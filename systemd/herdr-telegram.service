@@ -1,0 +1,22 @@
+# herdr-supervisor: Telegram long-poll bridge. Outbound HTTPS only; no listening socket.
+# Reads its own protected config/token files; the token never passes through unit environment settings.
+[Unit]
+Description=herdr-telegram long-poll bridge (outbound only)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr-telegram daemon
+Restart=on-failure
+RestartSec=15
+SuccessExitStatus=0 3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/herdr-telegram %h/.local/state/herdr-supervisor %h/.config/herdr %h/.local/state/herdr-telegram-locks
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

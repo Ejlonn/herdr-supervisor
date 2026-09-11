@@ -1,0 +1,3 @@
+#!/bin/sh
+# herdr-query-worker launcher (user-scoped, read-only query plane). Implementation: ~/.local/lib/herdr-supervisor/herdr_query.py
+exec python3 "${HERDR_SUPERVISOR_LIB:-$HOME/.local/lib/herdr-supervisor}/herdr_query.py" "$@"

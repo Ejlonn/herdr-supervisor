@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+scripts/dev/
+build/
+dist/
+*.egg-info/
+
+# Runtime configuration, credentials, and durable state never belong in source.
+config.json
+backup.json
+telegram.json
+bot-token
+owners.json
+state.json
+outbox/
+inbox/
+logs/
+*.lock
+*.sock
+.env
+.env.*

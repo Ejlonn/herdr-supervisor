@@ -1,0 +1,18 @@
+[Unit]
+Description=Process one supported Codex banked-reset request
+[Service]
+Type=oneshot
+SuccessExitStatus=0 3
+UMask=0077
+ExecStart=%h/.local/bin/herdr-codex-reset-worker --once
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The supported Codex app-server initializes its SQLite state runtime below ~/.codex.
+# Keep the rest of $HOME read-only and expose only Codex-owned state plus the request journal.
+ReadWritePaths=%h/.codex %h/.local/state/herdr-supervisor/codex-reset
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

@@ -1,0 +1,313 @@
+"""Shared V2 fixtures: temporary XDG roots, fake Herdr, realistic review artifacts. No live systems."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+LIB = _ROOT / "src" if (_ROOT / "src" / "herdr_supervisor.py").exists() else _ROOT  # source tree or installed layout
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+
+import herdr_supervisor as hs  # noqa: E402
+
+NOW = 1_000_000.0
+CODEX_SESSION = "11111111-1111-4111-8111-111111111111"
+CLAUDE_SESSION = "22222222-2222-4222-8222-222222222222"
+QUERY_SESSION = "33333333-3333-4333-8333-333333333333"
+FAKE_TOKEN = "123456789:AAFakeTokenForTestsOnly_abcdefghijklmnopqrs"
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+
+
+class FakeClock:
+    def __init__(self, current: float = NOW) -> None:
+        self.current = current
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += seconds
+
+
+class FakeHerdr:
+    """Scripted adapter. `responses` is consumed per prompt: {'v2': (stage, next, gate, payload)} or
+    {'v1': next} or {'output': ..., 'status': ...} or {'error': code}."""
+
+    binary = "/fake/herdr"
+
+    def __init__(self) -> None:
+        self.agents: dict[str, dict] = {
+            "codex-main": self.agent("codex", "codex-main", "w3:p2", CODEX_SESSION),
+            "claude-main": self.agent("claude", "claude-main", "w3:p1", CLAUDE_SESSION),
+        }
+        self.responses: list[dict] = []
+        self.prompts: list[tuple[str, str]] = []
+        self.reads: list[tuple[str, str]] = []
+        self.waits: list[str] = []
+        self.outputs: dict[str, str] = {}
+        self.visible: dict[str, str] = {}
+        self.sent_keys: list = []
+        self.starts: list = []
+        self.workspaces: list = []
+        self.available_panes: set[str] = {"w3:p1", "w3:p2"}
+        self.next_pane = "w9:p1"
+        self.refresh_commands: list = []
+        self.on_wait = None
+        self.on_refresh = None
+
+    @staticmethod
+    def agent(provider: str, name: str, pane: str, session: str, status: str = "idle") -> dict:
+        return {"agent": provider, "name": name, "pane_id": pane, "agent_status": status, "agent_session": {"value": session}}
+
+    @staticmethod
+    def ids(prompt: str) -> tuple[str, str]:
+        run = next(l.split("=", 1)[1] for l in prompt.splitlines() if l.startswith("HERDR_RUN="))
+        turn = next(l.split("=", 1)[1] for l in prompt.splitlines() if l.startswith("HERDR_TURN="))
+        return run, turn
+
+    @staticmethod
+    def block_v2(run: str, turn: str, stage: str, next_agent: str, gate: str = "none", payload: str = "-", handoff: str = "fixture handoff", prefix: str = "  ") -> str:
+        lines = ["HERDR_PROTOCOL=2", f"HERDR_RUN={run}", f"HERDR_TURN={turn}", f"HERDR_STAGE={stage}", f"HERDR_NEXT={next_agent}", f"HERDR_GATE={gate}", f"HERDR_PAYLOAD={payload}", f"HERDR_HANDOFF={handoff}"]
+        return "\n".join(prefix + line for line in lines)
+
+    @staticmethod
+    def block_v1(run: str, turn: str, next_agent: str, stage: str = "stage") -> str:
+        return "\n".join(["HERDR_PROTOCOL=1", f"HERDR_RUN={run}", f"HERDR_TURN={turn}", f"HERDR_STAGE={stage}", f"HERDR_NEXT={next_agent}", "HERDR_HANDOFF=fixture handoff"])
+
+    def list_agents(self) -> list[dict]:
+        return list(self.agents.values())
+
+    def get_agent(self, name: str) -> dict:
+        if name not in self.agents:
+            raise hs.HerdrError("missing", code="agent_not_found")
+        return self.agents[name]
+
+    def prompt(self, name: str, text: str, *, timeout_ms: int) -> dict:
+        self.prompts.append((name, text))
+        if not self.responses:
+            raise AssertionError(f"unexpected prompt to {name}: {text[:100]}")
+        response = self.responses.pop(0)
+        if callable(response.get("before")):
+            response["before"](self, name, text)
+        run, turn = self.ids(text)
+        self.agents[name]["agent_status"] = response.get("status", "idle")
+        if "output" in response:
+            output = response["output"]
+        elif "v2" in response:
+            stage, nxt, gate, payload = (list(response["v2"]) + ["none", "-"])[:4]
+            output = text + "\n\nreply\n" + self.block_v2(run, turn, stage, nxt, gate, payload, prefix=response.get("prefix", "  "))
+        elif "v1" in response:
+            output = text + "\n\nreply\n" + self.block_v1(run, turn, response["v1"])
+        else:
+            output = text + "\n"
+        self.outputs[name] = output
+        self.visible[name] = response.get("visible", output[-2000:])
+        if "error" in response:
+            raise hs.HerdrError(response["error"], code=response["error"])
+        return {"result": {"agent": self.agents[name]}}
+
+    def read_agent(self, name: str, *, source: str, lines: int | None) -> str:
+        self.reads.append((name, source))
+        if source == "visible":
+            return self.visible.get(name, "")
+        if self.agents[name]["agent_status"] == "working" and self.agents[name]["agent"] == "claude":
+            raise hs.HerdrError("alternate screen", code="agent_not_idle")
+        return self.outputs.get(name, "")
+
+    def wait(self, name: str, *, timeout_ms: int) -> dict:
+        self.waits.append(name)
+        if self.on_wait is not None:
+            self.on_wait(self, name)
+        return {}
+
+    def send_keys(self, name: str, keys: list[str]) -> dict:
+        self.sent_keys.append((name, keys))
+        return {}
+
+    def start_agent(self, name: str, *, kind: str, pane_id: str, args: list[str]) -> dict:
+        self.starts.append((name, kind, pane_id, args))
+        session = {"codex": CODEX_SESSION, "claude": CLAUDE_SESSION}[kind]
+        self.agents[name] = self.agent(kind, name, pane_id, session)
+        return {}
+
+    def pane_available(self, pane_id: str) -> bool:
+        return pane_id in self.available_panes
+
+    def create_workspace(self, *, label: str, cwd: str) -> str | None:
+        self.workspaces.append((label, cwd))
+        self.available_panes.add(self.next_pane)
+        return self.next_pane
+
+    def run_command(self, argv: list[str]) -> str:
+        self.refresh_commands.append(argv)
+        if self.on_refresh is not None:
+            self.on_refresh(self)
+        return "{}"
+
+
+def quota_json(five: float, five_reset: float, week: float, week_reset: float, *, provider: str, session: str | None = None) -> dict:
+    windows = [
+        {"kind": "five_hour", "used_percent": 100 - five, "remaining_percent": five, "resets_at": five_reset},
+        {"kind": "weekly", "used_percent": 100 - week, "remaining_percent": week, "resets_at": week_reset},
+    ]
+    payload: dict = {"provider": provider, "fetched_at_unix": NOW - 60, "windows": windows, "context": {"used_percent": 42.0}, "session_quota_only": session is not None}
+    if session:
+        payload["session_windows"] = {session: json.loads(json.dumps(windows))}
+        payload["session_contexts"] = {session: {"used_percent": 8.0}}
+    return payload
+
+
+PLAN_TEXT = "# CODEX_PLAN\n\nStatus: draft\n\n## Scope\nAdd the widget.\n"
+
+
+class V2Case(unittest.TestCase):
+    """Temporary XDG roots for supervisor + review root + product repo stub; a fake Herdr."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        # Isolation: never read the machine's real Telegram config/state from any test (the live
+        # bridge may be configured on the host); restored in tearDown.
+        self._saved_env = {k: os.environ.get(k) for k in ("HERDR_TELEGRAM_CONFIG", "HERDR_TELEGRAM_STATE_DIR")}
+        os.environ["HERDR_TELEGRAM_CONFIG"] = str(root / "tg-absent" / "config.json")
+        os.environ["HERDR_TELEGRAM_STATE_DIR"] = str(root / "tg-absent-state")
+        self.quota_dir = root / "quota"
+        self.quota_dir.mkdir()
+        self.state_dir = root / "state"
+        self.state_dir.mkdir(mode=0o700)
+        self.project_root = root / "workspace"
+        self.project_root.mkdir()
+        (self.project_root / "AGENTS.md").write_text("# rules\n")
+        self.review_root = self.project_root / "engineering" / "reviews"
+        self.review_root.mkdir(parents=True)
+        self.review_dir = self.review_root / "feature-widget"
+        self.review_dir.mkdir()
+        self.product_repo = self.project_root / "product"
+        self.product_repo.mkdir()
+        self.paths = hs.Paths(config_file=root / "config.json", state_dir=self.state_dir)
+        self.config = hs.resolve_config_defaults(hs.deep_merge(hs.DEFAULT_CONFIG, {
+            "project_root": str(self.project_root),
+            "quota_dir": str(self.quota_dir),
+            "review_root": str(self.review_root),
+            "product_repo": str(self.product_repo),
+            "quota_safety_buffer_seconds": 60,
+            "poll_interval_seconds": 5,
+            "query": {"allowed_paths": [str(self.product_repo), str(self.project_root / "AGENTS.md"), str(self.review_root)], "launch_args": ["--sandbox", "read-only", "--ask-for-approval", "never", "--profile", "herdr-query", "-C", str(self.project_root)]},
+        }))
+        self.owners = {"codex": {"pane_id": "w3:p2", "session_id": CODEX_SESSION}, "claude": {"pane_id": "w3:p1", "session_id": CLAUDE_SESSION}}
+        hs.atomic_write_json(self.paths.owners_file, self.owners, mode=0o600)
+        self.clock = FakeClock()
+        self.herdr = FakeHerdr()
+        self.write_quota("codex", 80, NOW + 3600, 60, NOW + 86400)
+        self.write_quota("claude", 80, NOW + 3600, 60, NOW + 86400)
+        self.head = SHA_A
+        self.head_resolver = lambda repo: self.head
+        self.sup = self.make_supervisor()
+
+    def reset_fixture(self) -> None:
+        """Replace this test's temporary fixture without leaking the previous TemporaryDirectory."""
+        self.tearDown()
+        self.setUp()
+
+    def make_supervisor(self) -> "hs.Supervisor":
+        sup = hs.Supervisor(self.paths, self.config, self.herdr, clock=self.clock.time, sleeper=self.clock.sleep)
+        sup.head_resolver = self.head_resolver
+        return sup
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def write_quota(self, provider: str, five: float, five_reset: float, week: float, week_reset: float) -> None:
+        name = self.config["agents"][provider]["quota_file"]
+        session = CLAUDE_SESSION if provider == "claude" else None
+        (self.quota_dir / name).write_text(json.dumps(quota_json(five, five_reset, week, week_reset, provider=provider, session=session)))
+
+    def write_quota_fresh(self, provider: str, five: float, five_reset: float, week: float, week_reset: float, *, fetched: float | None = None) -> None:
+        name = self.config["agents"][provider]["quota_file"]
+        session = CLAUDE_SESSION if provider == "claude" else None
+        payload = quota_json(five, five_reset, week, week_reset, provider=provider, session=session)
+        payload["fetched_at_unix"] = self.clock.current if fetched is None else fetched
+        (self.quota_dir / name).write_text(json.dumps(payload))
+
+    def state(self) -> dict:
+        return json.loads(self.paths.state_file.read_text())
+
+    def events(self) -> list[dict]:
+        return self.sup.list_events()
+
+    def event_types(self) -> list[str]:
+        return [e["type"] for e in self.events()]
+
+    # ----- review artifacts
+    def write_plan(self, text: str = PLAN_TEXT) -> Path:
+        path = self.review_dir / "CODEX_PLAN.md"
+        path.write_text(text)
+        return path
+
+    def plan_payload(self, **overrides) -> Path:
+        payload = {
+            "schema_version": 1, "gate_type": "plan_approval", "task_title": "Add widget", "summary": "Plan for the widget",
+            "review_directory": str(self.review_dir), "scope": "backend only", "intended_changes": ["add widget model", "add endpoint"],
+            "risk_summary": "low", "affected_components": ["backend"], "migration_required": False, "migration_explanation": "",
+            "runtime_validation_required": True, "rebuild_required": True, "rebuild_reason": "backend image contains the source",
+            "push_approval_required": True, "plan_path": str(self.review_dir / "CODEX_PLAN.md"),
+        }
+        payload.update(overrides)
+        path = self.review_dir / "plan_payload.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def question_payload(self, **overrides) -> Path:
+        payload = {"schema_version": 1, "gate_type": "generic_question", "task_title": "Add widget", "summary": "need a decision", "review_directory": str(self.review_dir), "question": "Use Postgres enum or text?", "answer_mode": "choice", "choices": ["enum", "text"], "max_answer_chars": 200}
+        payload.update(overrides)
+        path = self.review_dir / "question_payload.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def runtime_payload(self, sha: str = SHA_A, **overrides) -> Path:
+        payload = {
+            "schema_version": 1, "gate_type": "runtime_validation", "task_title": "Add widget", "summary": "local work complete", "review_directory": str(self.review_dir),
+            "repository": str(self.product_repo), "candidate_sha": sha, "prepared_commits": [f"{sha[:12]} add widget"], "affected_services": ["backend"],
+            "rebuild_required": True, "rebuild_reason": "backend image", "local_evidence_summary": "unit tests pass; lint pass", "codex_review_status": "APPROVED",
+            "runtime_validation_missing": True, "local_gate_result": "PASS",
+        }
+        payload.update(overrides)
+        path = self.review_dir / "runtime_payload.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    def evidence_file(self, sha: str = SHA_A, result: str = "PASS", environment: str = "TEST", name: str = "RUNTIME_EVIDENCE.json", **overrides) -> Path:
+        evidence = {"schema_version": 1, "candidate_sha": sha, "environment": environment, "result": result, "commands": [{"command": "runtime-test.sh backend", "result": "PASS"}], "timestamp": hs.iso_utc(NOW - 60)}
+        evidence.update(overrides)
+        path = self.review_dir / name
+        path.write_text(json.dumps(evidence))
+        return path
+
+    # ----- drive a gated run to a given point
+    def start_gated(self, responses: list[dict]) -> int:
+        self.herdr.responses = responses
+        return self.sup.run_new("Add the widget", "codex", workflow_policy="gated_v2")
+
+    def approve_pending(self, **kwargs) -> dict:
+        with self.sup.store.transaction():
+            state = self.sup.store.read_state()
+            gate = state["pending_gate"]
+            return self.sup.approve_gate(state, run_id=state["run_id"], gate_id=gate["gate_id"], actor=kwargs.pop("actor", "cli"), **kwargs)
+
+    def resume_with(self, responses: list[dict]) -> int:
+        self.herdr.responses = responses
+        return self.sup.resume()

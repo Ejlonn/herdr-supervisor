@@ -1,0 +1,20 @@
+# herdr-supervisor: detached workflow worker. Fixed command, no task text in argv/env.
+# Started by herdr-supervisor-worker.path when a command file lands in the inbox, or at boot for
+# reconciliation. Exit codes 2 (WAIT_USER), 3 (paused/another worker), 4 (human gate) are intentional.
+[Unit]
+Description=herdr-supervisor workflow worker (inbox consumer + safe-state recovery)
+After=herdr-server.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/herdr-supervisor worker
+SuccessExitStatus=0 2 3 4
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/herdr-supervisor %h/.config/herdr
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+TimeoutStartSec=infinity

@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for Herdr Codex reset requests
+[Path]
+DirectoryNotEmpty=%h/.local/state/herdr-supervisor/codex-reset/pending
+DirectoryMode=0700
+Unit=herdr-codex-reset-worker.service
+[Install]
+WantedBy=default.target

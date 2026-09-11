@@ -1,0 +1,22 @@
+# herdr-backup.service — optional scheduled backup (disabled by default; enable the timer only after
+# `herdr-backup setup --confirm`). Deterministic; no LLM, no task interaction, no history rewriting.
+[Unit]
+Description=herdr-supervisor optional backup run
+Documentation=file:%h/.local/share/doc/herdr-supervisor/BACKUP.md
+ConditionPathExists=%h/.config/herdr-supervisor/backup.json
+
+[Service]
+Type=oneshot
+# /usr/bin/env is the stable executable validated from the source tree. The fixed launcher path remains
+# an argument and is expanded by systemd at runtime, so unit verification does not depend on a live install.
+ExecStart=/usr/bin/env %h/.local/bin/herdr-backup run --scheduled
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/herdr-supervisor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077

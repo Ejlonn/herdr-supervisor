@@ -1,0 +1,5 @@
+#!/bin/sh
+# Launcher for the optional herdr-supervisor backup/restore CLI.
+set -eu
+LIB="${HERDR_SUPERVISOR_LIB:-$HOME/.local/lib/herdr-supervisor}"
+exec python3 "$LIB/herdr_backup.py" "$@"

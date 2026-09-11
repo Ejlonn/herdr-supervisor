@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "project_root": null,
+  "herdr_bin": null,
+  "timezone": "UTC",
+  "quota_recheck_seconds": 600,
+  "codex_reset": {
+    "enabled": true,
+    "codex_bin": null,
+    "helper_timeout_seconds": 30,
+    "inventory_max_age_seconds": 120,
+    "verification_attempts": 4,
+    "verification_interval_seconds": 2
+  },
+  "max_task_file_bytes": 65536,
+  "task_file_suffixes": [".md", ".txt"]
+}

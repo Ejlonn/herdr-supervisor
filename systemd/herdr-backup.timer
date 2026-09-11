@@ -1,0 +1,13 @@
+# Hourly tick; the run itself decides whether a backup is due (daily/weekly/interval policy) and exits
+# immediately otherwise. Not enabled by the installer.
+[Unit]
+Description=herdr-supervisor optional backup timer
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=15m
+Persistent=true
+AccuracySec=5m
+
+[Install]
+WantedBy=timers.target

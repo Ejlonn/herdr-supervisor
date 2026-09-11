@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "strategy": "ssh_snapshot",
+  "sources": [],
+  "exclusions": [],
+  "destination": null,
+  "schedule": {
+    "daily": true,
+    "weekly": false,
+    "interval_hours": null
+  },
+  "retention": {
+    "daily": 7,
+    "weekly": 4
+  },
+  "max_age_hours": 24,
+  "notify_telegram": false,
+  "git_repos": [],
+  "ssh_options": [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes"
+  ]
+}

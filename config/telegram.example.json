@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "mode": "unconfigured",
+  "owner_user_id": null,
+  "chat_id": null,
+  "timezone": "UTC",
+  "plain_text_queries": false,
+  "token_file": null,
+  "poll_timeout_seconds": 25,
+  "http_timeout_seconds": 35
+}

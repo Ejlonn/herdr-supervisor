@@ -1,0 +1,3 @@
+#!/bin/sh
+# herdr-supervisor launcher (user-scoped). Implementation: ~/.local/lib/herdr-supervisor/herdr_supervisor.py
+exec python3 "${HERDR_SUPERVISOR_LIB:-$HOME/.local/lib/herdr-supervisor}/herdr_supervisor.py" "$@"

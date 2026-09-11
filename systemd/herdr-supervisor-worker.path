@@ -1,0 +1,12 @@
+# Durable trigger: any file created in the protected command inbox starts the fixed worker service.
+[Unit]
+Description=herdr-supervisor command inbox watcher
+
+[Path]
+DirectoryNotEmpty=%h/.local/state/herdr-supervisor/inbox/pending
+Unit=herdr-supervisor-worker.service
+MakeDirectory=yes
+DirectoryMode=0700
+
+[Install]
+WantedBy=default.target

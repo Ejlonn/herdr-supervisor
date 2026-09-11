@@ -1,0 +1,11 @@
+[Unit]
+Description=herdr-supervisor query inbox watcher
+
+[Path]
+DirectoryNotEmpty=%h/.local/state/herdr-supervisor/query/inbox
+Unit=herdr-query-worker.service
+MakeDirectory=yes
+DirectoryMode=0700
+
+[Install]
+WantedBy=default.target

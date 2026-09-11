@@ -1,0 +1,17 @@
+# herdr-supervisor: headless Herdr server for a FUTURE clean boot of the existing `default` session.
+# Installed inactive. Never enable/start while the live interactive Herdr server is running.
+[Unit]
+Description=Herdr headless server (default session)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

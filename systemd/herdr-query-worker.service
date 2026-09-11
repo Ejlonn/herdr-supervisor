@@ -1,0 +1,19 @@
+# herdr-supervisor: read-only query dispatcher for the dedicated codex-query session.
+# Separate singleton lock and spool; no workflow-mutation entry point exists in herdr_query.py.
+[Unit]
+Description=herdr-supervisor read-only query worker
+After=herdr-server.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/herdr-query-worker --once
+SuccessExitStatus=0
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/herdr-supervisor/query %h/.local/state/herdr-supervisor/outbox %h/.config/herdr
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+TimeoutStartSec=600

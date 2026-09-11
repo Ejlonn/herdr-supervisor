@@ -1,0 +1,15 @@
+# Reviewed source-to-install mapping. User configuration and state are never sourced from live files.
+src/*.py -> ~/.local/lib/herdr-supervisor/
+bin/* -> ~/.local/bin/
+systemd/* -> ~/.config/systemd/user/
+config/*.example.json -> ~/.local/share/doc/herdr-supervisor/examples/
+docs/*.md -> ~/.local/share/doc/herdr-supervisor/
+README.md LICENSE VERSION MANIFEST.txt -> ~/.local/share/doc/herdr-supervisor/
+
+# Created by install.sh when absent; preserved by default on uninstall.
+~/.config/herdr-supervisor/config.json
+~/.config/herdr-supervisor/backup.json
+~/.config/herdr-telegram/config.json
+~/.local/state/herdr-supervisor/
+~/.local/state/herdr-telegram/
+~/.local/state/herdr-telegram-locks/

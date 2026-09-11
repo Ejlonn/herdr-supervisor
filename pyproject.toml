@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-supervisor"
+version = "0.3.0b1"
+description = "Durable human-in-the-loop workflow supervision and Telegram control for Herdr coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = []
+dependencies = []
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+herdr-supervisor = "herdr_supervisor:main"
+herdr-telegram = "herdr_telegram:main"
+herdr-query-worker = "herdr_query:main"
+herdr-backup = "herdr_backup:main"
+herdr-codex-reset-worker = "herdr_codex_reset:main"
+
+[tool.setuptools]
+py-modules = ["herdr_supervisor", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "telegram_api"]
+package-dir = {"" = "src"}
