@@ -53,6 +53,7 @@ REQUIRED_CAPABILITIES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] 
 # Optional acceleration, reported separately: lifecycle acknowledgement of a submission.
 OPTIONAL_CAPABILITIES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("prompt lifecycle acknowledgement (--until + agent_prompt_stalled)", ("agent", "prompt"), ("--until", "agent_prompt_stalled")),
+    ("task-start pane split (--direction/--ratio/--cwd/--no-focus)", ("pane", "split"), ("--direction", "--ratio", "--cwd", "--no-focus")),
 )
 
 
@@ -222,6 +223,23 @@ class HerdrCli:
 
     def start_agent(self, name: str, *, kind: str, pane_id: str, args: list[str]) -> Any:
         return self._run(["agent", "start", name, "--kind", kind, "--pane", pane_id, "--", *args], timeout=330)
+
+    def split_pane(self, pane_id: str, *, direction: str, ratio: float, cwd: str) -> str | None:
+        response = self._run(["pane", "split", pane_id, "--direction", direction, "--ratio", str(ratio), "--cwd", cwd, "--no-focus"], timeout=60)
+        found: list[str] = []
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                candidate = value.get("pane_id")
+                if isinstance(candidate, str) and candidate:
+                    found.append(candidate)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+        collect(response.get("result") if isinstance(response, dict) else None)
+        candidates=list(dict.fromkeys(value for value in found if value != pane_id))
+        return candidates[0] if len(candidates)==1 else None
 
     def pane_available(self, pane_id: str) -> bool:
         """True when the recorded pane exists and hosts no agent (the shell prompt is expected)."""

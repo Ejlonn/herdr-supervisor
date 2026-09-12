@@ -151,7 +151,9 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
         title = "Task closed by operator handoff"
     open_followup = status.get("agent_followup") if isinstance(status.get("agent_followup"), dict) else None
     if state == "WAIT_USER":
-        if open_followup and open_followup.get("status") == "FAILED":
+        if isinstance(status.get("owner_recovery"), dict):
+            title = "Session pane ownership needs repair"
+        elif open_followup and open_followup.get("status") == "FAILED":
             title = "Answer not verified"
         else:
             title = "Task stopped: your decision is needed" if status.get("wait_user_requires_action") else "Task paused safely"
@@ -163,14 +165,21 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
     if status.get("task_id"):
         lines.append(_task_line(status))
         lines.append(f"Stage: {esc(status.get('phase') or 'starting', limit=40)} · Active agent: {esc((status.get('active_agent') or '-').title(), limit=20)}")
+        selection=status.get("session_selection") or {}
+        lines.append(f"Sessions: {esc(selection.get('policy') or 'preserve')} · models {esc(selection.get('profiles') or {})}")
     else:
         lines.append("Send /task or upload a .md/.txt task file to start.")
+    preparation=status.get("session_preparation")
+    if isinstance(preparation,dict):
+        lines.append(f"Session preparation: {esc(preparation.get('status') or 'unknown')} · id {esc(preparation.get('preparation_id') or 'unknown')}")
     if state == "WAIT_QUOTA" and isinstance(status.get("quota_wait"), dict):
         wait = status["quota_wait"]
         lines.append(f"Blocked by: {esc(wait.get('provider', '').title())} quota, resets {fmt_local(wait.get('resume_at'), tz)}")
         lines.append("Task and native session are preserved; the original prompt is not replayed.")
     if status.get("wait_user_reason"):
         lines.append(f"Needs you: {esc(status['wait_user_reason'], limit=300)}")
+    if isinstance(status.get("owner_recovery"), dict) and state == "WAIT_USER":
+        lines.extend(_owner_recovery_lines(status["owner_recovery"])[:2])
     followup = status.get("agent_followup")
     if isinstance(followup, dict) and followup.get("status") in FOLLOWUP_OPEN:
         lines.extend(_followup_status_lines(followup))
@@ -189,9 +198,9 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
     if gate and gate.get("status") == "pending":
         lines.append(f"Pending gate: {esc(gate.get('gate_type', '').replace('_', ' '))}")
     if status.get("candidate_sha"):
-        evidence = status.get("runtime_evidence") or {}
         push = status.get("push_approval") or {}
-        lines.append(f"Candidate {code(abbrev(status['candidate_sha'], 7))}: runtime {esc(evidence.get('result') or 'not run')}, push {'approved' if push.get('candidate_sha') == status['candidate_sha'] else 'not approved'}")
+        lines.append(f"Candidate {code(abbrev(status['candidate_sha'], 7))}: runtime {esc(_runtime_words(status.get('runtime_validation')))}, push {'approved' if push.get('candidate_sha') == status['candidate_sha'] else 'not approved'}")
+        lines.extend(_runtime_lines(status.get("runtime_validation"), tz))
     reset=status.get("codex_reset")
     if isinstance(reset,dict):
         available=reset.get("available_at_authorization")
@@ -214,7 +223,7 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
 
 def render_status_raw(status: dict[str, Any]) -> Rendered:
     """Sanitized, bounded technical view (never secrets)."""
-    keys = ("supervisor_state", "task_id", "phase", "active_agent", "workflow_policy", "delivery", "pending_gate", "candidate_sha", "runtime_evidence", "push_approval", "codex_reset", "last_event", "event_sequence", "quota_wait", "deferred_anomaly", "native_sessions_abbrev", "errors")
+    keys = ("supervisor_state", "task_id", "phase", "active_agent", "workflow_policy", "session_selection", "session_preparation", "delivery", "pending_gate", "candidate_sha", "runtime_evidence", "push_approval", "codex_reset", "last_event", "event_sequence", "quota_wait", "deferred_anomaly", "native_sessions_abbrev", "errors")
     view = {k: status.get(k) for k in keys if status.get(k) is not None}
     text = redact(json.dumps(view, indent=1, sort_keys=True, default=str), limit=3500)
     return Rendered(f"{title_line('Raw status (sanitized)')}\n<pre>{html.escape(text, quote=False)}</pre>")
@@ -278,8 +287,63 @@ def _with_ask(rows: Keyboard, status: dict[str, Any]) -> Keyboard:
     return [*rows, [button]] if len(rows[-1]) >= 2 else [*rows[:-1], [*rows[-1], button]]
 
 
+def _owner_recovery_keyboard(recovery: dict[str, Any]) -> Keyboard:
+    return [[("Refresh repair preview", "owner_recovery_preview", {"recovery_id": recovery.get("recovery_id")})], [("Status", "status", {}), ("Cancel task", "cancel", {})]]
+
+
+def _owner_recovery_lines(recovery: dict[str, Any]) -> list[str]:
+    provider = str(recovery.get("provider") or "agent").title()
+    session = recovery.get("session_abbrev") or "?"
+    recorded = recovery.get("recorded_pane") or "?"
+    panes = ", ".join(recovery.get("live_panes") or []) or "none"
+    kind = recovery.get("classification")
+    if kind == "duplicate":
+        what = f"The same saved {provider} session ({session}) is live in more than one pane ({panes}); the recorded pane is {recorded}."
+        do = f"Close the unwanted duplicate pane(s) yourself, keep one, then tap Refresh repair preview. If the kept pane is {recorded}, the run simply resumes; otherwise the preview offers to record the kept pane."
+    elif kind == "moved":
+        what = f"The saved {provider} session ({session}) is live in pane {panes} but the recorded pane is {recorded}."
+        do = "Tap Refresh repair preview; if exactly one idle carrier is found, an Apply pane repair button records that pane. The session id does not change."
+    else:
+        what = f"The recorded pane {recorded} for the saved {provider} session ({session}) is gone and the session is not live."
+        do = f"Reopen that session in a pane (for example in {recorded}) or elsewhere, then tap Refresh repair preview; or cancel the run."
+    return [what, "No different conversation was adopted, nothing was created, and no prompt was resent. The task, stage, approvals, and reset budget are unchanged.", "", f"• {do}", "• Cancel task: end the run; the sessions are kept."]
+
+
+def render_owner_recovery_wait(recovery: dict[str, Any]) -> Rendered:
+    return Rendered("\n".join([title_line("Session pane ownership needs repair"), *_owner_recovery_lines(recovery)]), keyboard=_owner_recovery_keyboard(recovery))
+
+
+def render_owner_recovery_preview(event: dict[str, Any], tz: str) -> Rendered:
+    """Result of a refresh: either the bound Apply action or the exact thing that must change first."""
+    data = event.get("data") or {}
+    preview: dict[str, Any] = data["preview"] if isinstance(data.get("preview"), dict) else {}
+    provider = str(preview.get("provider") or "agent").title()
+    if preview.get("eligible"):
+        lines = [title_line("Pane repair is possible"),
+                 f"One idle {provider} carrier of session {esc(preview.get('session_abbrev'))} was found in pane {esc(preview.get('new_pane'))}; the recorded pane {esc(preview.get('recorded_pane'))} is stale.",
+                 "Apply records that pane for the same session id — nothing else changes and nothing is resent. The run then continues from where it stopped."]
+        keyboard: Keyboard = [[("Apply pane repair", "owner_recovery_apply", {"recovery_id": preview.get("recovery_id"), "pane": preview.get("new_pane")})], [("Refresh repair preview", "owner_recovery_preview", {"recovery_id": preview.get("recovery_id")}), ("Status", "status", {})]]
+    elif preview.get("in_place"):
+        lines = [title_line("Session is back in its recorded pane"), esc(preview.get("reason"), limit=300), "No repair is needed; /resume (or the Resume button) continues the run in place."]
+        keyboard = [[("Resume", "resume", {}), ("Status", "status", {})]]
+    else:
+        lines = [title_line("Pane repair not possible yet"), esc(preview.get("reason"), limit=300), f"Next: {esc(preview.get('next_action'), limit=300)}"]
+        keyboard = [[("Refresh repair preview", "owner_recovery_preview", {"recovery_id": preview.get("recovery_id")})], [("Status", "status", {}), ("Cancel task", "cancel", {})]]
+    return Rendered("\n".join(lines), keyboard=keyboard)
+
+
+def render_owner_pane_repaired(event: dict[str, Any], tz: str) -> Rendered:
+    data = event.get("data") or {}
+    return Rendered("\n".join([title_line("Pane ownership repaired"),
+                                f"{esc(str(data.get('provider') or '').title())} session {esc(data.get('session_abbrev'))}: recorded pane {esc(data.get('old_pane'))} → {esc(data.get('new_pane'))}. The session id is unchanged.",
+                                f"Next: {esc(data.get('resumption'), limit=200)}."]), keyboard=[[("Status", "status", {})]])
+
+
 def keyboard_for_status(status: dict[str, Any]) -> Keyboard:
     state = status.get("supervisor_state")
+    recovery = status.get("owner_recovery")
+    if isinstance(recovery, dict) and state == "WAIT_USER":
+        return _owner_recovery_keyboard(recovery)
     followup = status.get("agent_followup")
     if isinstance(followup, dict) and followup.get("status") == "FAILED" and state == "WAIT_USER":
         return _followup_wait_keyboard(followup)
@@ -410,6 +474,9 @@ def render_followup_wait(reason: str, followup: dict[str, Any], tz: str) -> Rend
 
 def render_wait_user(reason: str, status: dict[str, Any] | None, tz: str, *, requires_action: bool = False, followup: dict[str, Any] | None = None) -> Rendered:
     status = status or {}
+    recovery = status.get("owner_recovery")
+    if isinstance(recovery, dict) and requires_action:
+        return render_owner_recovery_wait(recovery)
     open_followup = followup if isinstance(followup, dict) else status.get("agent_followup")
     if isinstance(open_followup, dict) and open_followup.get("status") == "FAILED" and requires_action:
         return render_followup_wait(reason, open_followup, tz)
@@ -493,6 +560,52 @@ def render_quota_resumed(event: dict[str, Any], tz: str) -> Rendered:
     return Rendered("\n".join(lines), keyboard=[[("Status", "status", {})]])
 
 
+def _runtime_words(view: Any) -> str:
+    """'not run' / 'PASS proposed (unconfirmed)' / 'FAIL accepted' — a proposal is never shown as accepted."""
+    if not isinstance(view, dict) or view.get("state") in (None, "none"):
+        return "not run"
+    if view.get("state") == "proposed":
+        return f"{view.get('result')} proposed (unconfirmed" + (", legacy" if view.get("legacy") else "") + ")"
+    return f"{view.get('result')} accepted"
+
+
+def _runtime_lines(view: Any, tz: str) -> list[str]:
+    if not isinstance(view, dict) or (view.get("state") == "none" and not view.get("gate_pending")):
+        return []
+    lines = []
+    if view.get("state") in ("proposed", "accepted"):
+        who = f" by {esc(view.get('actor'), limit=60)}" if view.get("actor") else ""
+        when = f" at {fmt_iso_local(view.get('at_utc'), tz)}" if view.get("at_utc") else ""
+        lines.append(f"Runtime result: {esc(_runtime_words(view))}{who}{when}")
+        if view.get("reason"):
+            lines.append(f"Reason: {esc(view.get('reason'), limit=200)}")
+    if view.get("waiting"):
+        lines.append(f"Waiting because: {esc(view.get('waiting'), limit=240)} · next: {esc(view.get('next_actor') or 'operator')}")
+    return lines
+
+
+def render_runtime_proposed(event: dict[str, Any], status: dict[str, Any] | None, tz: str) -> Rendered:
+    """The agent proposed a result. Nothing is recorded until the operator confirms; the only recordable
+    decision is the one the evidence bytes say, bound to run/gate/candidate/environment/hash."""
+    data = event.get("data") or {}
+    result = str(data.get("result") or "?")
+    lines = [
+        title_line(f"Runtime {result} proposed — your confirmation is needed"),
+        f"Candidate {code(abbrev(data.get('candidate_sha'), 7))} on {esc(data.get('environment'))}, proposed by {esc(data.get('proposed_by'), limit=60)}.",
+        "Nothing is recorded yet. Push stays blocked and the workflow does not move until you record this result.",
+        "",
+    ]
+    for item in (data.get("commands") or [])[:6]:
+        if isinstance(item, dict):
+            lines.append(f"• {esc(item.get('command'), limit=90)} → {esc(item.get('result'), limit=120)}")
+    if data.get("summary"):
+        lines += ["", f"Summary: {esc(data.get('summary'), limit=240)}"]
+    lines += ["", f"Record {result}: records exactly this evidence as the {result} result (a different result needs new evidence).",
+              "Ask agent: a read-only question; the proposal stays pending.", "Request revision: send the run back to the agent instead."]
+    extra = {"gate_id": data.get("gate_id"), "evidence_sha256": data.get("evidence_sha256"), "decision": result, "candidate_sha": data.get("candidate_sha"), "environment": data.get("environment")}
+    return Rendered("\n".join(lines), keyboard=[[(f"Record {result}", "runtime_confirm", extra)], [("Request Revision", "revise", {}), ("Ask agent", "ask_agent", {"decision_id": data.get("gate_id")})], [("Status", "status", {})]])
+
+
 def render_runtime_required(gate: dict[str, Any], tz: str) -> Rendered:
     f = _gate_fields(gate)
     lines = [
@@ -506,16 +619,17 @@ def render_runtime_required(gate: dict[str, Any], tz: str) -> Rendered:
         f"Affected services: {_services(f)}",
         f"Rebuild: {_yes_no(f.get('rebuild_required'))}" + (f" ({esc(f.get('rebuild_reason'), limit=100)})" if f.get("rebuild_reason") else ""),
         "",
-        "Exact-SHA runtime validation must be recorded from the operator CLI before push approval becomes available. Telegram cannot record it.",
+        "Collaborative validation: the agent runs the checks and proposes evidence; you record PASS or FAIL here (Record button) or with `herdr-supervisor runtime-confirm`. A proposal is never treated as recorded.",
     ]
     return Rendered("\n".join(lines), keyboard=[[("View Report", "view_details", {}), ("Status", "status", {})], [("Ask agent", "ask_agent", {"decision_id": gate.get("gate_id")})]])
 
 
 def render_runtime_failed(event: dict[str, Any], tz: str) -> Rendered:
     data = event.get("data") or {}
+    recorded = f" (recorded by {esc(data.get('actor'), limit=60)})" if data.get("actor") else ""
     return Rendered("\n".join([
         title_line("Runtime validation failed"),
-        f"Candidate {code(abbrev(data.get('candidate_sha'), 7))} on {esc(data.get('environment'))} did not pass.",
+        f"Candidate {code(abbrev(data.get('candidate_sha'), 7))} on {esc(data.get('environment'))} did not pass{recorded}.",
         "Push stays blocked. Send a revision note so the agent can fix and re-run, or cancel.",
     ]), keyboard=[[("Request Revision", "revise", {}), ("Status", "status", {})]])
 
@@ -564,7 +678,7 @@ def render_recovered(event: dict[str, Any], tz: str) -> Rendered:
 def render_command_result(event: dict[str, Any], tz: str, status: dict[str, Any] | None = None) -> Rendered:
     data = event.get("data") or {}
     ok = bool(data.get("ok"))
-    verb = {"task": "Task start", "approve": "Approval", "reject": "Rejection", "revise": "Revision", "answer": "Answer", "pause": "Pause", "resume": "Resume", "cancel": "Cancel", "refresh_quota": "Quota refresh", "ask_agent": "Question to the agent", "retry_followup_response": "Answer reread", "return_to_decision": "Return to decision", "retry_routing_result": "Routing result retry"}.get(str(data.get("action")), str(data.get("action") or "Command").title())
+    verb = {"task": "Task start", "approve": "Approval", "reject": "Rejection", "revise": "Revision", "answer": "Answer", "pause": "Pause", "resume": "Resume", "cancel": "Cancel", "refresh_quota": "Quota refresh", "ask_agent": "Question to the agent", "retry_followup_response": "Answer reread", "return_to_decision": "Return to decision", "retry_routing_result": "Routing result retry", "runtime_confirm": "Runtime result confirmation", "owner_recovery_preview": "Repair preview", "owner_recovery_apply": "Pane repair"}.get(str(data.get("action")), str(data.get("action") or "Command").title())
     keyboard: Keyboard = [[("Status", "status", {})]] if not ok else []
     if ok and data.get("action") == "return_to_decision" and status is not None:
         keyboard = keyboard_for_status(status)  # the restored decision's own controls
@@ -631,7 +745,11 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
         return render_revision_requested(event, tz)
     if kind == "WAIT_USER":
         data = event.get("data") or {}
+        if isinstance(data.get("owner_recovery"), dict) and isinstance((status or {}).get("owner_recovery"), dict):
+            return render_owner_recovery_wait((status or {})["owner_recovery"])
         return render_wait_user(str(data.get("reason") or ""), status, tz, requires_action=bool((status or {}).get("wait_user_requires_action")), followup=data.get("followup") if isinstance(data.get("followup"), dict) else None)
+    if kind == "OWNER_PANE_REPAIRED":
+        return render_owner_pane_repaired(event, tz)
     if kind == "AGENT_FOLLOWUP_READY":
         return render_agent_followup_ready(event, status, tz)
     if kind == "WAIT_QUOTA":
@@ -642,6 +760,8 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
         return render_runtime_required(gate, tz)
     if kind == "RUNTIME_VALIDATION_FAILED":
         return render_runtime_failed(event, tz)
+    if kind == "RUNTIME_EVIDENCE_PROPOSED":
+        return render_runtime_proposed(event, status, tz)
     if kind == "PUSH_APPROVAL_REQUIRED" and gate:
         return render_push_approval(gate, tz)
     if kind == "TASK_PAUSED":
@@ -657,6 +777,9 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
     if kind == "RECOVERED_AFTER_RESTART":
         return render_recovered(event, tz)
     if kind == "COMMAND_RESULT":
+        data = event.get("data") or {}
+        if data.get("action") == "owner_recovery_preview" and data.get("ok") and isinstance(data.get("preview"), dict):
+            return render_owner_recovery_preview(event, tz)
         return render_command_result(event, tz, status)
     if kind == "QUERY_RESULT":
         return render_ask_answer(event, tz, long_threshold=long_threshold)
@@ -675,7 +798,7 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
     if kind in ("PLAN_APPROVED", "PUSH_APPROVED", "QUESTION_ANSWERED", "TASK_RESUMED", "RUNTIME_VALIDATION_PASSED"):
         data = event.get("data") or {}
         titles = {"PLAN_APPROVED": "Plan approved", "PUSH_APPROVED": "Push stage approved", "QUESTION_ANSWERED": "Answer recorded", "TASK_RESUMED": "Task resumed", "RUNTIME_VALIDATION_PASSED": "Runtime validation passed"}
-        follow = {"PLAN_APPROVED": "Codex writes the brief; implementation follows in the same sessions.", "PUSH_APPROVED": "The workflow continues; you perform the push/PR yourself.", "QUESTION_ANSWERED": "The agent continues with your answer.", "TASK_RESUMED": "Continuing where it stopped; nothing replayed.", "RUNTIME_VALIDATION_PASSED": f"Candidate {abbrev(data.get('candidate_sha'), 7)} validated on {data.get('environment')}."}
+        follow = {"PLAN_APPROVED": "Codex writes the brief; implementation follows in the same sessions.", "PUSH_APPROVED": "The workflow continues; you perform the push/PR yourself.", "QUESTION_ANSWERED": "The agent continues with your answer.", "TASK_RESUMED": "Continuing where it stopped; nothing replayed.", "RUNTIME_VALIDATION_PASSED": f"Candidate {abbrev(data.get('candidate_sha'), 7)} validated on {data.get('environment')}" + (f", recorded by {data.get('actor')}." if data.get("actor") else ".")}
         return Rendered("\n".join([title_line(titles[kind]), esc(follow[kind], limit=200)]))
     if kind == "BACKUP_HEALTH":
         return render_backup_health(event.get("data") or {}, tz)

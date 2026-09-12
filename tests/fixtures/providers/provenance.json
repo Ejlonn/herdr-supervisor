@@ -1,0 +1,15 @@
+{
+  "captured_on": "2026-09-11",
+  "commands": [
+    "codex --help",
+    "claude --help",
+    "codex app-server --help",
+    "codex resume --help",
+    "codex app-server generate-json-schema --out <tmp>"
+  ],
+  "versions": {
+    "codex": "0.154.0",
+    "claude": "2.1.269"
+  },
+  "scope": "Read-only help excerpts (model option, app-server subcommands, resume SESSION_ID) and a schema excerpt for thread/start; no session or thread was started or prompted."
+}

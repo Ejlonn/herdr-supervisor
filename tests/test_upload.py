@@ -102,7 +102,7 @@ class StagingTests(UploadCase):
         self.assertIn("Task to start:\nfile task.md (.md, ", card["text"])
         self.assertIn(excerpt[:120], card["text"], "the already-validated excerpt is the preview")
         self.assertLessEqual(card["text"].count("Details line."), 30, "bounded excerpt, not the 200-line file")
-        self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], [["Start · 0","Start · 1"],["Cancel"]])
+        self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], [["Start · 0","Start · 1"],["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],["Cancel"]])
         for record_path in self.tg_paths.interactions_dir.glob("*.json"):
             record = json.loads(record_path.read_text())
             self.assertNotIn("excerpt", record); self.assertNotIn("task_text", record)

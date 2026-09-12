@@ -33,6 +33,10 @@ It is not another AI agent, an API-model router, a provider-quota bypass, or a t
 
 Routine installation does not require root. Keeping user services alive after logout may require an administrator to run `loginctl enable-linger USER` once; see [Installation](docs/INSTALL.md).
 
+## Tested scope
+
+This beta has so far been developed and tested with Codex and Claude in one Herdr workspace using two panes. Other providers, larger workspace layouts, and additional operating environments have not yet received the same validation. Broader tests are planned, and bug reports, test results, feature requests, and contributions are welcome.
+
 ## Install
 
 ```sh
@@ -70,6 +74,12 @@ herdr-supervisor doctor
 herdr-supervisor refresh-quota --run-id CURRENT_RUN_UUID
 ```
 
+New tasks preserve both native sessions by default. `--session-policy fresh-codex` starts Codex in a new pane and leaves the old session alive; optional model-profile names must be defined in `session_start.model_profiles`. Telegram keeps the task and final Start action primary and shows fresh choices only after the local pane/start contract is verified. `rebind-sessions` previews or applies explicit pane bindings only when no run or preparation worker is active. If a CLI fresh start stops before run initialization, repeating the exact command reconciles its task-bound preparation; a different command fails closed while that preparation is unresolved. Status shows the preparation ID for inspection before `abandon-session-start --preparation-id ID` or an explicit rebind. Neither command closes the old or newly created sessions. If, during a run, the saved session turns up in another pane, in two panes, or its recorded pane disappears, the supervisor stops in a `Session pane ownership needs repair` wait instead of relocating anything; `repair-owner-pane` (preview, then `--apply`) or the Telegram `Refresh repair preview` / `Apply pane repair` buttons update only the recorded pane for the same session id (see `docs/RECOVERY.md`).
+
+**Fresh Codex** pre-creates a durable native thread through the supported Codex app-server `thread/start` (via the same user-scoped helper journal as banked resets), persists the returned thread id before any pane exists, and then launches `codex resume <thread-id>` in the new pane; the configured model profile is set on the thread, not through a launch flag. Ownership binds only when Herdr reports exactly that thread id, ready and unique, in the new pane, and the task is delivered once afterwards. `thread/start` has no idempotency key: a timeout, crash, or malformed result leaves the preparation reconciling (an orphaned provider thread is accepted over a duplicate) — repeating the same task start adopts a settled helper result, `abandon-session-start` releases the attempt, and nothing is retried automatically. Fresh Codex is offered only when every component is verified read-only: Herdr pane split, agent start, identity observation, and the local Codex app-server, `thread/start` schema, and `resume SESSION_ID`; `doctor` lists each component. Fresh Claude keeps its provider-specific launch.
+
+**Runtime evidence ownership.** Runtime validation is collaborative by default (`runtime_validation_mode: operator_collaborative` in the plan payload): `herdr-supervisor runtime-pass|runtime-fail` and the agent's evidence file only create a durable **proposal** — nothing is recorded, the gate stays pending, no push gate is synthesized. The operator records the result with the Telegram `Record PASS` / `Record FAIL` button on the proposal card or with `herdr-supervisor runtime-confirm --run-id RUN --gate-id GATE --evidence-sha256 HASH --decision PASS|FAIL`; the confirmation is bound to the run, gate, candidate, environment, exact evidence bytes, and live state, and the recorded result is always the evidence file's own result. An actor label on a CLI command grants no operator authority. Only a human-approved plan payload declaring `runtime_validation_mode: automatic_agent` lets the assigned agent record directly. Evidence recorded before this rule on a still-pending gate is shown as an unconfirmed proposal; completed history is untouched. `/status`, `status`, and `doctor` show none / proposed / accepted, the latest result, who acts next, and why the task waits.
+
 Telegram supports `/status`, `/task`, `.md`/`.txt` uploads with Start/Cancel confirmation, `/plan`, `/pending`, `/pause`, `/resume`, `/cancel`, `/logs`, `/doctor`, read-only `/ask`, and `/ask-agent`.
 
 **Ask agent** and **Request revision** are different actions at every human decision. `Ask agent` (`/ask-agent <question>`, the `Ask agent` button, or `herdr-supervisor ask-agent`) sends one read-only question to the same active native session while the pending plan, question, runtime, or push gate — or an unread-result wait — stays exactly as it is; the verified answer comes back as a short summary plus a Markdown document, and the same decision returns with its own controls. Asking never approves, revises, advances, replays the task, or applies a fix; a change the agent recommends starts only with an explicit revision or a new task. `Request revision` (`/revise`) still voids the current gate or result and requires the agent to produce a replacement routing result. If no verified answer comes back, the supervisor stops in a follow-up wait that offers `Retry reading answer` (once, no prompt), `Return to decision`, and `Request revision`; `herdr-supervisor retry-answer` and `return-to-decision` are the CLI forms.
@@ -77,6 +87,36 @@ Telegram supports `/status`, `/task`, `.md`/`.txt` uploads with Start/Cancel con
 `herdr-supervisor status` and Telegram `/status` show supervisor submission metrics — how many prompts the supervisor has submitted per provider and how many characters — next to the provider quota and context percentages that come from `herdr-agent-quota`. The metrics are controller counts, not provider tokens. Automatic same-provider routing chains are bounded by `max_consecutive_auto_turns` (default 8): the supervisor stops in an action-required wait before preparing turn limit+1; a cross-provider handoff ends the streak and only an authenticated human continuation (`/revise`, an answer, an approval, a recorded runtime result) resets it. Continuation prompts never repeat the task body.
 
 Two completions exist. **Verified completion** is reached only by the agent route after every required runtime and push gate is satisfied. **Operator handoff** (`/done`, its one-time Done button, or the CLI command with the explicit `--operator-handoff` flag) closes a run whose agent reported completion while only human-owned runtime validation or push approval was missing: you perform those actions yourself. The record and every status message say the remaining actions were handed to the operator and were not verified by Supervisor; `/done` grants no push approval, records no runtime evidence, and never claims a push-ready or published state. It is refused while any gate is pending, an agent is working, delivery is uncertain, quota or reset recovery is active, or the request belongs to another run, user, or chat.
+
+## Telegram walkthrough
+
+A gated task as it appears in the Telegram chat, in the order the messages arrive. Drop the screenshots into
+`docs/images/` with the names below (or adjust the paths).
+
+1. **Tapping Start** — the task-start card shows the task text and the banked-reset budget buttons; tapping `Start`
+   creates the supervised run and Codex begins planning.
+
+   ![Tapping Start](docs/images/telegram-01-start.png)
+
+2. **Plan ready for approval** — Codex's plan arrives as a card with its fingerprint, risk line, and the runtime,
+   rebuild, migration, and push flags; nothing is implemented yet.
+
+   ![Plan ready for approval](docs/images/telegram-02-plan-ready.png)
+
+3. **Approval accepted** — the one-time `Approve` button is confirmed by the worker; Codex writes the brief and hands
+   implementation to Claude in the same sessions.
+
+   ![Approval accepted](docs/images/telegram-03-approval-accepted.png)
+
+4. **Waiting for quota** — a provider usage limit interrupts a turn; the task and native session are preserved, the
+   original prompt is not replayed, and the safe reset time is shown.
+
+   ![Waiting for quota](docs/images/telegram-04-waiting-for-quota.png)
+
+5. **Codex quota available again** — the recheck finds usable quota and the same session continues from where it
+   stopped.
+
+   ![Codex quota available again](docs/images/telegram-05-quota-available.png)
 
 ## Backups
 

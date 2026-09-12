@@ -28,7 +28,9 @@ from herdr_core import (
     MAX_FOLLOWUP_QUESTION_CHARS,
     MAX_FOLLOWUP_SUMMARY_CHARS,
     MAX_HANDOFF_NOTE_CHARS,
+    OWNER_RECOVERY_CLASSIFICATIONS,
     PROVIDERS,
+    RUNTIME_VALIDATION_MODES,
     SCHEMA_VERSION,
     SHA_RE,
     STATE_SCHEMA_VERSION,
@@ -43,6 +45,7 @@ from herdr_core import (
     iso_utc,
     load_json,
     sha256_bytes,
+    valid_pane_id,
 )
 from herdr_quota import _parse_windows
 
@@ -80,7 +83,7 @@ class StateStore:
             # Additive V2 evolution: old schema-2 records gain zero reset authority, zero submission
             # metrics, and a fresh (zero) consecutive-turn count in memory; nothing is replayed.
             defaults = new_v2_fields(str(value.get("workflow_policy") or "v1"))
-            for key in ("codex_reset", "prompt_metrics", "consecutive_auto_turns", "agent_followup"):
+            for key in ("codex_reset", "prompt_metrics", "consecutive_auto_turns", "agent_followup", "session_selection", "session_preparation", "runtime_proposal", "owner_recovery"):
                 value.setdefault(key, defaults[key])
             validate_state_v2(value)
         return value
@@ -174,6 +177,10 @@ def new_v2_fields(workflow_policy: str) -> dict[str, Any]:
         "runtime_policy": None,
         "candidate_sha": None,
         "runtime_evidence": None,
+        # Durable agent proposal awaiting operator confirmation (collaborative runtime validation).
+        "runtime_proposal": None,
+        # Structured exact-session pane-ownership recovery condition (missing/moved/duplicate pane).
+        "owner_recovery": None,
         "push_approval": None,
         "continuation": None,
         "processed_requests": {},
@@ -193,6 +200,8 @@ def new_v2_fields(workflow_policy: str) -> dict[str, Any]:
         "missing_result": None,
         # Optional gate-preserving follow-up ("Ask agent"): absent for existing runs; never migrated.
         "agent_followup": None,
+        "session_selection": {"policy": "preserve", "profiles": {p: "default" for p in PROVIDERS}, "fresh_providers": []},
+        "session_preparation": None,
         "codex_reset": {
             "authorized_reset_budget": 0, "used_reset_count": 0,
             "authorization_available_count": None, "authorization_timestamp": None,
@@ -221,6 +230,15 @@ def migrate_state_v1(value: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 def validate_state_v2(state: dict[str, Any]) -> None:
+    selection = state.get("session_selection")
+    if not isinstance(selection, dict) or selection.get("policy") not in ("preserve", "fresh-codex", "fresh-claude", "fresh-all"):
+        raise SupervisorError("state session_selection is invalid")
+    profiles=selection.get("profiles")
+    if not isinstance(profiles,dict) or set(profiles)!=set(PROVIDERS) or any(not isinstance(value,str) or not value for value in profiles.values()):
+        raise SupervisorError("state session model profiles are invalid")
+    preparation=state.get("session_preparation")
+    if preparation is not None and (not isinstance(preparation,dict) or preparation.get("status") not in ("OWNERSHIP_BOUND","TASK_STARTED")):
+        raise SupervisorError("state session_preparation is invalid")
     if state.get("workflow_policy") not in WORKFLOW_POLICIES:
         raise SupervisorError(f"state has an invalid workflow_policy: {state.get('workflow_policy')!r}")
     for key in ("gate_sequence", "event_sequence", "recovery_count"):
@@ -314,6 +332,15 @@ def validate_state_v2(state: dict[str, Any]) -> None:
     followup = state.get("agent_followup")
     if followup is not None:
         _validate_agent_followup(followup, state)
+    proposal = state.get("runtime_proposal")
+    if proposal is not None:
+        _validate_runtime_proposal(proposal, state)
+    recovery = state.get("owner_recovery")
+    if recovery is not None:
+        _validate_owner_recovery(recovery, state)
+    evidence = state.get("runtime_evidence")
+    if isinstance(evidence, dict) and evidence.get("provenance") is not None:
+        _validate_evidence_provenance(evidence["provenance"])
     completion = state.get("completion")
     if completion is not None:
         _validate_completion(completion, state)
@@ -522,6 +549,145 @@ def validate_followup_markdown(raw: bytes, *, max_bytes: int) -> str:
             raise SupervisorError(f"follow-up response section {name!r} is empty")
     return text
 
+def _valid_owner_record(value: Any) -> bool:
+    return isinstance(value, dict) and set(value) == {"pane_id", "session_id"} and valid_pane_id(value["pane_id"]) and type(value["session_id"]) is str and bool(value["session_id"])
+
+def owner_recovery_checkpoint(state: dict[str, Any]) -> dict[str, Any]:
+    """The operational checkpoint a pane repair must return the run to. Canonical (sorted, primitive) so it
+    can be compared exactly and bound into the recovery identity."""
+    delivery = state.get("delivery") if isinstance(state.get("delivery"), dict) else None
+    continuation = state.get("continuation") if isinstance(state.get("continuation"), dict) else None
+    interrupted = state.get("interrupted_delivery") if isinstance(state.get("interrupted_delivery"), dict) else None
+    return {
+        "phase": str(state.get("phase") or "initial"),
+        "active_agent": state.get("active_agent"),
+        "delivery_turn_id": delivery.get("turn_id") if delivery else None,
+        "delivery_status": delivery.get("status") if delivery else None,
+        "delivery_kind": delivery.get("kind") if delivery else None,
+        "delivery_prompt_sha256": delivery.get("prompt_sha256") if delivery else None,
+        "continuation": json.loads(json.dumps(continuation, sort_keys=True)) if continuation else None,
+        "interrupted_turn_id": interrupted.get("turn_id") if interrupted else None,
+        "turns_completed": int(state.get("turns_completed") or 0),
+        "gate_sequence": int(state.get("gate_sequence") or 0),
+    }
+
+# Delivery transitions that may legitimately happen while the run waits (restart recovery marks an
+# unacknowledged submission uncertain). Anything else is drift.
+_CHECKPOINT_DELIVERY_TRANSITIONS = {("prepared", "uncertain"), ("accepted", "uncertain")}
+
+def checkpoint_drift(recorded: Any, current: dict[str, Any]) -> str | None:
+    """None when `current` matches the recorded checkpoint (modulo the modelled delivery transitions); otherwise
+    the first field that drifted."""
+    if not isinstance(recorded, dict):
+        return "checkpoint"
+    for key, value in current.items():
+        if key == "delivery_status":
+            recorded_status = recorded.get("delivery_status")
+            if value != recorded_status and (recorded_status, value) not in _CHECKPOINT_DELIVERY_TRANSITIONS:
+                return "delivery_status"
+            continue
+        if recorded.get(key) != value:
+            return key
+    return None
+
+def _validate_owner_recovery(recovery: Any, state: dict[str, Any]) -> None:
+    label = "state owner_recovery"
+    if not isinstance(recovery, dict) or recovery.get("schema_version") != 1 or type(recovery.get("schema_version")) is not int:
+        raise SupervisorError(f"{label} is invalid")
+    for key in ("run_id", "recovery_id"):
+        if type(recovery.get(key)) is not str or not _UUID_RE.fullmatch(recovery[key]):
+            raise SupervisorError(f"{label} {key} is invalid")
+    if recovery["run_id"] != state.get("run_id"):
+        raise SupervisorError(f"{label} belongs to another run")
+    provider = recovery.get("provider")
+    if provider not in PROVIDERS or type(provider) is not str:
+        raise SupervisorError(f"{label} provider is invalid")
+    session = recovery.get("session_id")
+    if type(session) is not str or not session or session != (state.get("native_sessions") or {}).get(provider):
+        raise SupervisorError(f"{label} session identity does not match the run's native session")
+    if recovery.get("classification") not in OWNER_RECOVERY_CLASSIFICATIONS or type(recovery.get("classification")) is not str:
+        raise SupervisorError(f"{label} classification is invalid")
+    if not valid_pane_id(recovery.get("recorded_pane")):
+        raise SupervisorError(f"{label} recorded pane is not a canonical Herdr pane id")
+    owners_before = recovery.get("owners_before")
+    if not isinstance(owners_before, dict) or set(owners_before) != set(PROVIDERS) or not all(_valid_owner_record(owners_before[p]) for p in PROVIDERS):
+        raise SupervisorError(f"{label} owner snapshot is invalid")
+    if owners_before[provider] != {"pane_id": recovery["recorded_pane"], "session_id": session}:
+        raise SupervisorError(f"{label} owner snapshot does not match the affected owner")
+    for other in PROVIDERS:
+        if owners_before[other]["session_id"] != (state.get("native_sessions") or {}).get(other):
+            raise SupervisorError(f"{label} owner snapshot does not match the run's native sessions")
+    panes = recovery.get("live_panes")
+    if not isinstance(panes, list) or len(panes) > 16 or any(not valid_pane_id(item) for item in panes):
+        raise SupervisorError(f"{label} live panes are invalid")
+    if type(recovery.get("created_at_unix")) is bool or _epoch(recovery.get("created_at_unix")) is None:
+        raise SupervisorError(f"{label} timestamp is invalid")
+    checkpoint = recovery.get("checkpoint")
+    if not isinstance(checkpoint, dict) or set(checkpoint) != set(owner_recovery_checkpoint(state)):
+        raise SupervisorError(f"{label} checkpoint is invalid")
+    if type(checkpoint["phase"]) is not str or not _STAGE_RE.fullmatch(checkpoint["phase"]) or checkpoint["active_agent"] not in PROVIDERS:
+        raise SupervisorError(f"{label} checkpoint phase/agent is invalid")
+    turn = checkpoint["delivery_turn_id"]
+    if turn is not None and (type(turn) is not str or not _UUID_RE.fullmatch(turn)):
+        raise SupervisorError(f"{label} checkpoint turn is invalid")
+    if (turn is None) != (checkpoint["delivery_status"] is None) or (checkpoint["delivery_status"] is not None and checkpoint["delivery_status"] not in ("prepared", "accepted", "uncertain", "interrupted", "completed")):
+        raise SupervisorError(f"{label} checkpoint delivery is invalid")
+    if checkpoint["continuation"] is not None and (not isinstance(checkpoint["continuation"], dict) or not _exact_str(checkpoint["continuation"].get("kind"), max_len=40)):
+        raise SupervisorError(f"{label} checkpoint continuation is invalid")
+    for key in ("turns_completed", "gate_sequence"):
+        if type(checkpoint[key]) is not int or checkpoint[key] < 0:
+            raise SupervisorError(f"{label} checkpoint {key} is invalid")
+    if state.get("supervisor_state") not in ("WAIT_USER", "PAUSED", "ERROR", *TERMINAL_STATES):
+        raise SupervisorError(f"{label} requires an owner-recovery wait")
+    if state.get("supervisor_state") not in TERMINAL_STATES:
+        drift = checkpoint_drift(checkpoint, owner_recovery_checkpoint(state))
+        if drift is not None:
+            raise SupervisorError(f"{label} checkpoint no longer matches the run ({drift} changed)")
+
+def _validate_evidence_provenance(provenance: Any) -> None:
+    if not isinstance(provenance, dict) or provenance.get("mode") not in RUNTIME_VALIDATION_MODES or type(provenance.get("mode")) is not str:
+        raise SupervisorError("state runtime evidence provenance is invalid")
+    if not _exact_str(provenance.get("actor"), max_len=200):
+        raise SupervisorError("state runtime evidence provenance actor is invalid")
+    chat_id = provenance.get("chat_id")
+    if chat_id is not None and type(chat_id) is not int:
+        raise SupervisorError("state runtime evidence provenance chat_id is invalid")
+    if type(provenance.get("at_unix")) is bool or _epoch(provenance.get("at_unix")) is None:
+        raise SupervisorError("state runtime evidence provenance timestamp is invalid")
+    if provenance["mode"] == "operator_collaborative" and not _SHA256_STR_RE.fullmatch(str(provenance.get("proposal_sha256") or "")):
+        raise SupervisorError("state runtime evidence provenance lacks the confirmed proposal hash")
+
+def _validate_runtime_proposal(proposal: Any, state: dict[str, Any]) -> None:
+    label = "state runtime_proposal"
+    if not isinstance(proposal, dict) or proposal.get("schema_version") != 1 or type(proposal.get("schema_version")) is not int:
+        raise SupervisorError(f"{label} is invalid")
+    for key in ("run_id", "gate_id"):
+        if type(proposal.get(key)) is not str or not _UUID_RE.fullmatch(proposal[key]):
+            raise SupervisorError(f"{label} {key} is invalid")
+    if proposal["run_id"] != state.get("run_id"):
+        raise SupervisorError(f"{label} belongs to another run")
+    if proposal.get("status") not in ("proposed", "accepted", "superseded") or type(proposal.get("status")) is not str:
+        raise SupervisorError(f"{label} status is invalid")
+    if proposal.get("result") not in ("PASS", "FAIL") or type(proposal.get("result")) is not str:
+        raise SupervisorError(f"{label} result is invalid")
+    if type(proposal.get("candidate_sha")) is not str or not SHA_RE.match(proposal["candidate_sha"]):
+        raise SupervisorError(f"{label} candidate is invalid")
+    if not _exact_str(proposal.get("environment"), max_len=40):
+        raise SupervisorError(f"{label} environment is invalid")
+    if type(proposal.get("evidence_path")) is not str or not proposal["evidence_path"].startswith("/"):
+        raise SupervisorError(f"{label} evidence path is invalid")
+    if type(proposal.get("evidence_sha256")) is not str or not _SHA256_STR_RE.fullmatch(proposal["evidence_sha256"]):
+        raise SupervisorError(f"{label} evidence hash is invalid")
+    if not _exact_str(proposal.get("proposed_by"), max_len=200):
+        raise SupervisorError(f"{label} proposer is invalid")
+    if type(proposal.get("proposed_at_unix")) is bool or _epoch(proposal.get("proposed_at_unix")) is None:
+        raise SupervisorError(f"{label} timestamp is invalid")
+    if type(proposal.get("legacy")) is not bool:
+        raise SupervisorError(f"{label} legacy flag is invalid")
+    summary = proposal.get("summary")
+    if summary is not None and not _exact_str(summary, max_len=600, allow_empty=True):
+        raise SupervisorError(f"{label} summary is invalid")
+
 def _validate_unmet(unmet: Any, label: str) -> None:
     """Non-empty, duplicate-free allowlist of exact strings. Element types are checked before any
     hashing so a nested JSON value (dict/list) fails as SupervisorError, never as a raw TypeError."""
@@ -677,6 +843,10 @@ def validate_gate_payload(raw: Any, gate_type: str, *, config: dict[str, Any]) -
             "push_approval_required": _bool(raw.get("push_approval_required"), "push_approval_required"),
             "plan_path": _bounded_str(raw.get("plan_path"), "plan_path", max_len=1024),
         })
+        mode = raw.get("runtime_validation_mode", "operator_collaborative")
+        if mode not in RUNTIME_VALIDATION_MODES or type(mode) is not str:
+            raise SupervisorError("runtime_validation_mode must be operator_collaborative or automatic_agent")
+        out["runtime_validation_mode"] = mode
     elif gate_type == "generic_question":
         mode = raw.get("answer_mode")
         if mode not in ("text", "choice"):
@@ -706,6 +876,11 @@ def validate_gate_payload(raw: Any, gate_type: str, *, config: dict[str, Any]) -
             raise SupervisorError("local_gate_result must be PASS or FAIL")
         if raw.get("codex_review_status") not in ("APPROVED", "CHANGES_REQUIRED", "PENDING"):
             raise SupervisorError("codex_review_status must be APPROVED, CHANGES_REQUIRED or PENDING")
+        declared_mode = raw.get("validation_mode")
+        if declared_mode is not None and (type(declared_mode) is not str or declared_mode not in RUNTIME_VALIDATION_MODES):
+            raise SupervisorError("validation_mode must be operator_collaborative or automatic_agent when present")
+        if declared_mode is not None:
+            out["validation_mode"] = declared_mode  # informational; the approved plan policy decides
         out.update({
             "repository": repository,
             "candidate_sha": sha,

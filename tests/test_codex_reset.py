@@ -286,6 +286,52 @@ class TelegramAuthorizationTests(TelegramCase):
         return self.bridge
     def budget_tokens(self):
         return {json.loads(p.read_text())["budget"]:p.stem for p in self.tg_paths.interactions_dir.glob("*.json") if json.loads(p.read_text()).get("action")=="reset_budget"}
+    def test_session_policy_callback_is_task_bound_and_leads_to_final_start(self):
+        self.enabled_bridge(2).handle_update(message(490,"/task rotate codex"))
+        initial=self.api.sent[-1]
+        choices={b["text"]:b["callback_data"] for row in initial["reply_markup"]["inline_keyboard"] for b in row}
+        result=self.bridge.handle_update(callback(491,choices["Fresh Codex"]))
+        self.assertEqual(result["result"],"selection_updated")
+        final=self.api.sent[-1]
+        self.assertIn("Task:\nrotate codex",final["text"]); self.assertIn("Sessions: fresh-codex",final["text"])
+        self.assertIn("Existing sessions stay preserved",final["text"]); self.assertIn("only when first prompted",final["text"])
+        starts={b["text"]:b["callback_data"] for row in final["reply_markup"]["inline_keyboard"] for b in row if b["text"].startswith("Start task")}
+        self.assertEqual(self.bridge.handle_update(callback(492,starts["Start task · reset budget 1"]))["result"],"enqueued")
+        command=self.pending_inbox()[0]
+        self.assertEqual(command["session_selection"]["policy"],"fresh-codex")
+        self.assertEqual(command["codex_reset_authorization"]["budget"],1)
+        self.assertIn("rejected",self.bridge.handle_update(callback(493,choices["Preserve sessions (default)"])))
+    def test_nondefault_model_is_not_offered_without_local_capability(self):
+        self.config["session_start"]["model_profiles"]["codex"]["large"]={"label":"Large","model":"gpt-approved"}
+        self.bridge.model_capability_reader=lambda provider:False
+        self.enabled_bridge(1).handle_update(message(494,"/task capability check"))
+        choices={b["text"]:b["callback_data"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        self.bridge.handle_update(callback(495,choices["Fresh Codex"]))
+        labels={b["text"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        self.assertIn("✓ Codex model: Default",labels)
+        self.assertNotIn("Codex model: Large",labels)
+    def test_model_callback_rechecks_capability_before_mutation(self):
+        self.config["session_start"]["model_profiles"]["codex"]["large"]={"label":"Large","model":"gpt-approved"}
+        available=[True]; self.bridge.model_capability_reader=lambda provider:available[0]
+        self.enabled_bridge(1).handle_update(message(496,"/task capability changes"))
+        choices={b["text"]:b["callback_data"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        self.bridge.handle_update(callback(497,choices["Fresh Codex"]))
+        profiles={b["text"]:b["callback_data"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        available[0]=False
+        result=self.bridge.handle_update(callback(498,profiles["Codex model: Large"]))
+        self.assertEqual(result["rejected"],"invalid_model_capability")
+
+    def test_fresh_policies_are_hidden_or_rejected_when_contract_is_unavailable(self):
+        capability=[False]; self.bridge.session_capability_reader=lambda:capability[0]
+        self.enabled_bridge(1).handle_update(message(499,"/task preserve only"))
+        labels={b["text"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        self.assertIn("Preserve sessions (default)",labels); self.assertNotIn("Fresh Codex",labels)
+        capability[0]=True
+        self.bridge.handle_update(message(500,"/task capability changes"))
+        choices={b["text"]:b["callback_data"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        capability[0]=False
+        result=self.bridge.handle_update(callback(501,choices["Fresh Codex"]))
+        self.assertEqual(result["rejected"],"invalid_session_capability")
     def test_task_waits_for_explicit_bound_budget_then_enqueues_once(self):
         bridge=self.enabled_bridge(3)
         result=bridge.handle_update(message(501,"/task important task")); self.assertEqual(result["result"],"reset_budget_required")
@@ -317,7 +363,7 @@ class TelegramAuthorizationTests(TelegramCase):
         card=self.api.sent[-1]
         self.assertIn("Banked resets available: unavailable",card["text"])
         buttons={b["text"]:b["callback_data"] for row in card["reply_markup"]["inline_keyboard"] for b in row}
-        self.assertEqual(set(buttons),{"Start · 0","Cancel"})
+        self.assertEqual(set(buttons),{"Start · 0","Preserve sessions (default)","Fresh Codex","Fresh Claude + Codex","Cancel"})
         started=self.bridge.handle_update(callback(523,buttons["Start · 0"]))
         self.assertEqual(started["result"],"enqueued")
         self.assertEqual(self.pending_inbox()[0]["codex_reset_authorization"],{"budget":0,"available_count":0,"account_fingerprint":None})
@@ -350,6 +396,32 @@ class TelegramAuthorizationTests(TelegramCase):
         result=self.sup.process_inbox()[0]
         self.assertFalse(result["ok"]); self.assertIn("binding",result["message"])
 
+    def test_enqueued_authorization_expiry_is_rejected_before_task_start(self):
+        bridge=self.enabled_bridge(1); bridge.handle_update(message(534,"/task expires before worker"))
+        bridge.handle_update(callback(535,self.budget_tokens()[0]))
+        pending_path=next(self.paths.pending_starts_dir.glob("*.json"))
+        expires=float(json.loads(pending_path.read_text())["expires_at_unix"])
+        self.clock.current=expires+1
+        result=self.sup.process_inbox()[0]
+        self.assertFalse(result["ok"]); self.assertIn("stale or invalid",result["message"])
+        self.assertEqual(json.loads(pending_path.read_text())["status"],"start_enqueued")
+        self.assertFalse(self.paths.state_file.exists())
+
+    def test_consuming_authorization_reconciles_after_expiry_without_new_inventory_gate(self):
+        bridge=self.enabled_bridge(2); bridge.handle_update(message(536,"/task consuming recovery"))
+        bridge.handle_update(callback(537,self.budget_tokens()[1]))
+        pending_path=next(self.paths.pending_starts_dir.glob("*.json"))
+        record=json.loads(pending_path.read_text())
+        record.update({"status":"supervisor_consuming","supervisor_consuming_at":hs.iso_utc(self.clock.current)})
+        hs.atomic_write_json(pending_path,record)
+        self.clock.current=float(record["expires_at_unix"])+1
+        gateway=FakeGateway(self,count=0); self.sup.reset_gateway=gateway
+        result=self.sup.process_inbox()[0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(gateway.calls,[])
+        self.assertEqual(self.state()["codex_reset"]["authorized_reset_budget"],1)
+        self.assertEqual(json.loads(pending_path.read_text())["status"],"started")
+
     def test_pending_authorization_bookkeeping_recovers_after_run_was_persisted(self):
         bridge=self.enabled_bridge(2); bridge.handle_update(message(540,"/task recover bookkeeping")); token=self.budget_tokens()[1]
         bridge.handle_update(callback(541,token))
@@ -376,7 +448,7 @@ class TelegramAuthorizationTests(TelegramCase):
         self.assertIn("Full Reset", text)
         self.assertLess(text.count("\n"), 14, "warning stays concise")
         rows=card["reply_markup"]["inline_keyboard"]
-        self.assertEqual([[b["text"] for b in row] for row in rows], [["Start · 0","Start · 1"],["Start · 2"],["Cancel"]], "two choices per row, then a full-width Cancel")
+        self.assertEqual([[b["text"] for b in row] for row in rows], [["Start · 0","Start · 1"],["Start · 2"],["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],["Cancel"]])
         buttons={b["text"]:b["callback_data"] for row in rows for b in row}
         # binding checks are unchanged: another actor and a stale inventory are refused, zero starts once
         self.assertIn("rejected",bridge.handle_update(callback(531,buttons["Start · 0"],user=999)))
@@ -391,6 +463,7 @@ class TelegramAuthorizationTests(TelegramCase):
             with self.subTest(count=count):
                 bridge=self.enabled_bridge(count); bridge.handle_update(message(600+count,f"/task size {count}"))
                 card=self.api.sent[-1]
+                expected_rows=expected_rows[:-1]+[["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],expected_rows[-1]]
                 self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], expected_rows)
                 self.assertTrue(all(len(row)<=2 for row in card["reply_markup"]["inline_keyboard"][:-1]))
                 self.assertIn(f"Banked resets available: {count}", card["text"])

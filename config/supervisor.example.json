@@ -12,6 +12,19 @@
     "verification_attempts": 4,
     "verification_interval_seconds": 2
   },
+  "session_start": {
+    "enabled": true,
+    "direction": "right",
+    "ratio": 0.5,
+    "provider_commands": {"codex": "codex", "claude": "claude"},
+    "model_profiles": {
+      "codex": {
+        "default": {"label": "Default", "model": null},
+        "example": {"label": "Configured model", "model": "replace-with-supported-model-id"}
+      },
+      "claude": {"default": {"label": "Default", "model": null}}
+    }
+  },
   "max_task_file_bytes": 65536,
   "task_file_suffixes": [".md", ".txt"]
 }

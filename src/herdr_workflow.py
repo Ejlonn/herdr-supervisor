@@ -27,9 +27,11 @@ from herdr_core import (
     PLAN_CHANGED_MESSAGE,
     PROVIDERS,
     READY_STATES,
+    RUNTIME_VALIDATION_MODES,
     SHA_RE,
     TERMINAL_STATES,
     HerdrError,
+    OwnerRecoveryNeeded,
     Paths,
     SupervisorError,
     WorkerLock,
@@ -40,6 +42,7 @@ from herdr_core import (
     pid_alive,
     sha256_bytes,
     sha256_file,
+    valid_pane_id,
 )
 from herdr_protocol import FollowupFrame, ProtocolBlock, parse_followup, parse_protocol
 from herdr_redaction import credential_value_present
@@ -49,13 +52,21 @@ from herdr_validation import (
     StateStore,
     _bounded_str,
     check_safe_file,
+    checkpoint_drift,
     load_task_file,
+    owner_recovery_checkpoint,
     safe_gate_view,
     validate_followup_markdown,
     validate_gate_payload,
     validate_runtime_evidence,
     validate_upload_record,
 )
+
+
+def _carrier_panes(live: list[dict[str, Any]], session_id: str) -> list[str]:
+    """Canonical pane ids of every live record carrying `session_id`; a record without a canonical pane is
+    dropped from the locator list (never stringified into one)."""
+    return [agent["pane_id"] for agent in live if session_identity(agent) == session_id and valid_pane_id(agent.get("pane_id"))]
 
 
 class SupervisorV2Mixin:
@@ -70,6 +81,7 @@ class SupervisorV2Mixin:
     paths: Paths
     herdr: Any
     head_resolver: Callable[[Path], str]
+    _live_names: dict[str, str]
 
     if TYPE_CHECKING:  # pragma: no cover - typing-only declarations of host methods
 
@@ -93,7 +105,14 @@ class SupervisorV2Mixin:
 
         def codex_reset_inventory(self, request_id: str) -> Any: ...
 
-        def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None) -> dict[str, Any]: ...
+        def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None) -> dict[str, Any]: ...
+        def prepare_task_sessions(self, selection: Any, *, preparation_id: str, journal_path: Path | None = None,
+                                  origin: str = "supervisor", request_binding: str | None = None,
+                                  request_envelope: dict[str, Any] | None = None) -> dict[str, Any]: ...
+        def _mark_session_preparation_started(self, preparation_id: str) -> dict[str, Any] | None: ...
+        def validate_session_selection(self, selection: Any) -> dict[str, Any]: ...
+        def read_session_preparation(self, preparation_id: str) -> dict[str, Any] | None: ...
+        def session_preparation_view(self, record: dict[str, Any] | None) -> dict[str, Any] | None: ...
 
         def route(self, state: dict[str, Any], block: ProtocolBlock) -> str: ...
 
@@ -634,7 +653,77 @@ class SupervisorV2Mixin:
 
     def _runtime_pass_current(self, state: dict[str, Any]) -> bool:
         evidence = state.get("runtime_evidence")
-        return isinstance(evidence, dict) and evidence.get("result") == "PASS" and evidence.get("candidate_sha") == state.get("candidate_sha") and bool(state.get("candidate_sha"))
+        return (isinstance(evidence, dict) and evidence.get("result") == "PASS" and evidence.get("candidate_sha") == state.get("candidate_sha")
+                and bool(state.get("candidate_sha")) and self.evidence_accepted(state, evidence))
+
+    # ----- runtime evidence ownership: proposals versus accepted (canonical) evidence
+
+    @staticmethod
+    def runtime_validation_mode(state: dict[str, Any] | None) -> str:
+        """The approved plan decides who may record: collaborative unless the human-approved plan payload
+        declared fully automatic agent validation. Legacy policies without the field are collaborative."""
+        policy = (state or {}).get("runtime_policy") or {}
+        mode = policy.get("validation_mode")
+        return mode if mode in RUNTIME_VALIDATION_MODES else "operator_collaborative"
+
+    @staticmethod
+    def evidence_accepted(state: dict[str, Any], evidence: dict[str, Any]) -> bool:
+        """Evidence counts as accepted only with recorded provenance, or — legacy — when the gate it settled is
+        no longer pending (completed history stays history). A provenance-free record on a still-pending gate
+        is an unconfirmed proposal and carries no human authority."""
+        if isinstance(evidence.get("provenance"), dict):
+            return True
+        gate = state.get("pending_gate") or {}
+        return not (gate.get("status") == "pending" and gate.get("gate_id") == evidence.get("gate_id"))
+
+    def runtime_validation_view(self, state: dict[str, Any] | None) -> dict[str, Any]:
+        """One projection for status, doctor, and Telegram: none / proposed / accepted, the latest result,
+        timestamp, concise reason, who acts next, and why the task still waits. Never implies acceptance."""
+        if not state:
+            return {"state": "none", "mode": "operator_collaborative", "next_actor": None, "waiting": None}
+        mode = self.runtime_validation_mode(state)
+        gate = state.get("pending_gate") or {}
+        pending = gate.get("status") == "pending" and gate.get("gate_type") == "runtime_validation"
+        proposal = self.current_runtime_proposal(state)
+        evidence = state.get("runtime_evidence") if isinstance(state.get("runtime_evidence"), dict) else None
+        view: dict[str, Any] = {"mode": mode, "gate_pending": pending, "candidate_sha": state.get("candidate_sha"), "state": "none",
+                                "result": None, "at_utc": None, "reason": None, "next_actor": None, "waiting": None, "actor": None, "legacy": False}
+        if evidence is not None and self.evidence_accepted(state, evidence) and evidence.get("candidate_sha") == state.get("candidate_sha"):
+            provenance = evidence.get("provenance") or {}
+            view.update(state="accepted", result=evidence.get("result"), at_utc=evidence.get("received_at"), actor=provenance.get("actor") or evidence.get("actor"),
+                        reason=self._evidence_reason(evidence), legacy=provenance == {})
+            if evidence.get("result") == "FAIL" and pending:
+                view.update(next_actor="agent", waiting="the accepted result is FAIL: the agent must fix and propose new evidence, or you request a revision or cancel")
+        elif proposal is not None and proposal.get("status") == "proposed":
+            view.update(state="proposed", result=proposal.get("result"), at_utc=iso_utc(float(proposal["proposed_at_unix"])), actor=proposal.get("proposed_by"),
+                        reason=proposal.get("summary"), legacy=bool(proposal.get("legacy")), next_actor="operator",
+                        waiting=f"the agent proposed {proposal.get('result')}; nothing is recorded until you confirm it (Record {proposal.get('result')})")
+        elif pending:
+            view.update(next_actor="operator" if mode == "operator_collaborative" else "agent",
+                        waiting="no runtime attempt has been recorded yet; the agent prepares evidence and you record the result" if mode == "operator_collaborative" else "no runtime attempt has been recorded yet; the assigned agent records it directly (approved automatic mode)")
+        return view
+
+    @staticmethod
+    def _evidence_reason(evidence: dict[str, Any]) -> str | None:
+        commands = evidence.get("commands") or []
+        failures = [c.get("result") for c in commands if isinstance(c, dict) and str(c.get("result") or "").upper().startswith("FAIL")]
+        text = failures[0] if failures else (commands[-1].get("result") if commands and isinstance(commands[-1], dict) else None)
+        return str(text)[:300] if text else None
+
+    def current_runtime_proposal(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        """The durable proposal, or — for a run recorded before provenance existed — the legacy pending
+        evidence presented as an unconfirmed proposal (derived, never written as an approval)."""
+        proposal = state.get("runtime_proposal")
+        if isinstance(proposal, dict):
+            return proposal
+        evidence = state.get("runtime_evidence")
+        gate = state.get("pending_gate") or {}
+        if isinstance(evidence, dict) and evidence.get("provenance") is None and gate.get("status") == "pending" and gate.get("gate_id") == evidence.get("gate_id"):
+            return {"schema_version": 1, "run_id": state["run_id"], "gate_id": evidence["gate_id"], "status": "proposed", "result": evidence.get("result"),
+                    "candidate_sha": evidence.get("candidate_sha"), "environment": evidence.get("environment"), "evidence_path": evidence.get("evidence_path"),
+                    "evidence_sha256": evidence.get("evidence_sha256"), "proposed_by": str(evidence.get("actor") or "unknown"), "proposed_at_unix": self.clock(),
+                    "legacy": True, "summary": self._evidence_reason(evidence)}
+        return None
 
     def _push_approval_current(self, state: dict[str, Any]) -> bool:
         approval = state.get("push_approval")
@@ -795,6 +884,7 @@ class SupervisorV2Mixin:
             payload = gate["payload"]
             state["approved_plan"] = {"plan_path": gate["artifact_path"], "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"], "gate_id": gate_id, "actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock())}
             state["runtime_policy"] = {key: payload[key] for key in ("runtime_validation_required", "rebuild_required", "rebuild_reason", "push_approval_required", "migration_required")}
+            state["runtime_policy"]["validation_mode"] = payload.get("runtime_validation_mode", "operator_collaborative")
             state["continuation"] = {"kind": "plan_approved", "gate_id": gate_id, "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"]}
             self._reset_auto_turns(state)
             state["active_agent"] = "codex"
@@ -859,6 +949,8 @@ class SupervisorV2Mixin:
         if state.get("run_id") != run_id:
             raise SupervisorError("run_id does not match the current task")
         self._abandon_followup_for_revision(state, actor)
+        if isinstance(state.get("owner_recovery"), dict):
+            raise SupervisorError("the session's pane ownership must be repaired (or the run cancelled) before any revision can be delivered")
         if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action"):
             raise SupervisorError("guidance is only accepted for an action-required WAIT_USER; use the pending gate's id otherwise")
         if (state.get("pending_gate") or {}).get("status") == "pending":
@@ -891,7 +983,9 @@ class SupervisorV2Mixin:
         self.store.write_state(state)
         return {"ok": True, "message": "answer recorded; the agent will continue in the same session", "gate_id": gate_id}
 
-    def record_runtime_evidence(self, state: dict[str, Any], *, run_id: str, candidate_sha: str, environment: str, evidence_file: str, result: str, actor: str = "cli", head_resolver: Callable[[Path], str] | None = None) -> dict[str, Any]:
+    def _validate_runtime_submission(self, state: dict[str, Any], *, run_id: str, candidate_sha: str, environment: str, evidence_file: str, result: str, head_resolver: Callable[[Path], str] | None) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+        """Shared checks for proposing and recording: pending runtime gate, approved plan, exact candidate,
+        environment, HEAD, safe evidence file, validated evidence whose result matches the command."""
         if state.get("run_id") != run_id:
             raise SupervisorError("run_id does not match the current task")
         gate = state.get("pending_gate")
@@ -924,16 +1018,87 @@ class SupervisorV2Mixin:
         evidence = validate_runtime_evidence(raw, candidate_sha=candidate_sha, environment=environment, now=self.clock())
         if evidence["result"] != result:
             raise SupervisorError(f"evidence result {evidence['result']} does not match the {result} command")
-        record = {**evidence, "evidence_path": str(path), "evidence_sha256": sha256_file(path), "received_at": iso_utc(self.clock()), "gate_id": gate["gate_id"], "actor": actor}
+        return gate, path, evidence
+
+    def record_runtime_evidence(self, state: dict[str, Any], *, run_id: str, candidate_sha: str, environment: str, evidence_file: str, result: str, actor: str = "cli", head_resolver: Callable[[Path], str] | None = None) -> dict[str, Any]:
+        """Agent/CLI entry. Collaborative mode (default): a durable PROPOSAL only — no canonical record, no
+        gate change, no push gate; the operator confirms. Automatic mode (approved plan payload): recorded
+        directly with agent provenance. An actor label never grants operator authority."""
+        if self.runtime_validation_mode(state) != "automatic_agent":
+            return self.propose_runtime_evidence(state, run_id=run_id, candidate_sha=candidate_sha, environment=environment, evidence_file=evidence_file, result=result, actor=actor, head_resolver=head_resolver)
+        gate, path, evidence = self._validate_runtime_submission(state, run_id=run_id, candidate_sha=candidate_sha, environment=environment, evidence_file=evidence_file, result=result, head_resolver=head_resolver)
+        provenance = {"mode": "automatic_agent", "actor": _bounded_str(actor, "actor", max_len=200), "chat_id": None, "at_unix": self.clock()}
+        return self._apply_runtime_evidence(state, gate, path, evidence, result, actor=actor, provenance=provenance)
+
+    def propose_runtime_evidence(self, state: dict[str, Any], *, run_id: str, candidate_sha: str, environment: str, evidence_file: str, result: str, actor: str = "cli", head_resolver: Callable[[Path], str] | None = None) -> dict[str, Any]:
+        gate, path, evidence = self._validate_runtime_submission(state, run_id=run_id, candidate_sha=candidate_sha, environment=environment, evidence_file=evidence_file, result=result, head_resolver=head_resolver)
+        digest = sha256_file(path)
+        existing = state.get("runtime_proposal")
+        if isinstance(existing, dict) and existing.get("status") == "proposed" and existing.get("evidence_sha256") == digest and existing.get("gate_id") == gate["gate_id"]:
+            return {"ok": True, "message": f"runtime {result} is already proposed for candidate {candidate_sha[:12]}; waiting for operator confirmation", "gate_id": gate["gate_id"], "proposed": True, "evidence_sha256": digest}
+        if isinstance(existing, dict) and existing.get("status") == "proposed":
+            existing["status"] = "superseded"
+            self._log(state, "runtime_proposal_superseded", gate_id=gate["gate_id"], evidence_sha256=existing.get("evidence_sha256"))
+        proposal = {
+            "schema_version": 1, "run_id": state["run_id"], "gate_id": gate["gate_id"], "status": "proposed", "result": result,
+            "candidate_sha": candidate_sha, "environment": environment, "evidence_path": str(path), "evidence_sha256": digest,
+            "proposed_by": _bounded_str(actor, "actor", max_len=200), "proposed_at_unix": self.clock(), "legacy": False,
+            "summary": self._evidence_reason(evidence),
+        }
+        state["runtime_proposal"] = proposal
+        self.emit_event(state, "RUNTIME_EVIDENCE_PROPOSED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "result": result,
+                                                              "evidence_sha256": digest, "proposed_by": proposal["proposed_by"], "summary": proposal["summary"],
+                                                              "commands": [{"command": c["command"][:200], "result": c["result"][:200]} for c in evidence["commands"][:12]]})
+        self.store.write_state(state)
+        self._log(state, "runtime_proposed", gate_id=gate["gate_id"], result=result, actor=actor, evidence_sha256=digest)
+        return {"ok": True, "message": f"runtime {result} PROPOSED for candidate {candidate_sha[:12]}; nothing is recorded until the operator confirms it (Telegram Record {result}, or `herdr-supervisor runtime-confirm`)", "gate_id": gate["gate_id"], "proposed": True, "evidence_sha256": digest}
+
+    def confirm_runtime_evidence(self, state: dict[str, Any], *, run_id: Any, gate_id: Any, evidence_sha256: Any, decision: Any, actor: str, chat_id: Any = None, candidate_sha: Any = None, environment: Any = None, head_resolver: Callable[[Path], str] | None = None) -> dict[str, Any]:
+        """Authenticated operator confirmation of the current proposal: bound to run, gate, candidate,
+        environment, the exact evidence bytes, and live state. The recorded result is the evidence file's
+        result; a decision that contradicts the bytes is refused (new evidence is needed instead)."""
+        if not isinstance(run_id, str) or run_id != state.get("run_id"):
+            raise SupervisorError("runtime confirmation must be bound to the current run")
+        if decision not in ("PASS", "FAIL"):
+            raise SupervisorError("decision must be PASS or FAIL")
+        if chat_id is not None and type(chat_id) is not int:
+            raise SupervisorError("chat_id must be an integer when present")
+        proposal = self.current_runtime_proposal(state)
+        if proposal is None or proposal.get("status") != "proposed":
+            raise SupervisorError("no runtime evidence proposal is pending; nothing to confirm")
+        if gate_id != proposal.get("gate_id"):
+            raise SupervisorError("confirmation does not match the pending runtime gate")
+        if not isinstance(evidence_sha256, str) or evidence_sha256 != proposal.get("evidence_sha256"):
+            raise SupervisorError("confirmation does not match the proposed evidence; use the newest card")
+        if candidate_sha is not None and candidate_sha != proposal.get("candidate_sha"):
+            raise SupervisorError("confirmation candidate does not match the proposal")
+        if environment is not None and environment != proposal.get("environment"):
+            raise SupervisorError("confirmation environment does not match the proposal")
+        if decision != proposal.get("result"):
+            raise SupervisorError(f"the proposed evidence says {proposal.get('result')}; recording {decision} requires new evidence, not a relabel")
+        gate, path, evidence = self._validate_runtime_submission(state, run_id=run_id, candidate_sha=str(proposal["candidate_sha"]), environment=str(proposal["environment"]), evidence_file=str(proposal["evidence_path"]), result=decision, head_resolver=head_resolver)
+        if gate.get("gate_id") != gate_id or sha256_file(path) != evidence_sha256:
+            raise SupervisorError("the evidence file changed since it was proposed; propose it again")
+        provenance = {"mode": "operator_collaborative", "actor": _bounded_str(actor, "actor", max_len=200), "chat_id": chat_id, "at_unix": self.clock(), "proposal_sha256": evidence_sha256}
+        if isinstance(state.get("runtime_proposal"), dict):
+            state["runtime_proposal"]["status"] = "accepted"
+        else:
+            state["runtime_proposal"] = {**proposal, "status": "accepted"}
+        return self._apply_runtime_evidence(state, gate, path, evidence, decision, actor=actor, provenance=provenance)
+
+    def _apply_runtime_evidence(self, state: dict[str, Any], gate: dict[str, Any], path: Path, evidence: dict[str, Any], result: str, *, actor: str, provenance: dict[str, Any]) -> dict[str, Any]:
+        """The canonical write: exactly the pre-existing PASS/FAIL semantics plus provenance."""
+        candidate_sha, environment = evidence["candidate_sha"], evidence["environment"]
+        record = {**evidence, "evidence_path": str(path), "evidence_sha256": sha256_file(path), "received_at": iso_utc(self.clock()), "gate_id": gate["gate_id"], "actor": actor, "provenance": provenance}
         state["runtime_evidence"] = record
         if result == "FAIL":
             gate["last_failure"] = {"at": record["received_at"], "evidence_sha256": record["evidence_sha256"]}
             state["pending_gate"] = gate
-            self.emit_event(state, "RUNTIME_VALIDATION_FAILED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment})
+            self.emit_event(state, "RUNTIME_VALIDATION_FAILED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "provenance_mode": provenance["mode"], "actor": provenance["actor"]})
             self.store.write_state(state)
             return {"ok": True, "message": "runtime validation FAIL recorded; task remains blocked at WAIT_RUNTIME_VALIDATION", "gate_id": gate["gate_id"]}
-        self._finish_gate(state, gate, "approved", actor=actor, chat_id=None, note="runtime PASS recorded")
-        self.emit_event(state, "RUNTIME_VALIDATION_PASSED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "evidence_sha256": record["evidence_sha256"]})
+        self._finish_gate(state, gate, "approved", actor=actor, chat_id=provenance.get("chat_id"), note="runtime PASS recorded")
+        self.emit_event(state, "RUNTIME_VALIDATION_PASSED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "evidence_sha256": record["evidence_sha256"], "provenance_mode": provenance["mode"], "actor": provenance["actor"]})
         policy = state.get("runtime_policy") or {}
         if policy.get("push_approval_required"):
             push_gate = self._synthesize_push_gate(state, gate)
@@ -1516,7 +1681,7 @@ class SupervisorV2Mixin:
         request_id = command.get("request_id")
         if not isinstance(request_id, str) or not re.match(r"^[A-Za-z0-9_-]{8,128}$", request_id):
             raise SupervisorError("command request_id must be 8-128 URL-safe characters")
-        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "retry_routing_result", "ask_agent", "retry_followup_response", "return_to_decision"):
+        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "retry_routing_result", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply"):
             raise SupervisorError(f"unsupported command action {command.get('action')!r}")
         dirs = self.inbox_paths()
         for path in dirs.values():
@@ -1574,7 +1739,7 @@ class SupervisorV2Mixin:
                 # bound by apply_command but the crash came before the result was published: publish once now
                 prior["notified"] = True
                 state["processed_requests"][request_id] = prior
-                self.emit_event(state, "COMMAND_RESULT", {"request_id": request_id, "action": command.get("action"), "ok": prior.get("ok"), "message": prior.get("message"), "chat_id": command.get("chat_id"), "callback_query_id": command.get("callback_query_id")})
+                self.emit_event(state, "COMMAND_RESULT", {"request_id": request_id, "action": command.get("action"), "ok": prior.get("ok"), "message": prior.get("message"), "chat_id": command.get("chat_id"), "callback_query_id": command.get("callback_query_id"), "preview": prior.get("preview")})
                 self.store.write_state(state)
                 if command.get("action") == "task" and command.get("upload_id"):
                     self._mark_upload_started(command, str(prior.get("run_id")))
@@ -1593,7 +1758,7 @@ class SupervisorV2Mixin:
             if len(processed) > 200:
                 for key in sorted(processed, key=lambda k: processed[k].get("at", ""))[:-200]:
                     del processed[key]
-            self.emit_event(state, "COMMAND_RESULT", {"request_id": request_id, "action": command.get("action"), "ok": result["ok"], "message": result["message"], "chat_id": command.get("chat_id"), "callback_query_id": command.get("callback_query_id")})
+            self.emit_event(state, "COMMAND_RESULT", {"request_id": request_id, "action": command.get("action"), "ok": result["ok"], "message": result["message"], "chat_id": command.get("chat_id"), "callback_query_id": command.get("callback_query_id"), "preview": result.get("preview")})
             self.store.write_state(state)
         return result
 
@@ -1614,8 +1779,11 @@ class SupervisorV2Mixin:
             raise SupervisorError("pending reset authorization identity is invalid")
         path = self.paths.pending_starts_dir / f"{pending_id}.json"
         record = load_json(path, label="pending reset authorization")
-        if record.get("status") not in ("start_enqueued", "supervisor_consuming"):
+        authorization_status = record.get("status")
+        if authorization_status not in ("start_enqueued", "supervisor_consuming"):
             raise SupervisorError("pending reset authorization is not executable")
+        if authorization_status == "supervisor_consuming" and not isinstance(record.get("supervisor_consuming_at"), str):
+            raise SupervisorError("pending reset authorization consumption state is invalid")
         expected_actor = f"telegram:{record.get('owner_user_id')}"
         task_sha = hashlib.sha256(json.dumps(task, sort_keys=True).encode()).hexdigest()
         checks = (
@@ -1628,18 +1796,29 @@ class SupervisorV2Mixin:
             record.get("budget") == budget,
             record.get("available_count") == authorization.get("available_count"),
             record.get("account_fingerprint") == authorization.get("account_fingerprint"),
-            self.clock() <= float(record.get("expires_at_unix") or 0),
+            record.get("session_selection") == command.get("session_selection"),
+            authorization_status == "supervisor_consuming" or self.clock() <= float(record.get("expires_at_unix") or 0),
         )
         if not all(checks):
             raise SupervisorError("pending reset authorization binding is stale or invalid")
-        if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+        if authorization_status == "start_enqueued" and isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
             current = self.codex_reset_inventory(f"start-auth-{pending_id}-{uuid.uuid4().hex}")
             if current.account_fingerprint != record.get("account_fingerprint") or current.available_count != record.get("inventory_available_count"):
                 raise SupervisorError("Codex account or reset inventory changed after authorization")
         record["status"] = "supervisor_consuming"
-        record["supervisor_consuming_at"] = iso_utc(self.clock())
+        record["supervisor_consuming_at"] = record.get("supervisor_consuming_at") or iso_utc(self.clock())
         atomic_write_json(path, record)
         return path
+
+    def _session_preparation_failure_message(self, preparation_id: str, error: SupervisorError) -> str:
+        try:
+            owners = self.owners()
+            preserved = ", ".join(f"{p} {str(owners[p]['session_id'])[:8]}" for p in PROVIDERS)
+        except SupervisorError:
+            preserved = "the current sessions"
+        return (f"No task was delivered. {error} Preserved unchanged: {preserved}. Recovery: send the same task again to reconcile "
+                f"a settled result, run `herdr-supervisor abandon-session-start --preparation-id {preparation_id}` to release this attempt, "
+                "or start with Preserve sessions.")
 
     def _mark_pending_start_started(self, command: dict[str, Any], run_id: str) -> None:
         """Finish pending-start bookkeeping after the run journal is authoritative.
@@ -1666,8 +1845,6 @@ class SupervisorV2Mixin:
         actor = str(command.get("actor") or "unknown")
         chat_id = command.get("chat_id")
         if action == "task":
-            if state is not None and state.get("supervisor_state") not in TERMINAL_STATES:
-                raise SupervisorError(f"a task is still {state['supervisor_state']}; the supervisor has no task queue")
             text = command.get("task_text")
             task_file = command.get("task_file")
             if (text is None) == (task_file is None):
@@ -1684,13 +1861,75 @@ class SupervisorV2Mixin:
                 char_limit = int(self.config["max_task_file_bytes"])
             if not isinstance(text, str) or not text.strip():
                 raise SupervisorError("task_text is required")
-            self.verify_or_seed_owners()
             authorization = command.get("codex_reset_authorization")
             task_binding = {key: command[key] for key in ("task_text", "task_file", "task_reference", "task_file_sha256", "upload_id", "source") if key in command}
+            selection = command.get("session_selection")
+            if state is not None and state.get("supervisor_state") not in TERMINAL_STATES:
+                preallocated = command.get("preallocated_run_id")
+                expected_selection = self.validate_session_selection(selection)
+                reset = state.get("codex_reset") or {}
+                exact_initialized_start = (
+                    isinstance(preallocated, str)
+                    and state.get("run_id") == preallocated
+                    and state.get("task_id") == preallocated
+                    and state.get("task_text") == text
+                    and state.get("task_reference") == reference
+                    and state.get("workflow_policy") == "gated_v2"
+                    and state.get("start_agent") == "codex"
+                    and state.get("session_selection") == expected_selection
+                    and isinstance(authorization, dict)
+                    and reset.get("authorized_reset_budget") == authorization.get("budget")
+                    and reset.get("authorization_available_count") == authorization.get("available_count")
+                    and reset.get("account_fingerprint") == authorization.get("account_fingerprint")
+                )
+                if not exact_initialized_start or not isinstance(preallocated, str):
+                    raise SupervisorError(f"a task is still {state['supervisor_state']}; the supervisor has no task queue")
+                pending_authorization = self._validate_pending_reset_authorization(command, task_binding)
+                # Recovery for the crash boundary after initialize() made this exact preallocated run
+                # authoritative but before its inbox request and preparation completion were recorded.
+                # The pending-start record above binds the actor, task, selection, account, and request;
+                # never prepare sessions or replay the original task prompt here.
+                recovered_preparation = self.read_session_preparation(preallocated)
+                if recovered_preparation is not None:
+                    if recovered_preparation.get("selection") != expected_selection:
+                        raise SupervisorError("initialized task session selection does not match its preparation")
+                    bound = recovered_preparation.get("bound_owners") or {}
+                    expected_sessions = {provider: bound.get(provider, {}).get("session_id") for provider in PROVIDERS}
+                    if state.get("native_sessions") != expected_sessions:
+                        raise SupervisorError("initialized task native sessions do not match its preparation")
+                elif expected_selection["fresh_providers"]:
+                    raise SupervisorError("initialized fresh-session task has no preparation record")
+                started_preparation = self._mark_session_preparation_started(preallocated)
+                if started_preparation is not None:
+                    state["session_preparation"] = self.session_preparation_view(started_preparation)
+                result = {"ok": True, "message": f"task started with codex (run {preallocated[:8]})", "run_id": preallocated}
+                request_id = command.get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    raise SupervisorError("task request identity is invalid")
+                state.setdefault("processed_requests", {})[request_id] = {
+                    "request_id": request_id, "action": "task", "at": iso_utc(self.clock()), "notified": False, **result,
+                }
+                state["task_command"] = {"request_id": request_id, "upload_id": command.get("upload_id"), "task_reference": reference, "task_file_sha256": command.get("task_file_sha256")}
+                self.store.write_state(state)
+                if pending_authorization is not None:
+                    self._mark_pending_start_started(command, preallocated)
+                if task_file is not None:
+                    self._mark_upload_started(command, preallocated)
+                return result
             pending_authorization = self._validate_pending_reset_authorization(command, task_binding)
+            try:
+                preparation = self.prepare_task_sessions(selection, preparation_id=str(command.get("preallocated_run_id")))
+            except SupervisorError as error:
+                # The operator-facing outcome: nothing was delivered, the old sessions are intact, and the
+                # concrete recovery choices (retry adopts a settled result; abandon frees a new sequence).
+                raise SupervisorError(self._session_preparation_failure_message(str(command.get("preallocated_run_id")), error)) from error
             new_state = self.initialize(text, "codex", task_reference=reference, workflow_policy="gated_v2", char_limit=char_limit,
                                         codex_reset_authorization=authorization if isinstance(authorization, dict) else None,
-                                        run_id=command.get("preallocated_run_id"))
+                                        run_id=command.get("preallocated_run_id"), session_selection=selection, session_preparation=preparation)
+            started_preparation=self._mark_session_preparation_started(new_state["run_id"])
+            if started_preparation is not None:
+                new_state["session_preparation"]=self.session_preparation_view(started_preparation)
+                self.store.write_state(new_state)
             result = {"ok": True, "message": f"task started with codex (run {new_state['run_id'][:8]})", "run_id": new_state["run_id"]}
             request_id = command.get("request_id")
             if isinstance(request_id, str) and request_id:
@@ -1731,6 +1970,15 @@ class SupervisorV2Mixin:
             return self.retry_followup_response(state, run_id=command.get("run_id"), followup_turn_id=command.get("followup_turn_id"), actor=actor)
         if action == "return_to_decision":
             return self.return_to_decision(state, run_id=command.get("run_id"), followup_turn_id=command.get("followup_turn_id"), actor=actor)
+        if action == "owner_recovery_preview":
+            preview = self.owner_recovery_preview(state, run_id=command.get("run_id"), recovery_id=command.get("recovery_id"))
+            return {"ok": True, "message": ("repair eligible: " if preview["eligible"] else "repair not eligible: ") + str(preview["reason"]) + f" — next: {preview['next_action']}", "preview": preview}
+        if action == "owner_recovery_apply":
+            return self.owner_recovery_apply(state, run_id=command.get("run_id"), recovery_id=command.get("recovery_id"), pane=command.get("pane"), actor=actor, chat_id=chat_id if type(chat_id) is int else None)
+        if action == "runtime_confirm":
+            return self.confirm_runtime_evidence(state, run_id=command.get("run_id"), gate_id=command.get("gate_id"), evidence_sha256=command.get("evidence_sha256"),
+                                                 decision=command.get("decision"), actor=actor, chat_id=chat_id if type(chat_id) is int else None,
+                                                 candidate_sha=command.get("candidate_sha"), environment=command.get("environment"))
         if action == "done":
             bound = command.get("run_id")
             if not isinstance(bound, str) or not bound:
@@ -1766,6 +2014,11 @@ class SupervisorV2Mixin:
         if action == "resume":
             if state["supervisor_state"] in TERMINAL_STATES:
                 raise SupervisorError(f"task is already {state['supervisor_state']}")
+            if isinstance(state.get("owner_recovery"), dict) and state["supervisor_state"] == "WAIT_USER":
+                # Resume clears the condition only when fresh live evidence shows the exact session back in its
+                # recorded pane (duplicate closed, original kept): no locator change, no adoption. Anything else
+                # still needs the bound repair or cancel.
+                self._owner_recovery_clear_in_place(state, actor=actor)
             followup = self.followup_unresolved(state)
             if followup is not None and followup["status"] == "FAILED" and state["supervisor_state"] == "WAIT_USER":
                 raise SupervisorError("a follow-up question has no verified answer; retry reading the answer, return to the decision, or request a revision")
@@ -1889,41 +2142,222 @@ class SupervisorV2Mixin:
         return [agent for agent in self.herdr.list_agents() if session_identity(agent) == session_id]
 
     def recover_agent(self, provider: str) -> dict[str, Any]:
-        """Locate a workflow agent by the identity rule (persisted provider AND exact native session);
-        restore in the recorded pane; as a last resort create a non-focused workspace. Ambiguity, a
-        wrong-provider carrier, or a wrong returned identity fails closed."""
+        """Locate a workflow agent by the identity rule (persisted provider AND exact native session) and
+        restore it ONLY inside its recorded pane. A missing recorded pane, the exact session in another pane,
+        or in several panes stops here as a structured owner-recovery condition: no workspace is created, no
+        agent is started elsewhere, no target cache or owner locator changes, and no prompt is sent."""
         owners = self.owners()
         record = owners[provider]
         name = self.agent_name(provider)
-        identity = match_exact_session(self.herdr.list_agents(), provider, record["session_id"])
+        live = self.herdr.list_agents()
+        identity = match_exact_session(live, provider, record["session_id"])
+        carriers = _carrier_panes(live, record["session_id"])
         if identity.ambiguous:
-            raise SupervisorError(f"{provider} native session {record['session_id'][:8]} is live in more than one pane; refusing")
+            raise OwnerRecoveryNeeded(f"{provider} native session {record['session_id'][:8]} is live in more than one pane ({', '.join(carriers)}); refusing",
+                                      provider=provider, classification="duplicate", session_id=record["session_id"], recorded_pane=record["pane_id"], live_panes=carriers)
         if identity.provider_conflicts:
             raise SupervisorError(f"{provider} native session {record['session_id'][:8]} is carried by a record of another provider; refusing")
         if identity.record is not None:
             agent = identity.record
             if agent.get("pane_id") != record["pane_id"]:
-                raise SupervisorError(f"{provider} native session {record['session_id'][:8]} is live in pane {agent.get('pane_id')} but {record['pane_id']} is recorded; refusing (pane conflict)")
+                raise OwnerRecoveryNeeded(f"{provider} native session {record['session_id'][:8]} is live in pane {agent.get('pane_id')} but {record['pane_id']} is recorded; refusing (pane conflict)",
+                                          provider=provider, classification="moved", session_id=record["session_id"], recorded_pane=record["pane_id"], live_panes=carriers)
             return agent
-        args = [part.format(session_id=record["session_id"]) for part in self.config["agents"][provider]["native_resume_args"]]
         pane_id = record["pane_id"]
         if not self.herdr.pane_available(pane_id):
-            created = self.herdr.create_workspace(label=f"herdr-supervisor {provider} recovery", cwd=self.config["project_root"])
-            if not isinstance(created, str) or not created:
-                raise SupervisorError("workspace creation returned no pane id; refusing to guess")
-            pane_id = created
+            raise OwnerRecoveryNeeded(f"{provider} native session {record['session_id'][:8]} is not live and its recorded pane {pane_id} is unavailable; nothing was created, started, or resent",
+                                      provider=provider, classification="missing_pane", session_id=record["session_id"], recorded_pane=pane_id, live_panes=carriers)
+        args = [part.format(session_id=record["session_id"]) for part in self.config["agents"][provider]["native_resume_args"]]
         self.herdr.start_agent(name, kind=provider, pane_id=pane_id, args=args)
         agent = self.herdr.get_agent(name)
         if session_identity(agent) != record["session_id"] or agent.get("agent") != provider:
             raise SupervisorError(f"{name} restored with native session {session_identity(agent)!r} ({agent.get('agent')!r}), expected {record['session_id']} ({provider}); refusing")
-        if pane_id != record["pane_id"]:
-            self._log_owner_locator(provider, agent)
+        if agent.get("pane_id") != pane_id:
+            raise SupervisorError(f"{name} restored outside its recorded pane ({agent.get('pane_id')} != {pane_id}); refusing")
         return agent
 
-    def _log_owner_locator(self, provider: str, agent: dict[str, Any]) -> None:
-        """Update only the convenience locator (pane) of a verified exact session; the id never changes."""
+    # ----- exact-session pane-ownership recovery (nonterminal runs): structured wait, bound preview/apply
+
+    @staticmethod
+    def owner_recovery_view(recovery: Any) -> dict[str, Any] | None:
+        """Bounded, secret-free projection: what happened, which provider/session (abbreviated), panes, and
+        the recovery id the operator's preview/apply must carry."""
+        if not isinstance(recovery, dict):
+            return None
+        checkpoint = recovery.get("checkpoint") or {}
+        return {"recovery_id": recovery.get("recovery_id"), "provider": recovery.get("provider"), "session_abbrev": str(recovery.get("session_id") or "")[:8],
+                "classification": recovery.get("classification"), "recorded_pane": recovery.get("recorded_pane"), "live_panes": list(recovery.get("live_panes") or []),
+                "created_at_unix": recovery.get("created_at_unix"),
+                "checkpoint": {"phase": checkpoint.get("phase"), "delivery_turn_abbrev": str(checkpoint.get("delivery_turn_id") or "")[:8] or None, "delivery_status": checkpoint.get("delivery_status"),
+                               "continuation_kind": (checkpoint.get("continuation") or {}).get("kind") if isinstance(checkpoint.get("continuation"), dict) else None}}
+
+    def enter_owner_recovery(self, state: dict[str, Any], error: OwnerRecoveryNeeded) -> str:
+        """Persist the condition and stop in an actionable wait. The authority fields (affected provider/session,
+        classification, the complete owner snapshot) and the workflow checkpoint are recorded; the recovery id is
+        reused only for an exact re-observation of all of them, so a changed condition invalidates old cards.
+        Live panes are a non-authoritative observation refreshed on each entry."""
         owners = self.owners()
-        if session_identity(agent) != owners[provider]["session_id"]:
-            raise SupervisorError("refusing to update a locator for a different native session")
-        owners[provider] = {"pane_id": str(agent.get("pane_id")), "session_id": owners[provider]["session_id"]}
+        if not all(valid_pane_id(owners[p]["pane_id"]) for p in PROVIDERS):
+            raise SupervisorError("owners.json carries a non-canonical pane id; refusing to record a recovery condition on it")
+        if owners[error.provider]["session_id"] != error.session_id or owners[error.provider]["pane_id"] != error.recorded_pane:
+            raise SupervisorError("owners.json changed while the identity failure was being recorded; refusing")
+        checkpoint = owner_recovery_checkpoint(state)
+        authority = {"provider": error.provider, "session_id": error.session_id, "classification": error.classification, "recorded_pane": error.recorded_pane,
+                     "owners_before": {p: dict(owners[p]) for p in PROVIDERS}, "checkpoint": checkpoint}
+        existing = state.get("owner_recovery")
+        same = isinstance(existing, dict) and all(existing.get(key) == value for key, value in authority.items())
+        recovery_id = str(existing["recovery_id"]) if same and isinstance(existing, dict) else str(uuid.uuid4())
+        state["owner_recovery"] = {"schema_version": 1, "run_id": state["run_id"], "recovery_id": recovery_id, **authority,
+                                   "live_panes": [pane for pane in error.live_panes if valid_pane_id(pane)][:16], "created_at_unix": self.clock()}
+        state["supervisor_state"] = "WAIT_USER"
+        state["wait_user_reason"] = str(error)
+        state["wait_user_requires_action"] = True
+        state["worker_pid"] = None
+        self.emit_event(state, "WAIT_USER", {"reason": str(error), "owner_recovery": self.owner_recovery_view(state["owner_recovery"])})
+        self.store.write_state(state)
+        self._log(state, "owner_recovery_wait", provider=error.provider, classification=error.classification, recorded_pane=error.recorded_pane, live_panes=error.live_panes, recovery_id=recovery_id, reused=same)
+        return "stop"
+
+    def _owner_recovery_clear_in_place(self, state: dict[str, Any], *, actor: str) -> None:
+        if self.herdr is None:
+            raise SupervisorError("this wait needs the pane-ownership repair (preview, then apply) or cancel; live agents cannot be inspected from this control path")
+        preview = self.owner_recovery_preview(state, run_id=state.get("run_id"), recovery_id=None)
+        if not preview.get("in_place"):
+            raise SupervisorError(f"this wait needs the pane-ownership repair, not a plain resume: {preview['reason']} — next: {preview['next_action']}")
+        recovery = state.get("owner_recovery") or {}
+        state["owner_recovery"] = None
+        self._log(state, "owner_recovery_cleared_in_place", provider=recovery.get("provider"), session_abbrev=str(recovery.get("session_id") or "")[:8], pane=recovery.get("recorded_pane"), actor=actor)
+
+    def _owner_recovery_problem(self, state: dict[str, Any], *, run_id: Any, recovery_id: Any) -> dict[str, Any]:
+        """The recovery condition this run is waiting on, or why no repair may be considered right now."""
+        if not isinstance(run_id, str) or run_id != state.get("run_id"):
+            raise SupervisorError("owner recovery must be bound to the current run")
+        recovery = state.get("owner_recovery")
+        if not isinstance(recovery, dict):
+            raise SupervisorError("no owner-recovery condition is recorded for this run")
+        if recovery_id is not None and recovery_id != recovery.get("recovery_id"):
+            raise SupervisorError("this recovery action belongs to an earlier condition; refresh the preview")
+        if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action"):
+            raise SupervisorError(f"the run is {state.get('supervisor_state')}, not in the owner-recovery wait")
+        if (state.get("pending_gate") or {}).get("status") == "pending":
+            raise SupervisorError("a typed gate is pending; owner repair is not applicable")
+        if state.get("quota_wait") is not None:
+            raise SupervisorError("a quota wait is in flight")
+        phase = (state.get("codex_reset") or {}).get("current_redemption_state")
+        if phase not in ("IDLE", "RESET_VERIFIED"):
+            raise SupervisorError(f"a Codex reset is being reconciled ({phase})")
+        if self.followup_unresolved(state) is not None:
+            raise SupervisorError("a follow-up question is unresolved; return to the decision first")
+        delivery = state.get("delivery")
+        if isinstance(delivery, dict) and delivery.get("status") == "prepared":
+            raise SupervisorError("a prompt submission is in flight; wait for it to settle")
+        if pid_alive(state.get("worker_pid")):
+            raise SupervisorError("a worker still owns the agents")
+        drift = checkpoint_drift(recovery.get("checkpoint"), owner_recovery_checkpoint(state))
+        if drift is not None:
+            raise SupervisorError(f"the run's workflow checkpoint no longer matches the recorded recovery condition ({drift} changed); repair refused")
+        return recovery
+
+    def owner_recovery_preview(self, state: dict[str, Any], *, run_id: Any, recovery_id: Any = None, live_agents: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Read-only eligibility from fresh live evidence: exactly one ready carrier of the same provider AND
+        exact session, in a pane other than the stale recorded one, nothing else carrying the session."""
+        recovery = self._owner_recovery_problem(state, run_id=run_id, recovery_id=recovery_id)
+        if self.herdr is None:
+            raise SupervisorError("live agents cannot be inspected from this control path")
+        provider, session = recovery["provider"], recovery["session_id"]
+        live = live_agents if live_agents is not None else self.herdr.list_agents()
+        owners = self.owners()
+        carriers = [a for a in live if session_identity(a) == session]
+        panes = _carrier_panes(live, session)
+        view = {"recovery_id": recovery["recovery_id"], "provider": provider, "session_abbrev": session[:8], "recorded_pane": recovery["recorded_pane"],
+                "classification": recovery["classification"], "live_panes": panes, "eligible": False, "new_pane": None, "reason": None, "next_action": None}
+        if owners[provider]["session_id"] != session or (state.get("native_sessions") or {}).get(provider) != session:
+            view.update(reason="owners.json or the run no longer records this exact session; use rebind-sessions at a terminal boundary", next_action="cancel or finish the run, then rebind")
+            return view
+        # Every unaffected owner must equal the snapshot taken when the condition was recorded AND be exactly
+        # one ready live carrier in that recorded pane; any drift invalidates the recovery without mutation.
+        for other in PROVIDERS:
+            if other == provider:
+                continue
+            expected = recovery["owners_before"][other]
+            if owners[other] != expected or (state.get("native_sessions") or {}).get(other) != expected["session_id"]:
+                view.update(reason=f"{other} ownership changed since the condition was recorded ({expected['pane_id']} / {expected['session_id'][:8]})", next_action="inspect owners.json; this recovery is no longer valid — cancel the run or rebind at a terminal boundary")
+                return view
+            match = match_exact_session(live, other, expected["session_id"])
+            if not match.unique or match.record is None or match.record.get("pane_id") != expected["pane_id"] or match.record.get("agent_status") not in READY_STATES:
+                view.update(reason=f"{other} session {expected['session_id'][:8]} is not exactly one idle carrier in its recorded pane {expected['pane_id']}", next_action=f"restore/settle the {other} session in {expected['pane_id']} first, then refresh this preview")
+                return view
+        if not carriers:
+            view.update(reason=f"the exact {provider} session {session[:8]} is not live in any pane", next_action=f"reopen the session in its recorded pane {recovery['recorded_pane']} (herdr agent start … resume {session[:8]}…) or close the run")
+            return view
+        if len(carriers) > 1:
+            view.update(reason=f"the same session is live in {len(carriers)} panes ({', '.join(panes)})", next_action="close the unwanted duplicate pane(s), keep one, then refresh this preview")
+            return view
+        carrier = carriers[0]
+        pane = carrier.get("pane_id")
+        if not valid_pane_id(pane):
+            view.update(reason="the carrier reports no canonical pane id", next_action="inspect the pane; no repair is possible")
+            return view
+        if carrier.get("agent") != provider:
+            view.update(reason=f"the session's only carrier is not a {provider} agent record", next_action="inspect the pane; no repair is possible")
+            return view
+        if carrier.get("agent_status") not in READY_STATES:
+            view.update(reason=f"the carrier in {pane} is {carrier.get('agent_status')}", next_action="wait until it is idle, then refresh this preview")
+            return view
+        if pane == owners[provider]["pane_id"]:
+            # Either the session is back in its recorded pane, or an earlier apply wrote the locator and died
+            # before recording that; in both cases no locator change is needed and a resume clears the condition.
+            view.update(reason=f"the session is in the pane owners.json records ({pane}); no locator change is needed", next_action="/resume continues the run in place", eligible=False, new_pane=pane, in_place=True)
+            return view
+        if any(recovery["owners_before"][p]["pane_id"] == pane for p in PROVIDERS if p != provider):
+            view.update(reason=f"pane {pane} is recorded for another provider", next_action="inspect the panes; no repair is possible")
+            return view
+        view.update(eligible=True, new_pane=pane, reason=f"one idle {provider} carrier of session {session[:8]} in {pane}; recorded pane {recovery['recorded_pane']} is stale",
+                    next_action=f"apply the repair to record pane {pane} (session id unchanged)")
+        return view
+
+    def owner_recovery_apply(self, state: dict[str, Any], *, run_id: Any, recovery_id: Any, pane: Any, actor: str, chat_id: Any = None) -> dict[str, Any]:
+        """Change only owners.json[provider].pane_id to the previewed pane after re-proving every condition
+        (recovery binding, checkpoint, affected carrier, unaffected owners) against fresh live evidence. The
+        caller holds the worker lock (CLI acquires it; the inbox worker owns it). Resumption follows the
+        recorded checkpoint, never whatever happens to be present."""
+        if not valid_pane_id(pane):
+            raise SupervisorError("repair pane is not a canonical Herdr pane id (w<n>:p<n>)")
+        if not isinstance(recovery_id, str):
+            raise SupervisorError("repair requires the previewed recovery id")
+        if self.paths.lock_file.exists() and WorkerLock.is_held(self.paths.lock_file) and WorkerLock.holder_pid(self.paths.lock_file) != os.getpid():
+            raise SupervisorError("another worker holds the agents; repair refused")
+        preview = self.owner_recovery_preview(state, run_id=run_id, recovery_id=recovery_id)
+        if not preview["eligible"] or preview["new_pane"] != pane:
+            raise SupervisorError(f"repair refused: {preview['reason']} ({preview['next_action']})")
+        recovery = state["owner_recovery"]
+        provider, session = recovery["provider"], recovery["session_id"]
+        owners = self.owners()
+        if owners != recovery["owners_before"]:
+            raise SupervisorError("owners.json changed since the condition was recorded; refresh the preview")
+        checkpoint = recovery["checkpoint"]
+        drift = checkpoint_drift(checkpoint, owner_recovery_checkpoint(state))
+        if drift is not None:
+            raise SupervisorError(f"workflow checkpoint drifted ({drift}); repair refused")
+        old_pane = owners[provider]["pane_id"]
+        owners[provider] = {"pane_id": pane, "session_id": session}  # the session id is copied from state, never derived from live data
         atomic_write_json(self.paths.owners_file, owners, mode=0o600)
+        self._live_names.clear()
+        state["owner_recovery"] = None
+        state["wait_user_reason"] = None
+        state["wait_user_requires_action"] = False
+        if checkpoint["delivery_turn_id"] is not None and checkpoint["delivery_status"] in ("prepared", "accepted", "uncertain", "interrupted"):
+            # The recorded turn is reread/reconciled by the worker for that exact turn; nothing is resubmitted here.
+            state["supervisor_state"] = "RUNNING"
+            resumption = f"the worker rereads the accepted turn {checkpoint['delivery_turn_id'][:8]}"
+        elif checkpoint["continuation"] is not None:
+            state["continuation"] = json.loads(json.dumps(checkpoint["continuation"]))  # exactly the recorded continuation
+            state["supervisor_state"] = "RUNNING"
+            resumption = f"the worker delivers the recorded {checkpoint['continuation'].get('kind')} continuation once"
+        else:
+            state["wait_user_reason"] = f"pane ownership repaired ({old_pane} -> {pane}); /resume continues in the same session"
+            resumption = "/resume continues in the same session (nothing was sent)"
+        self.emit_event(state, "OWNER_PANE_REPAIRED", {"provider": provider, "session_abbrev": session[:8], "old_pane": old_pane, "new_pane": pane, "actor": actor, "resumption": resumption})
+        self.store.write_state(state)
+        self._log(state, "owner_pane_repaired", provider=provider, session_abbrev=session[:8], old_pane=old_pane, new_pane=pane, actor=actor, recovery_id=recovery_id)
+        return {"ok": True, "message": f"{provider} pane locator repaired {old_pane} -> {pane} for session {session[:8]} (identity unchanged); {resumption}", "old_pane": old_pane, "new_pane": pane}

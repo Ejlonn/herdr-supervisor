@@ -6,7 +6,8 @@
     "cwd": "/home/user/workspace",
     "panes": [
       "w1:p1",
-      "w1:p2"
+      "w1:p2",
+      "w1:p3"
     ],
     "probe_targets": {
       "missing_agent": "no-such-agent-zz",
@@ -47,6 +48,7 @@
   ],
   "statement": "No real account, session, pane, tab, workspace, terminal, path, title, quota, or secret data remains; recorded envelopes keep the exact Herdr 0.9.0 key structure with the placeholder values above. Original identifiers are not recorded anywhere in this fixture set.",
   "synthetic_responses": [
+    "pane-split",
     "synthetic-error-agent-blocked",
     "synthetic-error-agent-not-idle",
     "synthetic-error-prompt-stalled",

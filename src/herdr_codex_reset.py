@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Supported Codex app-server banked-reset adapter and durable helper journal."""
+"""Supported Codex app-server adapter (banked-reset inventory/consume and durable `thread/start`) and the
+user-scoped helper journal that executes those operations exactly once outside the supervisor service."""
 from __future__ import annotations
 
 import argparse
@@ -135,6 +136,53 @@ def parse_consume(result: Any) -> str:
     return aliases[outcome]
 
 
+THREAD_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
+
+
+def thread_start_params(payload: Any) -> dict[str, Any]:
+    """Only Supervisor-owned values reach `thread/start`: an absolute workspace, an optional configured model,
+    and a durable (non-ephemeral) thread. Approval/sandbox stay at the launch profile's configured defaults."""
+    if not isinstance(payload, dict) or set(payload) != {"cwd", "model", "ephemeral"}:
+        raise ResetError("invalid thread-start payload")
+    cwd, model, ephemeral = payload["cwd"], payload["model"], payload["ephemeral"]
+    if not isinstance(cwd, str) or not cwd.startswith("/") or "\x00" in cwd or len(cwd) > 1024:
+        raise ResetError("thread-start cwd must be an absolute path")
+    if model is not None and (not isinstance(model, str) or not MODEL_RE.fullmatch(model)):
+        raise ResetError("thread-start model is invalid")
+    if ephemeral is not False:
+        raise ResetError("thread-start must create a durable thread")
+    params: dict[str, Any] = {"cwd": cwd, "ephemeral": False}
+    if model is not None:
+        params["model"] = model
+    return params
+
+
+def parse_thread_start(result: Any, *, requested_cwd: str, requested_model: str | None) -> dict[str, Any]:
+    """Accept the documented ThreadStartResponse and keep only non-secret identity/launch metadata."""
+    if not isinstance(result, dict):
+        raise ResetError("thread-start response is not an object")
+    thread = result.get("thread")
+    if not isinstance(thread, dict):
+        raise ResetError("thread-start response has no thread")
+    thread_id = thread.get("id")
+    if not isinstance(thread_id, str) or not THREAD_ID_RE.fullmatch(thread_id):
+        raise ResetError("thread-start returned no canonical thread id")
+    model, provider, cwd = result.get("model"), result.get("modelProvider"), result.get("cwd")
+    if not isinstance(model, str) or not model or not isinstance(provider, str) or not provider or not isinstance(cwd, str):
+        raise ResetError("thread-start response lacks model, provider, or cwd")
+    if thread.get("ephemeral") is not False:
+        raise ResetError("thread-start returned an ephemeral thread")
+    if cwd != requested_cwd or thread.get("cwd") != requested_cwd:
+        raise ResetError("thread-start response cwd does not match the request")
+    if requested_model is not None and model != requested_model:
+        raise ResetError("thread-start response model does not match the request")
+    cli_version, created_at = thread.get("cliVersion"), thread.get("createdAt")
+    if not isinstance(cli_version, str) or isinstance(created_at, bool) or not isinstance(created_at, int):
+        raise ResetError("thread-start response lacks thread provenance")
+    return {"thread_id": thread_id, "model": model, "model_provider": provider, "cwd": cwd, "cli_version": cli_version, "created_at": created_at}
+
+
 class AppServerClient:
     def __init__(self, command: list[str] | None = None, *, timeout: float = 15,
                  clock: Callable[[], float] = time.time, extra_env: dict[str, str] | None = None):
@@ -204,18 +252,26 @@ class AppServerClient:
             raise ResetError("invalid idempotency key")
         return parse_consume(self._call("account/rateLimitResetCredit/consume", {"idempotencyKey": key}))
 
+    def thread_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create one durable thread without a user prompt or model turn. Not idempotent: the caller persists
+        intent before this call and never repeats an uncertain outcome."""
+        params = thread_start_params(payload)
+        return parse_thread_start(self._call("thread/start", params), requested_cwd=params["cwd"], requested_model=params.get("model"))
+
 
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
 def make_request(operation: str, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
-    if operation not in ("inventory", "consume") or not isinstance(request_id, str) or not SAFE_ID.fullmatch(request_id):
+    if operation not in ("inventory", "consume", "thread_start") or not isinstance(request_id, str) or not SAFE_ID.fullmatch(request_id):
         raise ResetError("invalid reset-helper request")
     if not isinstance(payload, dict) or (operation == "inventory" and payload):
         raise ResetError("invalid reset-helper payload")
     if operation == "consume" and (set(payload) != {"idempotency_key"} or not isinstance(payload["idempotency_key"], str) or not 16 <= len(payload["idempotency_key"]) <= 128):
         raise ResetError("invalid reset-helper consume payload")
+    if operation == "thread_start":
+        thread_start_params(payload)  # strict shape; the digest below binds the exact request
     core = {"schema_version": 2, "request_id": request_id, "operation": operation, "payload": payload}
     return {**core, "request_digest": hashlib.sha256(_canonical(core)).hexdigest()}
 
@@ -277,6 +333,29 @@ class JournalGateway:
     def consume(self, key: str, request_id: str) -> str:
         return str(self.request("consume", {"idempotency_key": key}, request_id)["outcome"])
 
+    def thread_start(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Submit one thread-start request; a timeout is ambiguous (the thread may exist) and raises."""
+        result = self.request("thread_start", payload, request_id)
+        thread = result.get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("thread_id"), str) or not THREAD_ID_RE.fullmatch(thread["thread_id"]):
+            raise ResetError("thread-start helper result has no canonical thread id")
+        return thread
+
+    def result_if_present(self, operation: str, payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+        """Read a settled helper result for this exact request without submitting or waiting. Used to
+        reconcile an operation whose outcome was unknown when the caller last ran. None = still unknown."""
+        request = make_request(operation, payload, request_id)
+        result = self.root / "results" / f"{request_id}.json"
+        if not result.exists():
+            return None
+        try:
+            value = json.loads(result.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ResetError("reset-helper result is corrupt") from error
+        if not isinstance(value, dict) or value.get("request_id") != request_id or value.get("request_digest") != request["request_digest"]:
+            raise ResetError("reset-helper result identity mismatch")
+        return value
+
 
 def process_once(root: Path, client: AppServerClient | None = None) -> int:
     client = client or AppServerClient()
@@ -290,6 +369,7 @@ def process_once(root: Path, client: AppServerClient | None = None) -> int:
         source = work[0]
         filename_id = source.stem
         target = processing / source.name
+        recovered = source.parent == processing  # the helper died after moving the request in flight
         if source.parent == pending:
             os.replace(source, target)
             _fsync_dir(pending)
@@ -306,7 +386,14 @@ def process_once(root: Path, client: AppServerClient | None = None) -> int:
                     raise ResetError("existing reset-helper result identity mismatch")
                 target.unlink(missing_ok=True)
                 continue
-            if request["operation"] == "inventory":
+            if request["operation"] == "thread_start":
+                if recovered:
+                    # thread/start has no idempotency key. A request found in flight after a restart may or may
+                    # not have created a thread; record that as a definitive uncertain outcome and never resend.
+                    raise ResetError("thread start was interrupted; its outcome is unknown and it was not repeated")
+                output = {"request_id": filename_id, "request_digest": request["request_digest"], "ok": True,
+                          "thread": client.thread_start(request["payload"])}
+            elif request["operation"] == "inventory":
                 inventory = client.inventory()
                 output = {"request_id": filename_id, "request_digest": request["request_digest"], "ok": True, "inventory": inventory.as_dict()}
             else:

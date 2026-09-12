@@ -64,8 +64,12 @@ EVENT_TYPES = (
     "PUSH_APPROVAL_REQUIRED", "PUSH_APPROVED", "TASK_PAUSED", "TASK_RESUMED", "TASK_CANCELLED", "TASK_DONE",
     "TASK_ERROR", "RECOVERED_AFTER_RESTART", "COMMAND_RESULT", "QUERY_RESULT",
     "CODEX_RESET_AUTHORIZED", "CODEX_RESET_STARTED", "CODEX_RESET_VERIFIED", "CODEX_RESET_UNAVAILABLE",
-    "TASK_HANDED_OFF", "AGENT_FOLLOWUP_READY",
+    "TASK_HANDED_OFF", "AGENT_FOLLOWUP_READY", "RUNTIME_EVIDENCE_PROPOSED", "OWNER_PANE_REPAIRED",
 )
+
+# Who may turn runtime evidence into a canonical PASS/FAIL. Collaborative (default): agents only propose;
+# an authenticated operator confirmation records. Automatic: only when the approved plan payload says so.
+RUNTIME_VALIDATION_MODES = ("operator_collaborative", "automatic_agent")
 
 # Gate-preserving follow-up ("Ask agent"): one bounded question to the same native session while a human
 # decision (typed gate or missing-result wait) stays suspended and is restored unchanged afterwards.
@@ -165,6 +169,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "manual_quota_refresh_min_interval_seconds": 60,
     "codex_reset": {"enabled": True, "helper_timeout_seconds": 30, "inventory_max_age_seconds": 120,
                     "verification_attempts": 4, "verification_interval_seconds": 2},
+    # New-task-only native-session policy. Model profile values are identifiers, never raw argv;
+    # the fixed --model argv is constructed only after a read-only local capability probe.
+    "session_start": {
+        "enabled": True, "direction": "right", "ratio": 0.5,
+        "provider_commands": {"codex": "codex", "claude": "claude"},
+        "model_profiles": {
+            "codex": {"default": {"label": "Default", "model": None}},
+            "claude": {"default": {"label": "Default", "model": None}},
+        },
+    },
     # Conservative provider-specific patterns. A quota wait is entered only when
     # the snapshot shows a blocking window AND one of these matches the screen.
     "quota_screen_patterns": {
@@ -227,6 +241,31 @@ class SupervisorError(RuntimeError):
 
 class QuotaError(SupervisorError):
     """Quota evidence is missing, malformed, or contradictory."""
+
+class OwnerRecoveryNeeded(SupervisorError):
+    """The exact persisted native session cannot be targeted from its recorded pane: the pane is unavailable
+    (`missing_pane`), the session is live in another pane (`moved`), or in several panes (`duplicate`).
+    Structured so the runtime can persist an operator-recoverable condition instead of a free-form reason."""
+
+    def __init__(self, message: str, *, provider: str, classification: str, session_id: str, recorded_pane: str | None, live_panes: list[str]) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.classification = classification
+        self.session_id = session_id
+        self.recorded_pane = recorded_pane
+        self.live_panes = list(live_panes)
+
+
+OWNER_RECOVERY_CLASSIFICATIONS = ("missing_pane", "moved", "duplicate")
+
+# The recorded Herdr pane locator contract (`w<digits>:p<digits>`, e.g. w3:p2, w12:p10). One validator for
+# owner records, recovery state, CLI/callback input, and live carriers before any mutation.
+PANE_ID_RE = re.compile(r"^w[0-9]{1,6}:p[0-9]{1,6}$")
+
+
+def valid_pane_id(value: Any) -> bool:
+    return type(value) is str and PANE_ID_RE.fullmatch(value) is not None
+
 
 class HerdrError(SupervisorError):
     def __init__(self, message: str, *, code: str = "command_error", output: str = "") -> None:
@@ -313,6 +352,10 @@ class Paths:
     @property
     def pending_starts_dir(self) -> Path:
         return self.state_dir / "pending-starts"
+
+    @property
+    def session_preparations_dir(self) -> Path:
+        return self.state_dir / "session-preparations"
 
 def iso_utc(epoch: float) -> str:
     return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -449,7 +492,37 @@ def load_config(path: Path) -> dict[str, Any]:
         value = _number(reset.get(key))
         if value is None or value <= 0:
             raise SupervisorError(f"codex_reset.{key} must be positive")
+    validate_session_start_config(config)
     return config
+
+def validate_session_start_config(config: dict[str, Any]) -> None:
+    section = config.get("session_start")
+    if not isinstance(section, dict) or not isinstance(section.get("enabled"), bool):
+        raise SupervisorError("session_start configuration is invalid")
+    if section.get("direction") not in ("right", "down"):
+        raise SupervisorError("session_start.direction must be right or down")
+    ratio = section.get("ratio")
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0.1 <= float(ratio) <= 0.9:
+        raise SupervisorError("session_start.ratio must be between 0.1 and 0.9")
+    commands, profiles = section.get("provider_commands"), section.get("model_profiles")
+    if not isinstance(commands, dict) or set(commands) != set(PROVIDERS) or not isinstance(profiles, dict) or set(profiles) != set(PROVIDERS):
+        raise SupervisorError("session_start must configure both providers")
+    profile_re = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
+    for provider in PROVIDERS:
+        if not isinstance(commands[provider], str) or not commands[provider]:
+            raise SupervisorError(f"session_start.provider_commands.{provider} must be a command name")
+        entries = profiles[provider]
+        if not isinstance(entries, dict) or "default" not in entries:
+            raise SupervisorError(f"session_start.model_profiles.{provider} must include default")
+        for profile_id, entry in entries.items():
+            if not isinstance(profile_id, str) or not profile_re.fullmatch(profile_id) or not isinstance(entry, dict):
+                raise SupervisorError(f"invalid {provider} model profile")
+            label, model = entry.get("label"), entry.get("model")
+            model_ok = model is None or (isinstance(model,str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}",model) is not None)
+            if not isinstance(label, str) or not label or len(label) > 60 or not model_ok:
+                raise SupervisorError(f"invalid {provider} model profile {profile_id}")
+            if profile_id == "default" and model is not None:
+                raise SupervisorError(f"{provider} default model profile must not override the model")
 
 class WorkerLock:
     """Non-blocking exclusive flock; released automatically when the process exits."""

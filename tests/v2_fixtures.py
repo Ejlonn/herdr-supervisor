@@ -38,6 +38,59 @@ class FakeClock:
         self.current += seconds
 
 
+_RESUMED = object()
+
+import herdr_codex_reset as hcr  # noqa: E402
+
+
+class FakeThreadJournal:
+    """Scripted helper journal for the app-server operations the supervisor issues during a fresh Codex
+    start. Inventory/consume go to the real on-disk JournalGateway of the fixture (those tests script their
+    own gateway); thread/start is scripted here and records every request exactly once."""
+
+    def __init__(self, case: "V2Case") -> None:
+        self.case = case
+        self.real = hcr.JournalGateway(case.paths.codex_reset_dir, timeout=1, sleeper=case.clock.sleep)
+        self.requests: list[tuple[str, dict]] = []
+        self.results: dict[str, dict] = {}
+        self.next_thread_ids = ["44444444-4444-4444-8444-444444444444", "66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777"]
+        self.created = 0
+        self.mode = "ok"  # ok | timeout | malformed | error | timeout_then_settled
+        self.model_reported: str | None = None  # override the returned model (mismatch tests)
+
+    def inventory(self, request_id: str):
+        return self.real.inventory(request_id)
+
+    def consume(self, key: str, request_id: str):
+        return self.real.consume(key, request_id)
+
+    def _make(self, payload: dict) -> dict:
+        hcr.thread_start_params(payload)
+        self.created += 1
+        thread_id = self.next_thread_ids.pop(0) if self.next_thread_ids else f"{self.created:08d}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        return {"thread_id": thread_id, "model": self.model_reported or payload.get("model") or "gpt-5-codex", "model_provider": "openai",
+                "cwd": payload["cwd"], "cli_version": "0.154.0", "created_at": int(self.case.clock.current)}
+
+    def thread_start(self, payload: dict, request_id: str) -> dict:
+        self.requests.append((request_id, dict(payload)))
+        if self.mode == "error":
+            self.results[request_id] = {"request_id": request_id, "ok": False, "error": "helper failed"}
+            raise hcr.ResetError("helper failed")
+        if self.mode in ("timeout", "timeout_then_settled"):
+            if self.mode == "timeout_then_settled":
+                self.results[request_id] = {"request_id": request_id, "ok": True, "thread": self._make(payload)}
+            raise hcr.ResetError("reset-helper result timed out; operation is uncertain")
+        if self.mode == "malformed":
+            raise hcr.ResetError("thread-start returned no canonical thread id")
+        thread = self._make(payload)
+        self.results[request_id] = {"request_id": request_id, "ok": True, "thread": thread}
+        return thread
+
+    def result_if_present(self, operation: str, payload: dict, request_id: str) -> dict | None:
+        hcr.make_request(operation, payload, request_id)
+        return self.results.get(request_id)
+
+
 class FakeHerdr:
     """Scripted adapter. `responses` is consumed per prompt: {'v2': (stage, next, gate, payload)} or
     {'v1': next} or {'output': ..., 'status': ...} or {'error': code}."""
@@ -58,8 +111,11 @@ class FakeHerdr:
         self.sent_keys: list = []
         self.starts: list = []
         self.workspaces: list = []
+        self.splits: list = []
         self.available_panes: set[str] = {"w3:p1", "w3:p2"}
         self.next_pane = "w9:p1"
+        self.next_sessions = {"codex": "44444444-4444-4444-8444-444444444444", "claude": "55555555-5555-4555-8555-555555555555"}
+        self.resume_reports: object = _RESUMED  # _RESUMED = report the resumed thread id; None = no identity; a str = that id
         self.refresh_commands: list = []
         self.on_wait = None
         self.on_refresh = None
@@ -117,6 +173,12 @@ class FakeHerdr:
 
     def list_agents(self) -> list[dict]:
         return list(self.agents.values())
+
+    def capability_report(self) -> dict:
+        self.help_probes += 1
+        return {"detected_version":"0.9.0","minimum_version":"0.9.0","version_ok":True,"version_detail":"fixture",
+                "required":{"agent start (--kind/--pane)":True,"agent get":True,"agent list":True},"missing_capabilities":[],"optional":{"prompt lifecycle acknowledgement (--until + agent_prompt_stalled)":self.ack_supported,
+                "task-start pane split (--direction/--ratio/--cwd/--no-focus)":True},"compatible":True,"prompt_ack_mode":"lifecycle" if self.ack_supported else "settle"}
 
     def _resolve(self, target: str, command: str) -> str:
         """Herdr accepts an agent name or a pane id as TARGET. Records the raw target per command and
@@ -196,9 +258,23 @@ class FakeHerdr:
 
     def start_agent(self, name: str, *, kind: str, pane_id: str, args: list[str]) -> dict:
         self.starts.append((name, kind, pane_id, args))
-        session = {"codex": CODEX_SESSION, "claude": CLAUDE_SESSION}[kind]
+        if len(args) >= 2 and args[0] == "resume":
+            # `codex resume <thread-id>`: Herdr observes exactly the resumed thread as the native session,
+            # unless a test scripts a divergent report (missing identity, wrong thread).
+            session = args[1] if self.resume_reports is _RESUMED else self.resume_reports
+        else:
+            session = self.next_sessions[kind] if "-run-" in name else {"codex":CODEX_SESSION,"claude":CLAUDE_SESSION}[kind]
         self.agents[name] = self.agent(kind, name, pane_id, session)
+        if session is None:
+            self.agents[name].pop("agent_session", None)
         return {}
+
+    def split_pane(self, pane_id: str, *, direction: str, ratio: float, cwd: str) -> str | None:
+        self.splits.append((pane_id,direction,ratio,cwd))
+        pane=self.next_pane
+        self.next_pane=f"w9:p{len(self.splits)+1}"
+        self.available_panes.add(pane)
+        return pane
 
     def pane_available(self, pane_id: str) -> bool:
         return pane_id in self.available_panes
@@ -272,6 +348,7 @@ class V2Case(unittest.TestCase):
         self.write_quota("claude", 80, NOW + 3600, 60, NOW + 86400)
         self.head = SHA_A
         self.head_resolver = lambda repo: self.head
+        self.thread_journal = FakeThreadJournal(self)
         self.sup = self.make_supervisor()
 
     def reset_fixture(self) -> None:
@@ -282,6 +359,10 @@ class V2Case(unittest.TestCase):
     def make_supervisor(self) -> "hs.Supervisor":
         sup = hs.Supervisor(self.paths, self.config, self.herdr, clock=self.clock.time, sleeper=self.clock.sleep)
         sup.head_resolver = self.head_resolver
+        # Fresh Codex fixtures: the thread journal is shared across supervisors of one case (restart tests)
+        # and the read-only Codex thread contract is verified unless a test says otherwise.
+        sup.reset_gateway = self.thread_journal
+        sup._codex_thread_contract = dict(getattr(self, "codex_contract", {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True}))
         return sup
 
     def tearDown(self) -> None:
@@ -357,6 +438,19 @@ class V2Case(unittest.TestCase):
         path = self.review_dir / name
         path.write_text(json.dumps(evidence))
         return path
+
+    def record_runtime(self, result: str, *, sha: str = SHA_A, environment: str = "TEST", evidence: Path | None = None, actor: str = "agent", confirm: bool = True, operator: str = "operator-cli") -> dict:
+        """Collaborative runtime evidence in two authenticated steps: the agent proposes, the operator confirms.
+        With confirm=False only the proposal exists (nothing recorded)."""
+        evidence = evidence or self.evidence_file(sha, result, environment=environment)
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            proposed = self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=sha, environment=environment, evidence_file=str(evidence), result=result, actor=actor, head_resolver=self.head_resolver)
+        if not confirm or not proposed.get("proposed"):
+            return proposed
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            return self.sup.confirm_runtime_evidence(st, run_id=st["run_id"], gate_id=proposed["gate_id"], evidence_sha256=proposed["evidence_sha256"], decision=result, actor=operator, head_resolver=self.head_resolver)
 
     # ----- drive a gated run to a given point
     def start_gated(self, responses: list[dict]) -> int:

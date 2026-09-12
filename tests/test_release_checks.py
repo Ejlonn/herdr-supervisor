@@ -13,7 +13,7 @@ import herdr_core  # noqa: E402
 from v2_fixtures import hs  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIPPED_MODULES = ["herdr_supervisor", "herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_runtime", "herdr_command", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "telegram_api"]
+SHIPPED_MODULES = ["herdr_supervisor", "herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_runtime", "herdr_command", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "telegram_api"]
 SECRET_SHAPES = [
     re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b"),  # Telegram bot token
     re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),

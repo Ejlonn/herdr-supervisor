@@ -27,6 +27,7 @@ from herdr_core import (
     TERMINAL_STATES,
     WORKFLOW_POLICIES,
     HerdrError,
+    OwnerRecoveryNeeded,
     Paths,
     QuotaError,
     SupervisorError,
@@ -38,8 +39,21 @@ from herdr_core import (
 )
 from herdr_protocol import ProtocolBlock, parse_protocol
 from herdr_quota import QuotaSnapshot, QuotaWindow, blocking_windows, parse_quota_snapshot, quota_as_dict, quota_resume_at
+from herdr_sessions import (
+    cli_request_binding,
+    cli_request_envelope,
+    fresh_codex_components,
+    fresh_policy_supported,
+    preparation_view,
+    prepare_sessions,
+    probe_codex_thread_contract,
+    probe_model_flag,
+    session_contract_supported,
+    validate_preparation_record,
+    validate_selection,
+)
 from herdr_validation import StateStore, git_head, new_v2_fields, query_owner_summary, safe_gate_view
-from herdr_workflow import SupervisorV2Mixin
+from herdr_workflow import SupervisorV2Mixin, _carrier_panes
 
 
 def telegram_doctor_summary() -> dict[str, Any]:
@@ -81,6 +95,108 @@ class Supervisor(SupervisorV2Mixin):
             timeout=float(config["codex_reset"]["helper_timeout_seconds"]),
             sleeper=sleeper,
         )
+
+    def model_flag_supported(self, provider: str) -> bool:
+        """Read-only provider CLI probe; tests may replace this method, never a model session."""
+        return probe_model_flag(self.config["session_start"]["provider_commands"][provider])
+
+    def codex_thread_contract(self) -> dict[str, bool]:
+        """Read-only, per-process cached probe of the Codex app-server/thread/resume chain; tests replace it."""
+        cached = getattr(self, "_codex_thread_contract", None)
+        if cached is None:
+            cached = probe_codex_thread_contract(self.config["session_start"]["provider_commands"]["codex"])
+            self._codex_thread_contract = cached
+        return cached
+
+    def fresh_policy_supported(self, policy: str) -> bool:
+        probe = getattr(self.herdr, "capability_report", None)
+        report = probe() if callable(probe) else None
+        return fresh_policy_supported(self.config, policy, report, self.codex_thread_contract() if policy in ("fresh-codex", "fresh-all") else None)
+
+    def create_codex_thread(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """One durable thread via the helper journal. A timeout or helper failure is reported as unresolved;
+        the caller has already persisted the intent and never repeats the request."""
+        try:
+            return self.reset_gateway.thread_start(payload, request_id)
+        except hcr.ResetError as error:
+            raise SupervisorError(str(error)) from error
+
+    def settled_codex_thread(self, payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+        """Reconcile an earlier thread-start whose outcome was unknown: adopt a settled successful result for
+        the exact request, report None while unknown, and treat a recorded failure as unresolved (the
+        operator decides; nothing is resent)."""
+        try:
+            value = self.reset_gateway.result_if_present("thread_start", payload, request_id)
+        except hcr.ResetError as error:
+            raise SupervisorError(str(error)) from error
+        if value is None:
+            return None
+        if not value.get("ok"):
+            raise SupervisorError(f"thread start recorded a failure ({str(value.get('error') or 'unknown')[:120]}); the outcome may be an orphaned thread")
+        thread = value.get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("thread_id"), str) or not hcr.THREAD_ID_RE.fullmatch(thread["thread_id"]):
+            raise SupervisorError("settled thread-start result has no canonical thread id")
+        return thread
+
+    def prepare_task_sessions(self, selection: Any, *, preparation_id: str, journal_path: Path | None = None,
+                              origin: str = "supervisor", request_binding: str | None = None,
+                              request_envelope: dict[str, Any] | None = None) -> dict[str, Any]:
+        return prepare_sessions(self, selection, preparation_id=preparation_id, journal_path=journal_path,
+                                origin=origin, request_binding=request_binding, request_envelope=request_envelope)
+
+    @staticmethod
+    def session_preparation_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        return preparation_view(record)
+
+    def rebind_sessions(self, panes: dict[str, str], *, apply: bool = False) -> dict[str, Any]:
+        """Terminal-only explicit adoption of externally started sessions; validates the full set first."""
+        with WorkerLock(self.paths.lock_file):
+            return self._rebind_sessions_locked(panes,apply=apply)
+
+    def _rebind_sessions_locked(self, panes: dict[str, str], *, apply: bool = False) -> dict[str, Any]:
+        state = self.store.read_state(required=False)
+        if state and state.get("supervisor_state") not in TERMINAL_STATES:
+            raise SupervisorError("session rebind is forbidden while a supervised run is nonterminal")
+        if not panes or any(provider not in PROVIDERS or not isinstance(pane, str) or not pane for provider, pane in panes.items()):
+            raise SupervisorError("rebind requires explicit valid provider pane targets")
+        old = self.owners()
+        live = self.herdr.list_agents()
+        proposed = {provider: dict(old[provider]) for provider in PROVIDERS}
+        for provider, pane in panes.items():
+            candidates = [a for a in live if a.get("agent") == provider and a.get("pane_id") == pane]
+            if len(candidates) != 1 or candidates[0].get("agent_status") not in READY_STATES:
+                raise SupervisorError(f"{provider} rebind target is not one unique ready agent in pane {pane}")
+            identity = session_identity(candidates[0])
+            if not identity or any(session_identity(a) == identity for a in live if a is not candidates[0]):
+                raise SupervisorError(f"{provider} rebind target has a missing or duplicate native identity")
+            proposed[provider] = {"pane_id": pane, "session_id": identity}
+        view = {p: {"old": old[p]["session_id"][:8], "new": proposed[p]["session_id"][:8], "pane_id": proposed[p]["pane_id"]} for p in panes}
+        if apply:
+            atomic_write_json(self.paths.owners_file, proposed, mode=0o600)
+            self._live_names.clear()
+            if self.paths.session_preparations_dir.exists():
+                for path in self.paths.session_preparations_dir.glob("*.json"):
+                    record=load_json(path,label="session preparation")
+                    if isinstance(record,dict) and record.get("status") not in ("TASK_STARTED","ABANDONED"):
+                        record.update({"status":"ABANDONED","resolved_by":"explicit_rebind","abandoned_at":iso_utc(self.clock())})
+                        atomic_write_json(path,record)
+        return {"applied": apply, "providers": view}
+
+    def abandon_session_preparation(self, preparation_id: str) -> dict[str, Any]:
+        """Make a non-binding failed preparation inert without closing any pane or session."""
+        with WorkerLock(self.paths.lock_file):
+            return self._abandon_session_preparation_locked(preparation_id)
+
+    def _abandon_session_preparation_locked(self, preparation_id: str) -> dict[str, Any]:
+        if not isinstance(preparation_id,str) or not _UUID_RE.fullmatch(preparation_id):
+            raise SupervisorError("session preparation id is invalid")
+        path=self.paths.session_preparations_dir/f"{preparation_id}.json"
+        record=load_json(path,label="session preparation")
+        if record.get("preparation_id")!=preparation_id or record.get("status") in ("BINDING","OWNERSHIP_BOUND","TASK_STARTED"):
+            raise SupervisorError("this preparation cannot be abandoned; inspect ownership and use explicit rebind if needed")
+        record.update({"status":"ABANDONED","abandoned_at":iso_utc(self.clock())})
+        atomic_write_json(path,record)
+        return {"abandoned":True,"preparation_id":preparation_id,"note":"all created panes and sessions were preserved"}
 
     def codex_reset_inventory(self, request_id: str) -> hcr.ResetInventory:
         if not self.config["codex_reset"]["enabled"]:
@@ -415,8 +531,10 @@ class Supervisor(SupervisorV2Mixin):
         alias = self.config["agents"][provider]["name"]
         agents = live_agents if live_agents is not None else self.herdr.list_agents()
         identity = match_exact_session(agents, provider, expected)  # the one identity rule
+        carriers = _carrier_panes(agents, expected)
         if identity.ambiguous:
-            raise SupervisorError(f"{provider} native session {expected[:8]} is live in more than one pane; refusing")
+            raise OwnerRecoveryNeeded(f"{provider} native session {expected[:8]} is live in more than one pane ({', '.join(carriers)}); refusing",
+                                      provider=provider, classification="duplicate", session_id=expected, recorded_pane=recorded_pane, live_panes=carriers)
         if identity.provider_conflicts:
             raise SupervisorError(f"the live record for native session {expected[:8]} is not a {provider} agent; refusing")
         by_alias = [agent for agent in agents if agent.get("name") == alias]
@@ -433,7 +551,8 @@ class Supervisor(SupervisorV2Mixin):
             # without its alias). The only approved automatic acceptance is alias loss in the SAME pane;
             # anything else fails closed before the live-target cache or owners.json changes and before
             # any command is issued.
-            raise SupervisorError(f"{provider} native session {expected[:8]} reports pane {pane} but {recorded_pane} is recorded; refusing (pane conflict)")
+            raise OwnerRecoveryNeeded(f"{provider} native session {expected[:8]} reports pane {pane} but {recorded_pane} is recorded; refusing (pane conflict)",
+                                      provider=provider, classification="moved", session_id=expected, recorded_pane=recorded_pane, live_panes=carriers)
         if agent.get("name") == alias:
             # alias fast path: only after the same rule proved the alias record is the unique exact match in the recorded pane
             self._live_names[provider] = alias
@@ -476,6 +595,13 @@ class Supervisor(SupervisorV2Mixin):
 
     def _log(self, state: dict[str, Any], event: str, **details: Any) -> None:
         self.store.append_log(state, event, **details)
+
+    def _identity_stop(self, state: dict[str, Any], error: Exception, reason: str) -> str:
+        """A failed exact-session lookup stops the worker. A structured owner-recovery condition is persisted
+        as an actionable wait with its checkpoint; any other failure is the plain wait it always was."""
+        if isinstance(error, OwnerRecoveryNeeded):
+            return self.enter_owner_recovery(state, error)
+        return self.set_wait_user(state, reason)
 
     def set_wait_user(self, state: dict[str, Any], reason: str, *, requires_action: bool = False) -> str:
         """requires_action=True: a plain `resume` must not clear this wait; the human must revise/answer/cancel."""
@@ -701,7 +827,7 @@ class Supervisor(SupervisorV2Mixin):
             try:
                 agent = self.ensure_agent(provider)
             except (SupervisorError, HerdrError) as error:
-                return self.set_wait_user(state, f"cannot safely inspect {self.agent_name(provider)}: {error}")
+                return self._identity_stop(state, error, f"cannot safely inspect {self.agent_name(provider)}: {error}")
             name = self.agent_name(provider)  # the verified target resolved by ensure_agent, never a stale alias
             status = agent["agent_status"]
             if status == "working":
@@ -994,7 +1120,7 @@ class Supervisor(SupervisorV2Mixin):
         try:
             agent = self.ensure_agent(provider)
         except (SupervisorError, HerdrError) as error:
-            return self.set_wait_user(state, f"cannot inspect {self.agent_name(provider)} after the quota wait: {error}")
+            return self._identity_stop(state, error, f"cannot inspect {self.agent_name(provider)} after the quota wait: {error}")
         name = self.agent_name(provider)  # verified target (alias or pane) resolved by ensure_agent
         status = agent["agent_status"]
         if status == "blocked":
@@ -1050,7 +1176,8 @@ class Supervisor(SupervisorV2Mixin):
 
     # ----- run loop
 
-    def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None) -> dict[str, Any]:
+    def _validate_new_run_request(self, task: str, start: str, workflow_policy: str, char_limit: int | None,
+                                  codex_reset_authorization: dict[str, Any] | None) -> None:
         if start not in PROVIDERS:
             raise SupervisorError(f"invalid starting agent: {start}")
         if workflow_policy not in WORKFLOW_POLICIES:
@@ -1060,6 +1187,17 @@ class Supervisor(SupervisorV2Mixin):
         limit = int(char_limit) if char_limit is not None else int(self.config["max_task_chars"])
         if len(task) > limit:
             raise SupervisorError("task text exceeds max_task_chars" if char_limit is None else "task file exceeds the file character ceiling")
+        if codex_reset_authorization is not None:
+            budget=codex_reset_authorization.get("budget")
+            available=codex_reset_authorization.get("available_count")
+            fingerprint=codex_reset_authorization.get("account_fingerprint")
+            if isinstance(budget,bool) or not isinstance(budget,int) or budget<0 or isinstance(available,bool) or not isinstance(available,int) or budget>available:
+                raise SupervisorError("Codex reset authorization is invalid")
+            if budget>0 and (not isinstance(fingerprint,str) or not re.fullmatch(r"[0-9a-f]{64}",fingerprint)):
+                raise SupervisorError("positive Codex reset budget requires a verified account identity")
+
+    def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._validate_new_run_request(task,start,workflow_policy,char_limit,codex_reset_authorization)
         existing = self.store.read_state(required=False)
         if existing and existing.get("supervisor_state") not in TERMINAL_STATES:
             raise SupervisorError(
@@ -1092,14 +1230,12 @@ class Supervisor(SupervisorV2Mixin):
             "created_at": iso_utc(self.clock()),
             **new_v2_fields(workflow_policy),
         }
+        state["session_selection"] = validate_selection(self.config, session_selection)
+        state["session_preparation"] = preparation_view(session_preparation)
         if codex_reset_authorization is not None:
             budget = codex_reset_authorization.get("budget")
             available = codex_reset_authorization.get("available_count")
             fingerprint = codex_reset_authorization.get("account_fingerprint")
-            if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0 or isinstance(available, bool) or not isinstance(available, int) or budget > available:
-                raise SupervisorError("Codex reset authorization is invalid")
-            if budget > 0 and (not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)):
-                raise SupervisorError("positive Codex reset budget requires a verified account identity")
             state["codex_reset"].update({"authorized_reset_budget": budget, "authorization_available_count": available,
                                          "authorization_timestamp": iso_utc(self.clock()), "account_fingerprint": fingerprint})
         self.store.write_control("running")
@@ -1111,6 +1247,7 @@ class Supervisor(SupervisorV2Mixin):
         return state
 
     def run_loop(self, state: dict[str, Any], *, recovering: bool = False) -> int:
+        self.reconcile_session_preparation(state)
         state["worker_pid"] = os.getpid()
         followup = self.followup_unresolved(state)
         if followup is not None and state["supervisor_state"] not in TERMINAL_STATES:
@@ -1126,7 +1263,7 @@ class Supervisor(SupervisorV2Mixin):
             self.store.write_state(state)
             return self._exit_code(state)
         gate_pending = (state.get("pending_gate") or {}).get("status") == "pending"
-        needs_action = bool(state.get("wait_user_requires_action")) and not isinstance(state.get("continuation"), dict)
+        needs_action = (bool(state.get("wait_user_requires_action")) and not isinstance(state.get("continuation"), dict)) or isinstance(state.get("owner_recovery"), dict)
         if gate_pending and state["supervisor_state"] not in TERMINAL_STATES:
             state["supervisor_state"] = state["pending_gate"]["expected_state"]  # a paused/errored gate wait stays a gate wait
         elif state["supervisor_state"] in {"PAUSED", "WAIT_USER", "ERROR"} and not gate_pending and not needs_action:
@@ -1208,7 +1345,7 @@ class Supervisor(SupervisorV2Mixin):
                     agent = self.ensure_agent(provider)
                     blocking = blocking_windows(self.quota(provider), self.clock())
                 except (SupervisorError, HerdrError) as error:
-                    self.set_wait_user(state, str(error))
+                    self._identity_stop(state, error, str(error))
                     return 2
                 if blocking:
                     outcome = self.wait_for_quota(state, provider, blocking, midturn=False)
@@ -1264,11 +1401,126 @@ class Supervisor(SupervisorV2Mixin):
             self._log(state, "error", error=str(error))
             raise
 
-    def run_new(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None) -> int:
+    def _cli_preparation_identity(self, binding: str, envelope: dict[str, Any]) -> str:
+        """Reuse only an unfinished CLI operation with the exact task/options binding."""
+        candidates: list[str] = []
+        state=self.store.read_state(required=False)
+        if self.paths.session_preparations_dir.exists():
+            for path in self.paths.session_preparations_dir.glob("*.json"):
+                raw=load_json(path,label="session preparation")
+                if not isinstance(raw,dict) or raw.get("origin") != "cli" or raw.get("request_binding") != binding:
+                    continue
+                prep_id=raw.get("preparation_id")
+                if not isinstance(prep_id,str):
+                    raise SupervisorError("matching CLI session preparation has no identity")
+                record=validate_preparation_record(self.config,raw,prep_id)
+                if record.get("request_envelope") != envelope:
+                    raise SupervisorError("matching CLI session preparation request changed")
+                status=record.get("status")
+                if status == "OWNERSHIP_BOUND" and isinstance(state,dict) and state.get("run_id") == prep_id:
+                    raise SupervisorError("this CLI task was already initialized; resume it instead of replaying the run command")
+                if status not in ("TASK_STARTED","ABANDONED") and isinstance(prep_id,str):
+                    candidates.append(prep_id)
+        if len(candidates)>1:
+            raise SupervisorError("multiple matching CLI session preparations exist; refusing ambiguous recovery")
+        return candidates[0] if candidates else str(uuid.uuid4())
+
+    def _mark_session_preparation_started(self, preparation_id: str) -> dict[str, Any] | None:
+        path=self.paths.session_preparations_dir/f"{preparation_id}.json"
+        if not path.exists():
+            return None
+        record=validate_preparation_record(self.config,load_json(path,label="session preparation"),preparation_id)
+        if record.get("status") == "TASK_STARTED":
+            if record.get("started_run_id") != preparation_id:
+                raise SupervisorError("session preparation task binding changed")
+            return record
+        if record.get("status") != "OWNERSHIP_BOUND":
+            raise SupervisorError("session preparation was not ownership-bound before task start")
+        record.update({"status":"TASK_STARTED","started_run_id":preparation_id,"task_started_at":iso_utc(self.clock())})
+        atomic_write_json(path,record)
+        return record
+
+    def validate_session_selection(self, selection: Any) -> dict[str, Any]:
+        """Normalize a task-start selection for workflow recovery without reversing module layers."""
+        return validate_selection(self.config, selection)
+
+    def read_session_preparation(self, preparation_id: str) -> dict[str, Any] | None:
+        """Read and validate one durable preparation journal without mutating it."""
+        path=self.paths.session_preparations_dir/f"{preparation_id}.json"
+        if not path.exists():
+            return None
+        return validate_preparation_record(self.config,load_json(path,label="session preparation"),preparation_id)
+
+    def reconcile_session_preparation(self, state: dict[str, Any]) -> None:
+        """Finalize an initialized CLI task's exact preparation before its first delivery."""
+        view=state.get("session_preparation")
+        preparation_id=view.get("preparation_id") if isinstance(view,dict) else None
+        if not isinstance(preparation_id,str) or not _UUID_RE.fullmatch(preparation_id):
+            return
+        record=self.read_session_preparation(preparation_id)
+        if record is None or record.get("origin") != "cli":
+            return
+        expected_view=preparation_view(record)
+        if not isinstance(view,dict) or expected_view is None:
+            raise SupervisorError("initialized CLI task does not match its session preparation")
+        stable_keys=("preparation_id","origin","request_binding","policy","profiles","providers")  # the envelope lives only in the journal
+        bound=record.get("bound_owners") or {}
+        expected_sessions={provider:bound.get(provider,{}).get("session_id") for provider in PROVIDERS}
+        reset=state.get("codex_reset") or {}
+        state_envelope=cli_request_envelope(
+            self.config, task=state.get("task_text"), start=state.get("start_agent"),
+            task_reference=state.get("task_reference"), workflow_policy=state.get("workflow_policy"),
+            codex_reset_authorization={
+                "budget":reset.get("authorized_reset_budget"),
+                "available_count":reset.get("authorization_available_count"),
+                "account_fingerprint":reset.get("account_fingerprint"),
+            },
+            selection=state.get("session_selection"),
+        )
+        exact=(
+            all(view.get(key)==expected_view.get(key) for key in stable_keys)
+            and record.get("request_envelope")==state_envelope
+            and record.get("request_binding")==cli_request_binding(self.config,state_envelope)
+            and record.get("status") in ("OWNERSHIP_BOUND","TASK_STARTED")
+            and state.get("run_id")==preparation_id
+            and state.get("task_id")==preparation_id
+            and state.get("session_selection")==record.get("selection")
+            and state.get("native_sessions")==expected_sessions
+            and self.owners()==bound
+            and isinstance(record.get("request_binding"),str)
+        )
+        if not exact:
+            raise SupervisorError("initialized CLI task does not match its session preparation")
+        started=self._mark_session_preparation_started(preparation_id)
+        updated=preparation_view(started)
+        if state.get("session_preparation") != updated:
+            state["session_preparation"]=updated
+            self.store.write_state(state)
+
+    def run_new(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, session_selection: dict[str, Any] | None = None) -> int:
         with WorkerLock(self.paths.lock_file):
+            self._validate_new_run_request(task,start,workflow_policy,char_limit,codex_reset_authorization)
+            existing = self.store.read_state(required=False)
+            if existing and existing.get("supervisor_state") not in TERMINAL_STATES:
+                raise SupervisorError(f"task {existing.get('task_id')} is still {existing.get('supervisor_state')}; cancel or finish it before preparing sessions")
+            selected=validate_selection(self.config,session_selection)
+            envelope=cli_request_envelope(
+                self.config,task=task,start=start,task_reference=task_reference,workflow_policy=workflow_policy,
+                codex_reset_authorization=codex_reset_authorization,selection=selected,
+            )
+            binding=cli_request_binding(self.config,envelope)
+            preparation_id = self._cli_preparation_identity(binding,envelope) if selected["fresh_providers"] else str(uuid.uuid4())
+            preparation = self.prepare_task_sessions(
+                selected,preparation_id=preparation_id,origin="cli",request_binding=binding,request_envelope=envelope,
+            )
             with self.store.transaction():
                 state = self.initialize(task, start, task_reference=task_reference, workflow_policy=workflow_policy, char_limit=char_limit,
-                                        codex_reset_authorization=codex_reset_authorization)
+                                        codex_reset_authorization=codex_reset_authorization, session_selection=session_selection,
+                                        session_preparation=preparation, run_id=preparation_id if selected["fresh_providers"] else None)
+                if selected["fresh_providers"]:
+                    started_preparation=self._mark_session_preparation_started(preparation_id)
+                    state["session_preparation"]=preparation_view(started_preparation)
+                    self.store.write_state(state)
             return self._guarded(state, lambda: self.run_loop(state))
 
     def resume(self) -> int:
@@ -1431,6 +1683,19 @@ class Supervisor(SupervisorV2Mixin):
             report["state_schema"] = None if state is None else self.store._disk_schema()
         except SupervisorError as error:
             report["errors"].append(str(error))
+        try:
+            state_for_runtime = self.store.read_state(required=False)
+        except SupervisorError:
+            state_for_runtime = None
+        report["runtime_validation"] = self.runtime_validation_view(state_for_runtime)
+        repo = Path(self.config["product_repo"])
+        try:
+            head = self.head_resolver(repo)
+            report["product_repo"] = {"path": str(repo), "valid": True, "head": head}
+        except SupervisorError as error:
+            report["product_repo"] = {"path": str(repo), "valid": False, "detail": str(error)}
+            if state_for_runtime and (state_for_runtime.get("runtime_policy") or {}).get("runtime_validation_required"):
+                report["warnings"].append(f"product repository HEAD is unavailable at {repo}; exact-SHA runtime evidence cannot be recorded until it is")
         report["telegram"] = telegram_doctor_summary()
         report["query_session"] = self.query_report()
         report["backup"] = backup_doctor_summary(self.paths, now)
@@ -1446,6 +1711,26 @@ class Supervisor(SupervisorV2Mixin):
         elif contract["prompt_ack_mode"] != "lifecycle":
             report["warnings"].append("herdr lacks the optional prompt lifecycle acknowledgement; the bounded settlement fallback is used")
         report["prompt_ack_mode"] = "lifecycle" if self.prompt_ack_available() else "settle"
+        pane_split_name = "task-start pane split (--direction/--ratio/--cwd/--no-focus)"
+        pane_split = bool(contract and (contract.get("optional") or {}).get(pane_split_name))
+        agent_start = bool(contract and (contract.get("required") or {}).get("agent start (--kind/--pane)"))
+        fresh_available = session_contract_supported(self.config,contract)
+        codex_components = fresh_codex_components(self.config, contract, self.codex_thread_contract())
+        report["session_start"] = {
+            "enabled": bool(self.config["session_start"]["enabled"]),
+            "pane_split": pane_split,
+            "agent_start": agent_start,
+            "fresh_available": fresh_available,
+            "fresh_claude_available": fresh_available,
+            "fresh_codex_available": all(codex_components.values()),
+            "fresh_codex_components": codex_components,
+            "model_flag": {p: self.model_flag_supported(p) for p in PROVIDERS},
+            "profiles": {p: list(self.config["session_start"]["model_profiles"][p]) for p in PROVIDERS},
+        }
+        if self.config["session_start"]["enabled"] and not fresh_available:
+            report["warnings"].append("fresh task sessions unavailable: the compatible Herdr pane-split and agent-start contract was not verified")
+        elif self.config["session_start"]["enabled"] and not all(codex_components.values()):
+            report["warnings"].append("fresh Codex unavailable: unverified capability " + ", ".join(name for name, ok in codex_components.items() if not ok))
         report["ok"] = not report["errors"]
         return report
 
@@ -1486,6 +1771,9 @@ class Supervisor(SupervisorV2Mixin):
             "runtime_policy": state.get("runtime_policy") if state else None,
             "candidate_sha": state.get("candidate_sha") if state else None,
             "runtime_evidence": state.get("runtime_evidence") if state else None,
+            "runtime_proposal": self.current_runtime_proposal(state) if state else None,
+            "owner_recovery": self.owner_recovery_view(state.get("owner_recovery")) if state else None,
+            "runtime_validation": self.runtime_validation_view(state),
             "push_approval": state.get("push_approval") if state else None,
             "final_report": state.get("final_report") if state else None,
             "operator_handoff_ready": state.get("operator_handoff_ready") if state else None,
@@ -1508,12 +1796,24 @@ class Supervisor(SupervisorV2Mixin):
             "last_event": state.get("last_event") if state else None,
             "event_sequence": state.get("event_sequence") if state else None,
             "native_sessions_abbrev": {k: str(v)[:8] for k, v in (state.get("native_sessions") or {}).items()} if state else None,
+            "session_selection": state.get("session_selection") if state else None,
+            "session_preparation": state.get("session_preparation") if state else None,
             "agents": {},
             "quota": {},
             "query_session": self.query_report(),
             "backup": backup_doctor_summary(self.paths, now),
             "errors": [],
         }
+        if report["session_preparation"] is None and self.paths.session_preparations_dir.exists():
+            try:
+                candidates=sorted(self.paths.session_preparations_dir.glob("*.json"),key=lambda p:p.stat().st_mtime_ns,reverse=True)
+                for path in candidates:
+                    preparation=load_json(path,label="session preparation")
+                    if isinstance(preparation,dict) and preparation.get("status") not in ("TASK_STARTED","ABANDONED"):
+                        report["session_preparation"]=preparation_view(preparation)
+                        break
+            except (OSError,SupervisorError) as error:
+                report["errors"].append(f"session preparation state is unreadable: {error}")
         owners: dict[str, Any] | None = None
         try:
             owners = self.owners()

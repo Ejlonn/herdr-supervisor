@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, NOW, SHA_A, FakeHerdr, V2Case, hs  # noqa: E402
+from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, NOW, FakeHerdr, V2Case, hs  # noqa: E402
 
 import herdr_artifacts as ha  # noqa: E402
 import herdr_protocol as hpr  # noqa: E402
@@ -105,10 +105,7 @@ class FollowupCase(V2Case):
 
     def to_push_gate(self) -> dict:
         self.to_runtime_gate()
-        evidence = self.evidence_file(SHA_A, "PASS")
-        with self.sup.store.transaction():
-            st = self.sup.store.read_state()
-            self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=SHA_A, environment="TEST", evidence_file=str(evidence), result="PASS", head_resolver=self.head_resolver)
+        self.record_runtime("PASS")
         state = self.state()
         self.assertEqual(state["supervisor_state"], "WAIT_PUSH_APPROVAL")
         return state

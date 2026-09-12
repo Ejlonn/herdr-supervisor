@@ -110,7 +110,8 @@ class TelegramCase(V2Case):
 
     def make_bridge(self, **overrides) -> ht.Bridge:
         config = {**self.tg_config, **overrides}
-        return ht.Bridge(sup_paths=self.paths, sup_config=self.config, tg_paths=self.tg_paths, tg_config=config, api=self.api, bot_id=BOT_ID, status_reader=self.sup.status, clock=self.clock.time, sleeper=self.clock.sleep, rng=lambda: 0.0)
+        return ht.Bridge(sup_paths=self.paths, sup_config=self.config, tg_paths=self.tg_paths, tg_config=config, api=self.api, bot_id=BOT_ID, status_reader=self.sup.status, clock=self.clock.time, sleeper=self.clock.sleep, rng=lambda: 0.0,
+                         session_capability_reader=lambda: True, fresh_policy_reader=lambda policy: True)
 
     def texts(self) -> list[str]:
         return [m["text"] for m in self.api.sent]

@@ -26,7 +26,7 @@ from v2_fixtures import V2Case, hs  # noqa: E402
 
 SRC = Path(hs.__file__).resolve().parent
 # One-way layering, lowest first. A module may import only modules that appear before it.
-LAYERS = ["herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_runtime", "herdr_command"]
+LAYERS = ["herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_runtime", "herdr_command"]
 FACADE = "herdr_supervisor"
 # Names companion modules and tests consume through the facade (recorded before the split).
 CONSUMED = sorted({
@@ -102,12 +102,16 @@ class CharacterizationTests(V2Case):
     """Golden values recorded from the accepted pre-split monolith. Changing them is a behavior change."""
 
     def test_configuration_and_state_defaults_are_unchanged(self) -> None:
-        self.assertEqual(hashlib.sha256(json.dumps(hs.DEFAULT_CONFIG, sort_keys=True).encode()).hexdigest(), "474376d05a028125297f981ce49a613fd5bc4bad3a0847b38561befda118eb69")
+        self.assertEqual(hashlib.sha256(json.dumps(hs.DEFAULT_CONFIG, sort_keys=True).encode()).hexdigest(), "b549cbdf5717afa425c224ec33d14c8c6ed76c557e397fe1ce29616029ee6709")
         # Recorded after the gate-preserving follow-up added the optional `agent_followup: None` default
         # (pre-follow-up value: a558de0f…). Every other default is byte-identical to the accepted monolith.
-        self.assertEqual(hashlib.sha256(json.dumps(hs.new_v2_fields("gated_v2"), sort_keys=True).encode()).hexdigest(), "7c511e64dd533172061e1ef435ad3bf6df4c8544b0b6178f30bd537700733295")
-        without = {k: v for k, v in hs.new_v2_fields("gated_v2").items() if k != "agent_followup"}
-        self.assertEqual(hashlib.sha256(json.dumps(without, sort_keys=True).encode()).hexdigest(), "a558de0f492561310dc51bdfec920cd1d0aa35a7d3149d8743c441a8b3389260")
+        # Re-recorded after the runtime evidence provenance revision added the optional `runtime_proposal: None`
+        # default (previous golden b022b202…); the pre-follow-up golden is still asserted for the other fields.
+        # (+ `owner_recovery: None` from the pane-ownership recovery correction; previous golden c97194fb…)
+        self.assertEqual(hashlib.sha256(json.dumps({k: v for k, v in hs.new_v2_fields("gated_v2").items() if k != "owner_recovery"}, sort_keys=True).encode()).hexdigest(), "c97194fbd725b8ac90027abc050c89f598e27f3292066fe9aaadc4f11c381040")
+        self.assertIsNone(hs.new_v2_fields("gated_v2")["owner_recovery"])
+        without = {k: v for k, v in hs.new_v2_fields("gated_v2").items() if k not in ("agent_followup", "runtime_proposal", "owner_recovery")}
+        self.assertEqual(hashlib.sha256(json.dumps(without, sort_keys=True).encode()).hexdigest(), "a74e13eab152f143d6c987edca655cbb2a484f33ed243ace386df525aee7907e")
         migrated = hs.migrate_state_v1({"schema_version": 1, "supervisor_state": "DONE"})
         self.assertEqual(migrated["workflow_policy"], "v1")
         self.assertEqual(migrated["prompt_metrics"]["prompts"], 0)

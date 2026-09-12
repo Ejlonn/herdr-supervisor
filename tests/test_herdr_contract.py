@@ -160,11 +160,12 @@ class VersionPolicyTests(unittest.TestCase):
 
 class AdapterArgumentTests(unittest.TestCase):
     def test_exact_argv_for_every_command(self) -> None:
-        cli = RecordingCli({("agent", "list"): response("agent-list"), ("agent", "get"): response("agent-get"), ("pane", "get"): response("pane-get")})
+        cli = RecordingCli({("agent", "list"): response("agent-list"), ("agent", "get"): response("agent-get"), ("pane", "get"): response("pane-get"), ("pane", "split"): response("pane-split")})
         cli.list_agents(); cli.get_agent("codex-main"); cli.read_agent("w1:p2", source="recent-unwrapped", lines=400); cli.read_agent("codex-main", source="visible", lines=None)
         cli.prompt("codex-main", "hi", timeout_ms=20000); cli.prompt_ack("w1:p2", "hi", timeout_ms=8000); cli.wait("codex-main", timeout_ms=10000)
         cli.send_keys("codex-main", ["Enter"]); cli.start_agent("codex-main", kind="codex", pane_id="w1:p2", args=["resume", "x"]); cli.pane_available("w1:p2")
         cli.create_workspace(label="herdr-supervisor codex recovery", cwd="/home/user/workspace")
+        self.assertEqual(cli.split_pane("w1:p2",direction="right",ratio=0.5,cwd="/home/user/workspace"),"w1:p3")
         self.assertEqual(cli.calls, [
             ["agent", "list"], ["agent", "get", "codex-main"],
             ["agent", "read", "w1:p2", "--source", "recent-unwrapped", "--format", "text", "--lines", "400"],
@@ -176,6 +177,7 @@ class AdapterArgumentTests(unittest.TestCase):
             ["agent", "start", "codex-main", "--kind", "codex", "--pane", "w1:p2", "--", "resume", "x"],
             ["pane", "get", "w1:p2"],
             ["workspace", "create", "--cwd", "/home/user/workspace", "--label", "herdr-supervisor codex recovery", "--no-focus"],
+            ["pane", "split", "w1:p2", "--direction", "right", "--ratio", "0.5", "--cwd", "/home/user/workspace", "--no-focus"],
         ])
         # every option the adapter emits is documented by the recorded help of that command
         texts = help_texts()
@@ -255,7 +257,7 @@ class FixturePrivacyTests(unittest.TestCase):
     the category, never the leaked value."""
 
     PLACEHOLDER_SESSIONS = {"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "00000000-0000-4000-8000-000000000000"}
-    PLACEHOLDER_PANES = {"w1:p1", "w1:p2"}
+    PLACEHOLDER_PANES = {"w1:p1", "w1:p2", "w1:p3"}
     PROBE_PANES = {"w99:p99"}  # the deliberately non-existent pane used for the recorded pane_not_found probe
     UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
     PANE_RE = re.compile(r"\bw\d+:p\d+\b")

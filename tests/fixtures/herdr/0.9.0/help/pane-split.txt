@@ -1,0 +1,10 @@
+Create a pane by splitting an existing pane
+
+Usage: herdr pane split [OPTIONS] [PANE_ID]
+
+Options:
+      --direction <DIRECTION>  Split direction [possible values: right, down]
+      --ratio <RATIO>          Fraction assigned to the new pane
+      --cwd <CWD>              Working directory for the new pane
+      --no-focus               Keep focus on the existing pane
+  -h, --help                   Print help

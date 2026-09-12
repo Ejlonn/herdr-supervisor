@@ -125,8 +125,8 @@ class AliasLossTests(V2Case):
         cases = {
             "same provider, different session, alias absent": ({"w9:p9": FakeHerdr.agent("codex", None, "w9:p9", OTHER)}, "missing"),
             "duplicate exact matches": ({"w3:p2": FakeHerdr.agent("codex", None, "w3:p2", CODEX_SESSION), "w5:p5": FakeHerdr.agent("codex", None, "w5:p5", CODEX_SESSION)}, "ambiguous"),
-            "reused pane with a changed session": ({"w3:p2": FakeHerdr.agent("codex", None, "w3:p2", OTHER)}, "missing"),
-            "identity omitted": ({"w3:p2": {**FakeHerdr.agent("codex", None, "w3:p2", CODEX_SESSION), "agent_session": None}}, "missing"),
+            "reused pane with a changed session": ({"w3:p2": FakeHerdr.agent("codex", None, "w3:p2", OTHER)}, "missing_pane"),
+            "identity omitted": ({"w3:p2": {**FakeHerdr.agent("codex", None, "w3:p2", CODEX_SESSION), "agent_session": None}}, "missing_pane"),
             "exact session but a claude record": ({"w3:p2": FakeHerdr.agent("claude", None, "w3:p2", CODEX_SESSION)}, "conflict"),
             "alias reused by another session and nothing else": ({"codex-main": FakeHerdr.agent("codex", "codex-main", "w3:p2", OTHER)}, "conflict"),
         }
@@ -153,9 +153,17 @@ class AliasLossTests(V2Case):
                 touched = [t for t in self.herdr.targets if t[0] in ("prompt", "read", "wait", "send-keys") and t[1] in strangers]
                 self.assertEqual(touched, [], f"{label}: a command reached a wrong identity")
                 if kind == "missing":
-                    self.assertEqual(len(self.herdr.starts), 1, "explicit restore policy: one start with the persisted session")
+                    self.assertEqual(len(self.herdr.starts), 1, "explicit restore policy: one start with the persisted session, in the recorded pane")
                     self.assertEqual(self.herdr.starts[0][3], ["resume", CODEX_SESSION])
+                    self.assertEqual(self.herdr.starts[0][2], "w3:p2")
                     self.assertEqual(code, 2)
+                elif kind == "missing_pane":
+                    # the recorded pane is occupied by a stranger: never relocate, never create a workspace, never
+                    # start elsewhere; stop in the structured owner-recovery wait
+                    self.assertEqual((self.herdr.starts, self.herdr.workspaces, code), ([], [], 2), label)
+                    recovery = self.state()["owner_recovery"]
+                    self.assertEqual((recovery["classification"], recovery["provider"], recovery["recorded_pane"], recovery["session_id"]), ("missing_pane", "codex", "w3:p2", CODEX_SESSION))
+                    self.assertIn("nothing was created, started, or resent", self.state()["wait_user_reason"])
                 else:
                     self.assertEqual(self.herdr.starts, [], f"{label}: no restore from ambiguity or a conflicting identity")
                     self.assertEqual(code, 2)
@@ -164,7 +172,7 @@ class AliasLossTests(V2Case):
                 # reset the run to the approved wait for the next case
                 with self.sup.store.transaction():
                     st = self.sup.store.read_state()
-                    st.update(supervisor_state="RUNNING", wait_user_reason=None, wait_user_requires_action=False, delivery=None, pending_gate=None,
+                    st.update(supervisor_state="RUNNING", wait_user_reason=None, wait_user_requires_action=False, delivery=None, pending_gate=None, owner_recovery=None,
                               continuation={"kind": "plan_approved", "gate_id": "g", "plan_sha256": st["approved_plan"]["plan_sha256"], "payload_sha256": "q" * 64})
                     self.sup.store.write_state(st)
                 self.paths.owners_file.write_text(owners_before)
@@ -290,7 +298,7 @@ class AliasLossTests(V2Case):
                 self.assertEqual(self.paths.owners_file.read_text(), owners_before, label)
                 with self.sup.store.transaction():
                     st = self.sup.store.read_state()
-                    st.update(supervisor_state="RUNNING", wait_user_reason=None, wait_user_requires_action=False, delivery=None,
+                    st.update(supervisor_state="RUNNING", wait_user_reason=None, wait_user_requires_action=False, delivery=None, owner_recovery=None,
                               continuation={"kind": "plan_approved", "gate_id": "g", "plan_sha256": st["approved_plan"]["plan_sha256"], "payload_sha256": "q" * 64})
                     self.sup.store.write_state(st)
         # task start with a wrong-provider alias record and no owners file is refused too
@@ -340,7 +348,7 @@ class AliasLossTests(V2Case):
                 self.assertEqual(len(self.herdr.prompts), 1)
                 with self.sup.store.transaction():
                     st = self.sup.store.read_state()
-                    st.update(supervisor_state="RUNNING", wait_user_reason=None, wait_user_requires_action=False, delivery=None,
+                    st.update(supervisor_state="RUNNING", wait_user_reason=None, wait_user_requires_action=False, delivery=None, owner_recovery=None,
                               continuation={"kind": "plan_approved", "gate_id": "g", "plan_sha256": st["approved_plan"]["plan_sha256"], "payload_sha256": "q" * 64})
                     self.sup.store.write_state(st)
         # the approved success path is untouched: alias absent, SAME pane

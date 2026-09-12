@@ -25,6 +25,7 @@ from herdr_core import (
     load_config,
     load_json,
     resolve_herdr_bin,
+    valid_pane_id,
 )
 from herdr_runtime import Supervisor
 from herdr_validation import StateStore, load_task_file, register_query_provider
@@ -57,8 +58,30 @@ def print_status(report: dict[str, Any]) -> None:
         delivery = report.get("delivery")
         if isinstance(delivery, dict):
             print(f"Delivery:     {delivery.get('status')} turn={delivery.get('turn_id')} kind={delivery.get('kind')}")
+        selection=report.get("session_selection") or {}
+        print(f"Sessions:     {selection.get('policy','preserve')} profiles={selection.get('profiles') or {}}")
+        preparation=report.get("session_preparation")
+        if isinstance(preparation,dict):
+            print(f"Session prep: {preparation.get('status')} id={preparation.get('preparation_id') or 'unknown'}")
     if report.get("wait_user_reason"):
         print(f"WAIT_USER:    {report['wait_user_reason']}")
+    recovery = report.get("owner_recovery")
+    if isinstance(recovery, dict):
+        what = {"duplicate": "the same saved session is live in more than one pane", "moved": "the saved session is live in a different pane than recorded", "missing_pane": "the recorded pane is gone and the session is not live"}.get(str(recovery.get("classification")), "pane ownership needs repair")
+        print(f"Owner repair: {recovery.get('provider')} session {recovery.get('session_abbrev')} — {what} (recorded {recovery.get('recorded_pane')}, live {', '.join(recovery.get('live_panes') or []) or 'none'}). No other conversation was adopted; nothing was resent.")
+        print(f"              next: herdr-supervisor repair-owner-pane --run-id {report.get('task_id')} --recovery-id {recovery.get('recovery_id')}   (close duplicate panes first if any; --apply after the preview)")
+    runtime = report.get("runtime_validation") or {}
+    if runtime.get("gate_pending") or runtime.get("state") in ("proposed", "accepted"):
+        line = f"Runtime:      {runtime.get('state')}" + (f" {runtime.get('result')}" if runtime.get("result") else "") + f" (mode {runtime.get('mode')})"
+        if runtime.get("at_utc"):
+            line += f" at {runtime['at_utc']}"
+        if runtime.get("actor"):
+            line += f" by {runtime['actor']}"
+        print(line)
+        if runtime.get("reason"):
+            print(f"              reason: {runtime['reason']}")
+        if runtime.get("waiting"):
+            print(f"              waiting: {runtime['waiting']} (next: {runtime.get('next_actor')})")
     followup = report.get("agent_followup")
     if isinstance(followup, dict) and followup.get("status") in ("PREPARED", "DELIVERING", "WAITING", "RESPONSE_READY", "FAILED"):
         print(f"Follow-up:    {followup.get('status')} question to {followup.get('provider')}; the {str(followup.get('gate_type') or followup.get('decision_kind') or 'decision').replace('_', ' ')} is preserved" + (f" — {followup.get('reason')}" if followup.get("reason") else ""))
@@ -109,6 +132,17 @@ def print_doctor(report: dict[str, Any]) -> None:
     print(f"state dir:    {report['state_dir']}  worker_lock_held={report['worker_lock_held']}")
     print(f"project root: {report['project_root']}")
     print(f"task state:   {report.get('task_state') or 'NO_TASK'}")
+    runtime = report.get("runtime_validation") or {}
+    if runtime.get("gate_pending") or runtime.get("state") != "none":
+        print(f"runtime:      {runtime.get('state')} {runtime.get('result') or ''} mode={runtime.get('mode')} next={runtime.get('next_actor') or '-'}")
+    repo = report.get("product_repo") or {}
+    print(f"product repo: {repo.get('path')} valid={repo.get('valid')}" + (f" head={str(repo.get('head'))[:12]}" if repo.get("head") else f" ({repo.get('detail')})" if repo.get("detail") else ""))
+    session = report.get("session_start") or {}
+    if session:
+        components = session.get("fresh_codex_components") or {}
+        print(f"fresh codex:  {'available' if session.get('fresh_codex_available') else 'unavailable'}" + ("" if session.get("fresh_codex_available") else " (missing: " + ", ".join(n for n, ok in components.items() if not ok) + ")"))
+    session_start=report.get("session_start") or {}
+    print(f"fresh start:  {'available' if session_start.get('fresh_available') else 'unavailable'} enabled={session_start.get('enabled')} pane_split={session_start.get('pane_split')} agent_start={session_start.get('agent_start')} model_flags={session_start.get('model_flag')}")
     for provider in ("claude", "codex"):
         agent = report["agents"].get(provider, {})
         print(
@@ -186,6 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--start", choices=PROVIDERS, default="codex", help="entry agent (default: codex)")
     run.add_argument("--policy", choices=WORKFLOW_POLICIES, default="v1", help="v1 (default) or gated_v2 human-gate workflow")
     run.add_argument("--codex-reset-budget", type=int, default=0, help="explicit per-run automatic Codex banked-reset budget (default: 0)")
+    run.add_argument("--session-policy", choices=("preserve", "fresh-codex", "fresh-claude", "fresh-all"), default="preserve", help="new-task session policy (default: preserve)")
+    run.add_argument("--codex-model-profile", default="default", help="configured Codex launch profile (fresh Codex only)")
+    run.add_argument("--claude-model-profile", default="default", help="configured Claude launch profile (fresh Claude only)")
     run.add_argument("task", help="task text or path to a task file")
     status = sub.add_parser("status", help="show task, agents, quota, and context state")
     status.add_argument("--json", action="store_true")
@@ -209,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "reject":
             cmd.add_argument("--note", default=None)
     for name in ("runtime-pass", "runtime-fail"):
-        cmd = sub.add_parser(name, help=f"record runtime validation {name.split('-')[1].upper()} evidence for the exact candidate SHA")
+        cmd = sub.add_parser(name, help=f"submit runtime validation {name.split('-')[1].upper()} evidence for the exact candidate SHA: a PROPOSAL awaiting operator confirmation (default), or the canonical record only under an approved automatic_agent plan")
         cmd.add_argument("--run-id", required=True)
         cmd.add_argument("--candidate-sha", required=True)
         cmd.add_argument("--environment", required=True)
@@ -225,6 +262,12 @@ def build_parser() -> argparse.ArgumentParser:
     return_dec = sub.add_parser("return-to-decision", help="abandon an unresolved follow-up and restore the suspended gate or wait unchanged")
     return_dec.add_argument("--run-id", required=True)
     return_dec.add_argument("--actor", default="cli")
+    confirm = sub.add_parser("runtime-confirm", help="operator confirmation of the proposed runtime evidence (gate-bound, non-interactive): records the proposed PASS/FAIL canonically")
+    confirm.add_argument("--run-id", required=True)
+    confirm.add_argument("--gate-id", required=True)
+    confirm.add_argument("--evidence-sha256", required=True, help="exact hash of the proposed evidence file (from status or the proposal card)")
+    confirm.add_argument("--decision", choices=("PASS", "FAIL"), required=True)
+    confirm.add_argument("--actor", default="operator-cli")
     done = sub.add_parser("done", help="close a handoff-ready task as an operator handoff (records that remaining actions are yours and unverified)")
     done.add_argument("--run-id", required=True)
     done.add_argument("--operator-handoff", action="store_true", help="required: acknowledge that Supervisor will not verify runtime/push actions you perform")
@@ -237,6 +280,18 @@ def build_parser() -> argparse.ArgumentParser:
     register_query.add_argument("--provider", choices=PROVIDERS, required=True)
     register_query.add_argument("--agent-name", required=True)
     register_query.add_argument("--acknowledge-read-only-contract", action="store_true")
+    rebind = sub.add_parser("rebind-sessions", help="preview or atomically bind explicitly selected external native sessions (terminal runs only)")
+    rebind.add_argument("--codex-pane")
+    rebind.add_argument("--claude-pane")
+    rebind.add_argument("--apply", action="store_true", help="apply the fully validated preview")
+    repair = sub.add_parser("repair-owner-pane", help="nonterminal exact-session pane-locator repair: preview the eligible pane from live evidence, then --apply to record it (session id never changes)")
+    repair.add_argument("--run-id", required=True)
+    repair.add_argument("--recovery-id", default=None, help="recovery id from status (required with --apply)")
+    repair.add_argument("--pane", default=None, help="the previewed live pane (required with --apply)")
+    repair.add_argument("--apply", action="store_true")
+    repair.add_argument("--actor", default="operator-cli")
+    abandon = sub.add_parser("abandon-session-start", help="mark a failed pre-binding session preparation inert; created panes/sessions remain alive")
+    abandon.add_argument("--preparation-id", required=True)
     sub.add_parser("migrate", help="back up V1 state, write schema 2, tighten state permissions (no service activation)")
     events = sub.add_parser("events", help="list durable outbox events for the current run")
     events.add_argument("--json", action="store_true")
@@ -266,9 +321,38 @@ def main(argv: list[str] | None = None) -> int:
                 authorization = {"budget": args.codex_reset_budget, "available_count": inventory.available_count,
                                  "account_fingerprint": inventory.account_fingerprint}
             kwargs = {"task_reference": reference, "workflow_policy": args.policy, "char_limit": char_limit}
+            if args.session_policy != "preserve" or args.codex_model_profile != "default" or args.claude_model_profile != "default":
+                kwargs["session_selection"] = {"policy": args.session_policy, "profiles": {"codex": args.codex_model_profile, "claude": args.claude_model_profile}}
             if authorization is not None:
                 kwargs["codex_reset_authorization"] = authorization
             return supervisor.run_new(task, args.start, **kwargs)
+        if args.command == "rebind-sessions":
+            panes = {provider: pane for provider, pane in (("codex", args.codex_pane), ("claude", args.claude_pane)) if pane}
+            result = supervisor.rebind_sessions(panes, apply=args.apply)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if args.command == "repair-owner-pane":
+            if not args.apply:
+                with supervisor.store.transaction():
+                    state = supervisor.store.read_state()
+                    preview = supervisor.owner_recovery_preview(state, run_id=args.run_id, recovery_id=args.recovery_id)
+                print(json.dumps(preview, indent=2, sort_keys=True))
+                if preview["eligible"]:
+                    print(f"next: herdr-supervisor repair-owner-pane --run-id {args.run_id} --recovery-id {preview['recovery_id']} --pane {preview['new_pane']} --apply")
+                return 0
+            if not args.recovery_id or not args.pane:
+                raise SupervisorError("--apply requires --recovery-id and --pane from the preview")
+            if not valid_pane_id(args.pane):
+                raise SupervisorError("--pane must be a canonical Herdr pane id (w<n>:p<n>) taken from the preview")
+            with WorkerLock(supervisor.paths.lock_file):
+                with supervisor.store.transaction():
+                    state = supervisor.store.read_state()
+                    result = supervisor.owner_recovery_apply(state, run_id=args.run_id, recovery_id=args.recovery_id, pane=args.pane, actor=args.actor)
+            print(result["message"])
+            return 0
+        if args.command == "abandon-session-start":
+            print(json.dumps(supervisor.abandon_session_preparation(args.preparation_id),indent=2,sort_keys=True))
+            return 0
         if args.command in ("approve", "reject", "revise", "answer"):
             with supervisor.store.transaction():
                 state = supervisor.store.read_state()
@@ -316,6 +400,14 @@ def main(argv: list[str] | None = None) -> int:
             with supervisor.store.transaction():
                 state = supervisor.store.read_state()
                 result = supervisor.record_runtime_evidence(state, run_id=args.run_id, candidate_sha=args.candidate_sha, environment=args.environment, evidence_file=args.evidence_file, result="PASS" if args.command == "runtime-pass" else "FAIL", actor=args.actor)
+            print(result["message"])
+            if result.get("proposed"):
+                print(f"next: herdr-supervisor runtime-confirm --run-id {args.run_id} --gate-id {result['gate_id']} --evidence-sha256 {result.get('evidence_sha256')} --decision {'PASS' if args.command == 'runtime-pass' else 'FAIL'}   (operator only)")
+            return 0
+        if args.command == "runtime-confirm":
+            with supervisor.store.transaction():
+                state = supervisor.store.read_state()
+                result = supervisor.confirm_runtime_evidence(state, run_id=args.run_id, gate_id=args.gate_id, evidence_sha256=args.evidence_sha256, decision=args.decision, actor=args.actor)
             print(result["message"])
             return 0
         if args.command == "refresh-quota":

@@ -1,0 +1,85 @@
+{
+ "ClientRequest": {
+  "oneOf": [
+   {
+    "properties": {
+     "method": {
+      "enum": [
+       "thread/start"
+      ],
+      "title": "Thread/startRequestMethod",
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "method",
+     "params"
+    ]
+   }
+  ]
+ },
+ "Thread": {
+  "required": [
+   "cliVersion",
+   "createdAt",
+   "cwd",
+   "ephemeral",
+   "id",
+   "modelProvider",
+   "preview",
+   "projectId",
+   "sessionId",
+   "source",
+   "status",
+   "turns",
+   "updatedAt"
+  ]
+ },
+ "ThreadStartParams": {
+  "properties": [
+   "approvalPolicy",
+   "approvalsReviewer",
+   "baseInstructions",
+   "config",
+   "cwd",
+   "developerInstructions",
+   "ephemeral",
+   "model",
+   "modelProvider",
+   "personality",
+   "sandbox",
+   "serviceName",
+   "serviceTier",
+   "sessionStartSource",
+   "threadSource"
+  ]
+ },
+ "ThreadStartResponse": {
+  "properties": [
+   "approvalPolicy",
+   "approvalsReviewer",
+   "cwd",
+   "instructionSources",
+   "model",
+   "modelProvider",
+   "reasoningEffort",
+   "sandbox",
+   "serviceTier",
+   "thread"
+  ],
+  "required": [
+   "approvalPolicy",
+   "approvalsReviewer",
+   "cwd",
+   "model",
+   "modelProvider",
+   "sandbox",
+   "thread"
+  ]
+ },
+ "captured_on": "2026-09-12",
+ "command": "codex app-server generate-json-schema --out <tmp>",
+ "scope": "Read-only excerpt: the thread/start client-request variant, the ThreadStartResponse required set, and the ThreadStartParams property names. No thread was created.",
+ "version": "0.154.0"
+}

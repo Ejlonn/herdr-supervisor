@@ -166,7 +166,7 @@ class PlanApprovalTests(V2Case):
         after = self.state()
         self.assertEqual(after["supervisor_state"], "RUNNING")
         self.assertEqual(after["approved_plan"]["plan_sha256"], state["pending_gate"]["artifact_sha256"])
-        self.assertEqual(after["runtime_policy"], {"runtime_validation_required": True, "rebuild_required": True, "rebuild_reason": "backend image contains the source", "push_approval_required": True, "migration_required": False})
+        self.assertEqual(after["runtime_policy"], {"runtime_validation_required": True, "rebuild_required": True, "rebuild_reason": "backend image contains the source", "push_approval_required": True, "migration_required": False, "validation_mode": "operator_collaborative"})
         self.assertEqual(after["continuation"]["kind"], "plan_approved")
         self.assertEqual(after["pending_gate"]["status"], "approved")
         self.assertIn("PLAN_APPROVED", self.event_types())
@@ -317,9 +317,7 @@ class RuntimePushTests(V2Case):
 
     def record(self, result: str, *, sha: str = SHA_A, environment: str = "TEST", evidence: Path | None = None) -> dict:
         evidence = evidence or self.evidence_file(sha, "PASS" if result == "PASS" else "FAIL")
-        with self.sup.store.transaction():
-            st = self.sup.store.read_state()
-            return self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=sha, environment=environment, evidence_file=str(evidence), result=result, head_resolver=self.head_resolver)
+        return self.record_runtime(result, sha=sha, environment=environment, evidence=evidence)
 
     def test_a_runtime_required_stops_and_notifies_push_blocked(self) -> None:
         state = self.to_runtime_gate()
@@ -653,16 +651,21 @@ class InboxWorkerRecoveryTests(V2Case):
         self.assertEqual([t for t in self.herdr.targets if t[0] in ("prompt", "read", "wait", "send-keys")], [])
         self.assertEqual(self.paths.owners_file.read_text(), owners_before)
 
-    def test_recovery_missing_pane_creates_nonfocused_workspace_and_verifies_id(self) -> None:
+    def test_recovery_missing_pane_never_relocates_or_rewrites_ownership(self) -> None:
+        """The recorded pane is gone: no replacement workspace, no start elsewhere, no owner write, no prompt —
+        a structured owner-recovery wait instead (the pane-recovery correction plan)."""
         self.write_plan()
         self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
         self.approve_pending()
         del self.herdr.agents["codex-main"]
         self.herdr.available_panes.discard("w3:p2")
+        owners_before = self.paths.owners_file.read_text()
+        prompts = len(self.herdr.prompts)
         self.assertEqual(self.resume_with([{"v2": ("brief", "human", "generic_question", str(self.question_payload()))}]), 2)
-        self.assertEqual(self.herdr.workspaces, [("herdr-supervisor codex recovery", str(self.project_root))])
-        self.assertEqual(self.herdr.starts, [("codex-main", "codex", "w9:p1", ["resume", CODEX_SESSION])])
-        self.assertEqual(json.loads(self.paths.owners_file.read_text())["codex"]["pane_id"], "w9:p1")
+        self.assertEqual((self.herdr.workspaces, self.herdr.starts, len(self.herdr.prompts)), ([], [], prompts))
+        self.assertEqual(self.paths.owners_file.read_text(), owners_before)
+        state = self.state()
+        self.assertEqual((state["supervisor_state"], state["wait_user_requires_action"], state["owner_recovery"]["classification"]), ("WAIT_USER", True, "missing_pane"))
 
     def test_recovery_wrong_returned_session_or_ambiguity_fails_closed(self) -> None:
         self.write_plan()
@@ -874,9 +877,7 @@ class ReviewRegressionTests(V2Case):
         self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload()))}])
         (self.review_dir / "CODEX_PLAN.md").write_text("tampered\n")
         with self.assertRaises(hs.SupervisorError) as caught:
-            with self.sup.store.transaction():
-                st = self.sup.store.read_state()
-                self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=SHA_A, environment="TEST", evidence_file=str(self.evidence_file()), result="PASS", head_resolver=self.head_resolver)
+            self.record_runtime("PASS")
         self.assertEqual(str(caught.exception), hs.PLAN_CHANGED_MESSAGE)
         self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
         self.assertIsNone(self.state()["runtime_evidence"])
@@ -926,9 +927,7 @@ class ReviewRegressionTests(V2Case):
     def test_f4_head_change_after_runtime_pass_invalidates_push(self) -> None:
         self.approved_plan_state()
         self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload()))}])
-        with self.sup.store.transaction():
-            st = self.sup.store.read_state()
-            self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=SHA_A, environment="TEST", evidence_file=str(self.evidence_file()), result="PASS", head_resolver=self.head_resolver)
+        self.record_runtime("PASS")
         self.assertEqual(self.state()["supervisor_state"], "WAIT_PUSH_APPROVAL")
         self.head = SHA_B  # a new commit lands after the runtime PASS
         with self.assertRaises(hs.SupervisorError) as caught:
@@ -946,9 +945,7 @@ class ReviewRegressionTests(V2Case):
         self.reset_fixture()
         self.approved_plan_state(push_approval_required=False)
         self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload()))}])
-        with self.sup.store.transaction():
-            st = self.sup.store.read_state()
-            self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=SHA_A, environment="TEST", evidence_file=str(self.evidence_file()), result="PASS", head_resolver=self.head_resolver)
+        self.record_runtime("PASS")
         self.head = SHA_B
         self.assertEqual(self.resume_with([{"v2": ("finish", "done")}]), 2)
         self.assertIn("no longer equals candidate", self.state()["wait_user_reason"])
@@ -1227,9 +1224,7 @@ class OperatorHandoffTests(V2Case):
         self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload()))}])
         self.assertEqual(self.state()["supervisor_state"], "WAIT_RUNTIME_VALIDATION")
         self.assert_refused("typed gate is pending")
-        with self.sup.store.transaction():
-            st = self.sup.store.read_state()
-            self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=SHA_A, environment="TEST", evidence_file=str(self.evidence_file()), result="PASS", head_resolver=self.head_resolver)
+        self.record_runtime("PASS")
         self.assertEqual(self.state()["supervisor_state"], "WAIT_PUSH_APPROVAL")
         self.assert_refused("typed gate is pending")
 

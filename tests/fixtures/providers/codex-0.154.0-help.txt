@@ -1,0 +1,7 @@
+Codex CLI
+
+Usage: codex [OPTIONS] [PROMPT]
+
+Options:
+  -m, --model <MODEL>  Model the agent should use
+  -h, --help           Print help
