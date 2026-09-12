@@ -101,6 +101,7 @@ class ShippedFileTests(unittest.TestCase):
         self.assertIn("ruff check src tests", workflow)
         self.assertIn("mypy", workflow)
         self.assertIn("python -m build", workflow)
+        self.assertIn("PYTHONPATH=src:tests python -m unittest tests.test_release_checks", workflow)
         pyproject = (ROOT / "pyproject.toml").read_text()
         self.assertIn("fail_under = 80", pyproject)
         self.assertIn("branch = true", pyproject)

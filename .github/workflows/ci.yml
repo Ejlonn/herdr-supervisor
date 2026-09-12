@@ -104,4 +104,4 @@ jobs:
           export HOME="$(mktemp -d)"; mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/herdr"; chmod +x "$HOME/.local/bin/herdr"
           ./install.sh --dry-run
       - name: Fixture privacy, version consistency, and secret markers
-        run: HOME="$(mktemp -d)" PYTHONPATH=src python -m unittest tests.test_release_checks tests.test_herdr_contract.FixturePrivacyTests tests.test_distribution -v
+        run: HOME="$(mktemp -d)" PYTHONPATH=src:tests python -m unittest tests.test_release_checks tests.test_herdr_contract.FixturePrivacyTests tests.test_distribution -v

@@ -95,8 +95,9 @@ Two completions exist. **Verified completion** is reached only by the agent rout
 
    ![Start](docs/images/telegram-01-start.png)
 
-2. **Plan ready for approval** — Codex's plan arrives as a card with its fingerprint, risk line, and the runtime,
-   rebuild, migration, and push flags; nothing is implemented yet.
+2. **Plan ready for approval** — a plan-approval card arrives with Codex's summary, risk, fingerprint, and
+   runtime-validation, rebuild, migration, and push-approval requirements. The full plan is available through
+   **View Plan**; implementation has not started.
 
    ![Plan ready for approval](docs/images/telegram-02-plan-ready.png)
 
