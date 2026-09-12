@@ -90,13 +90,10 @@ Two completions exist. **Verified completion** is reached only by the agent rout
 
 ## Telegram walkthrough
 
-A gated task as it appears in the Telegram chat, in the order the messages arrive. Drop the screenshots into
-`docs/images/` with the names below (or adjust the paths).
-
-1. **Tapping Start** — the task-start card shows the task text and the banked-reset budget buttons; tapping `Start`
+1. **Start** — the task-start card shows the task text and the banked-reset budget buttons; tapping `Start`
    creates the supervised run and Codex begins planning.
 
-   ![Tapping Start](docs/images/telegram-01-start.png)
+   ![Start](docs/images/telegram-01-start.png)
 
 2. **Plan ready for approval** — Codex's plan arrives as a card with its fingerprint, risk line, and the runtime,
    rebuild, migration, and push flags; nothing is implemented yet.
