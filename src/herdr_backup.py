@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from herdr_supervisor import MAX_EPOCH, Paths, SupervisorError, _number, atomic_write_json, iso_utc, load_json
+from herdr_supervisor import Paths, SupervisorError, _number, atomic_write_json, iso_utc, load_json
 
 VERSION = "0.3.0-beta.1"
 STRATEGIES = ("ssh_snapshot", "git_recovery", "both")
@@ -142,7 +142,7 @@ def validate_backup_config(config: dict[str, Any]) -> dict[str, Any]:
     retention = config.get("retention")
     if isinstance(retention, dict) and set(retention) - {"daily", "weekly"}:
         raise SupervisorError("backup.retention contains unknown keys")
-    if not isinstance(retention, dict) or any(_number(retention.get(k)) is None or retention.get(k) < 1 for k in ("daily", "weekly")):
+    if not isinstance(retention, dict) or any((lambda n: n is None or n < 1)(_number(retention.get(k))) for k in ("daily", "weekly")):
         raise SupervisorError("backup.retention.daily/weekly must be positive numbers")
     if _number(config.get("max_age_hours")) is None or not 1 <= float(config["max_age_hours"]) <= 24 * 60:
         raise SupervisorError("backup.max_age_hours must be 1-1440")

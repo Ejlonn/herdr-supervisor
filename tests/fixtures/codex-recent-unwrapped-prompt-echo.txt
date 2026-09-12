@@ -1,0 +1,21 @@
+  REVISION of the pending gate (wait_user). Human note:
+  resume
+
+  Update the artifact and payload accordingly and emit a new gate block; the prior
+  gate and any prior approval are void.
+
+  When you finish this turn, end your response with exactly one contiguous eight-
+  line block, each line as KEY=value with no markdown formatting around it:
+  HERDR_PROTOCOL=2
+  HERDR_RUN=20598ca2-d049-4cb9-967a-5652e7bf6eff
+  HERDR_TURN=9945228c-bb87-493a-96ea-14d190c49510
+  HERDR_STAGE=<short stage name you completed, e.g. plan, brief, implement, review,
+  fix>
+  HERDR_NEXT=<one of: codex, claude, done, human>
+  HERDR_GATE=<none | plan_approval | generic_question | runtime_validation |
+  push_approval>
+  HERDR_PAYLOAD=<absolute path of the gate payload JSON below /home/user/workspace/
+  reviews, or - when HERDR_GATE=none>
+  HERDR_HANDOFF=<one line for the next actor, under 300 characters, no angle
+  brackets>
+  Rules enforced by the supervisor: HERDR_NEXT=human requires a typed HERDR_GATE

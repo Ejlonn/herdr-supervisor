@@ -7,12 +7,11 @@ import json
 import os
 from pathlib import Path
 
-from test_telegram import BOT_ID, CHAT, OWNER, FakeApi, TelegramCase, callback
-from v2_fixtures import FAKE_TOKEN, NOW, FakeHerdr, hs
-
-import herdr_telegram as ht  # noqa: E402
 import herdr_codex_reset as hcr  # noqa: E402
+import herdr_telegram as ht  # noqa: E402
 import telegram_api as tg  # noqa: E402
+from test_telegram import CHAT, OWNER, FakeApi, TelegramCase, callback
+from v2_fixtures import FAKE_TOKEN, hs
 
 TASK_MD = "# Widget task\n\nAdd the widget.\n\n" + ("Details line.\n" * 200)
 
@@ -92,6 +91,26 @@ class StagingTests(UploadCase):
         tokens={json.loads(p.read_text()).get("budget"):p.stem for p in self.tg_paths.interactions_dir.glob("*.json") if json.loads(p.read_text()).get("action")=="reset_budget"}
         started=self.bridge.handle_update(callback(11,tokens[1])); self.assertEqual(started["result"],"enqueued")
         command=self.pending_inbox()[0]; self.assertIn("task_file",command); self.assertEqual(command["codex_reset_authorization"]["budget"],1)
+
+    def test_uploaded_start_card_shows_bounded_validated_preview_only(self) -> None:
+        self.bridge.reset_inventory_reader=lambda:hcr.ResetInventory(1,True,"a"*64,self.clock.current)
+        result = self.upload(9); upload_id = result["upload_id"]
+        excerpt = self.meta(upload_id)["excerpt"]
+        self.bridge.handle_update(callback(10, self.buttons()["Start Task"]))
+        card = self.api.sent[-1]
+        self.assertTrue(card["text"].startswith("Start this task?"))
+        self.assertIn("Task to start:\nfile task.md (.md, ", card["text"])
+        self.assertIn(excerpt[:120], card["text"], "the already-validated excerpt is the preview")
+        self.assertLessEqual(card["text"].count("Details line."), 30, "bounded excerpt, not the 200-line file")
+        self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], [["Start · 0","Start · 1"],["Cancel"]])
+        for record_path in self.tg_paths.interactions_dir.glob("*.json"):
+            record = json.loads(record_path.read_text())
+            self.assertNotIn("excerpt", record); self.assertNotIn("task_text", record)
+            self.assertNotIn(excerpt[:40], record_path.read_text())
+        self.assertEqual(self.choose_reset_budget(11)["result"], "enqueued")
+        command = self.pending_inbox()[0]
+        self.assertNotIn("excerpt", command); self.assertNotIn(excerpt[:40], json.dumps(command))
+        self.assertNotIn("excerpt", self.meta(upload_id), "excerpt is dropped from metadata once the start is enqueued")
 
     def test_authorized_md_upload_stages_atomically_and_previews_without_a_task(self) -> None:
         result = self.upload()
@@ -427,15 +446,16 @@ class CompatibilityAndSecurityTests(UploadCase):
                 captured.update(task=task, task_reference=task_reference, char_limit=char_limit)
                 return 0
 
-        original = hs.Supervisor
-        hs.Supervisor = Recorder  # type: ignore[misc]
+        import herdr_command
+        original = herdr_command.Supervisor
+        herdr_command.Supervisor = Recorder  # type: ignore[misc]  # main() resolves the class in its own module
         try:
             self.paths.config_file.write_text(json.dumps({"schema_version": 1, "herdr_bin": os.sys.executable}))
             os.environ["HERDR_SUPERVISOR_CONFIG"] = str(self.paths.config_file)
             os.environ["HERDR_SUPERVISOR_STATE_DIR"] = str(self.state_dir)
             self.assertEqual(hs.main(["run", "--policy", "gated_v2", str(long_file)]), 0)
         finally:
-            hs.Supervisor = original  # type: ignore[misc]
+            herdr_command.Supervisor = original  # type: ignore[misc]
             os.environ.pop("HERDR_SUPERVISOR_CONFIG", None)
             os.environ.pop("HERDR_SUPERVISOR_STATE_DIR", None)
         self.assertEqual(captured["char_limit"], 65536)
@@ -606,12 +626,13 @@ class ReviewFixTests(UploadCase):
                 raise RuntimeError("injected crash boundary")
             return original(path, value, **kw)
 
-        hs.atomic_write_json = crash_before_completed
+        import herdr_workflow
+        herdr_workflow.atomic_write_json = crash_before_completed  # the inbox writer binds the name in its own module
         try:
             with self.assertRaises(RuntimeError):
                 self.sup.process_inbox()
         finally:
-            hs.atomic_write_json = original
+            herdr_workflow.atomic_write_json = original
         state = self.state()
         self.assertEqual(state["supervisor_state"], "RUNNING")
         run_id = state["run_id"]

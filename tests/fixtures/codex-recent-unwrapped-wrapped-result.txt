@@ -1,0 +1,24 @@
+  └ 28bde9b7c5cce0ef60ed676cd5718d8a2b2a6d069c1539c776d92cfc12795354  /home/user/
+    workspace/reviews/hs-token-cost-start-buttons/CODEX_PLAN.md
+    fd2cf144e1c4daa11389082df5149d7c0e2744a52368a52496522796d14a1f97  /home/user/
+    workspace/reviews/hs-token-cost-start-buttons/plan-approval.json
+
+────────────────────────────────────────────────────────────────────────────────────
+
+• The same technical plan has been reissued for fresh approval. The new plan SHA-256
+  is 28bde9b7c5cce0ef60ed676cd5718d8a2b2a6d069c1539c776d92cfc12795354.
+
+  HERDR_PROTOCOL=2
+  HERDR_RUN=20598ca2-d049-4cb9-967a-5652e7bf6eff
+  HERDR_TURN=9945228c-bb87-493a-96ea-14d190c49510
+  HERDR_STAGE=plan
+  HERDR_NEXT=human
+  HERDR_GATE=plan_approval
+  HERDR_PAYLOAD=/home/user/workspace/reviews/hs-token-cost-start-buttons/plan-
+  approval.json
+  HERDR_HANDOFF=Approve the reissued plan to resume; the technical scope is
+  unchanged from the previous token-cost and Telegram button proposal.
+
+────────────────────────────────────────────────────────────────────────────────────
+
+

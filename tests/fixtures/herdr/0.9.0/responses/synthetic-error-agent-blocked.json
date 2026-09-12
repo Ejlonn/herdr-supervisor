@@ -1,0 +1,12 @@
+{
+  "exit_code": 1,
+  "response": {
+    "error": {
+      "code": "agent_blocked",
+      "message": "agent is blocked on a dialog"
+    },
+    "id": "cli:agent:prompt"
+  },
+  "stream": "stderr",
+  "synthetic": true
+}

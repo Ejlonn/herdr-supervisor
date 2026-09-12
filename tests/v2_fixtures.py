@@ -63,6 +63,12 @@ class FakeHerdr:
         self.refresh_commands: list = []
         self.on_wait = None
         self.on_refresh = None
+        # Lifecycle acknowledgement (herdr >= 0.9 `--wait --until working --until blocked`). Set
+        # ack_supported=False to exercise the settlement fallback.
+        self.ack_supported = True
+        self.ack_calls: list[tuple[str, int]] = []
+        self.help_probes = 0
+        self.targets: list[tuple[str, str]] = []  # (command, raw TARGET argument) for identity assertions
 
     @staticmethod
     def agent(provider: str, name: str, pane: str, session: str, status: str = "idle") -> dict:
@@ -71,8 +77,34 @@ class FakeHerdr:
     @staticmethod
     def ids(prompt: str) -> tuple[str, str]:
         run = next(l.split("=", 1)[1] for l in prompt.splitlines() if l.startswith("HERDR_RUN="))
-        turn = next(l.split("=", 1)[1] for l in prompt.splitlines() if l.startswith("HERDR_TURN="))
+        turn = next(l.split("=", 1)[1] for l in prompt.splitlines() if l.startswith(("HERDR_TURN=", "HERDR_FOLLOWUP_TURN=")))
         return run, turn
+
+    @staticmethod
+    def prompt_field(prompt: str, key: str) -> str:
+        return next(l.split("=", 1)[1] for l in prompt.splitlines() if l.startswith(key + "="))
+
+    @staticmethod
+    def followup_frame(run: str, turn: str, decision: str, path: str, sha: str, summary: str = "answered_no_change_needed", prefix: str = "  ") -> str:
+        lines = ["HERDR_FOLLOWUP=1", f"HERDR_RUN={run}", f"HERDR_FOLLOWUP_TURN={turn}", f"HERDR_DECISION={decision}", f"HERDR_RESPONSE={path}", f"HERDR_RESPONSE_SHA256={sha}", f"HERDR_SUMMARY={summary}"]
+        return "\n".join(prefix + line for line in lines)
+
+    @classmethod
+    def followup_reply(cls, prompt: str, spec: dict) -> str:
+        """Scripted follow-up answer: writes the Markdown response where the prompt asked (unless `path`
+        overrides it, `skip_file` leaves it missing, or `sha` lies) and returns the frame text."""
+        run, turn = cls.ids(prompt)
+        path = spec.get("path") or cls.prompt_field(prompt, "HERDR_RESPONSE")
+        decision = spec.get("decision") or cls.prompt_field(prompt, "HERDR_DECISION")
+        content = spec.get("content", "# Answer\n\nThe widget plan is fine.\n\n# Recommendation\n\nApprove.\n\n# Change needed\n\nno\n\n# Next operator action\n\nApprove the plan.\n")
+        raw = content.encode("utf-8")
+        if not spec.get("skip_file"):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(raw)
+        import hashlib  # noqa: PLC0415
+
+        sha = spec.get("sha") or hashlib.sha256(raw).hexdigest()
+        return cls.followup_frame(run, turn, decision, path, sha, summary=spec.get("summary", "answered_no_change_needed"), prefix=spec.get("prefix", "  "))
 
     @staticmethod
     def block_v2(run: str, turn: str, stage: str, next_agent: str, gate: str = "none", payload: str = "-", handoff: str = "fixture handoff", prefix: str = "  ") -> str:
@@ -86,12 +118,22 @@ class FakeHerdr:
     def list_agents(self) -> list[dict]:
         return list(self.agents.values())
 
+    def _resolve(self, target: str, command: str) -> str:
+        """Herdr accepts an agent name or a pane id as TARGET. Records the raw target per command and
+        returns the key of the fake's agent record (its name, or the pane id for a nameless record)."""
+        self.targets.append((command, target))
+        if target in self.agents:
+            return target
+        for key, agent in self.agents.items():
+            if agent.get("pane_id") == target:
+                return key
+        raise hs.HerdrError("missing", code="agent_not_found")
+
     def get_agent(self, name: str) -> dict:
-        if name not in self.agents:
-            raise hs.HerdrError("missing", code="agent_not_found")
-        return self.agents[name]
+        return self.agents[self._resolve(name, "get")]
 
     def prompt(self, name: str, text: str, *, timeout_ms: int) -> dict:
+        name = self._resolve(name, "prompt")
         self.prompts.append((name, text))
         if not self.responses:
             raise AssertionError(f"unexpected prompt to {name}: {text[:100]}")
@@ -102,6 +144,8 @@ class FakeHerdr:
         self.agents[name]["agent_status"] = response.get("status", "idle")
         if "output" in response:
             output = response["output"]
+        elif "followup" in response:
+            output = text + "\n\nreply\n" + self.followup_reply(text, response["followup"])
         elif "v2" in response:
             stage, nxt, gate, payload = (list(response["v2"]) + ["none", "-"])[:4]
             output = text + "\n\nreply\n" + self.block_v2(run, turn, stage, nxt, gate, payload, prefix=response.get("prefix", "  "))
@@ -115,7 +159,22 @@ class FakeHerdr:
             raise hs.HerdrError(response["error"], code=response["error"])
         return {"result": {"agent": self.agents[name]}}
 
+    def prompt_ack_supported(self) -> bool:
+        self.help_probes += 1
+        return self.ack_supported
+
+    def prompt_ack(self, name: str, text: str, *, timeout_ms: int) -> dict:
+        """Same scripted submission as prompt(); the acknowledgement reports the observed lifecycle
+        (response key `ack_status`, default working) instead of the settled state."""
+        self.ack_calls.append((name, timeout_ms))
+        head = self.responses[0] if self.responses else None
+        ack_status = head.get("ack_status", "working") if isinstance(head, dict) else "working"
+        result = self.prompt(name, text, timeout_ms=timeout_ms)
+        agent = (result.get("result") or {}).get("agent") if isinstance(result, dict) else None
+        return {"result": {"agent": {**(agent or self.agents.get(name) or {}), "agent_status": ack_status}}}
+
     def read_agent(self, name: str, *, source: str, lines: int | None) -> str:
+        name = self._resolve(name, "read")
         self.reads.append((name, source))
         if source == "visible":
             return self.visible.get(name, "")
@@ -124,12 +183,14 @@ class FakeHerdr:
         return self.outputs.get(name, "")
 
     def wait(self, name: str, *, timeout_ms: int) -> dict:
+        name = self._resolve(name, "wait")
         self.waits.append(name)
         if self.on_wait is not None:
             self.on_wait(self, name)
         return {}
 
     def send_keys(self, name: str, keys: list[str]) -> dict:
+        name = self._resolve(name, "send-keys")
         self.sent_keys.append((name, keys))
         return {}
 

@@ -1,0 +1,12 @@
+{
+  "exit_code": 1,
+  "response": {
+    "error": {
+      "code": "timeout",
+      "message": "timed out"
+    },
+    "id": "cli:agent:wait"
+  },
+  "stream": "stderr",
+  "synthetic": true
+}

@@ -252,7 +252,7 @@ class DistributionTests(unittest.TestCase):
         for optional in ("api.telegram.org:443", "`git`", "`ssh`", "`rsync`"):
             self.assertIn(optional, requirements)
         # The plugin the source actually invokes is the one the README names.
-        source = (ROOT / "src/herdr_supervisor.py").read_text()
+        source = (ROOT / "src/herdr_core.py").read_text()  # DEFAULT_CONFIG owns the refresh command
         self.assertIn('"--plugin", "herdr-agent-quota"', source)
 
     def test_shell_scripts_parse(self) -> None:
@@ -272,8 +272,9 @@ class DistributionTests(unittest.TestCase):
                 line.strip() for line in Path(markers_file).read_text().splitlines()
                 if line.strip() and not line.lstrip().startswith("#")
             )
+        skipped = {".git", "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", "build", "dist", ".coverage"}
         for path in ROOT.rglob("*"):
-            if ".git" in path.parts or "__pycache__" in path.parts or not path.is_file():
+            if skipped & set(path.parts) or not path.is_file() or path.name.startswith(".coverage"):
                 continue
             self.assertNotIn(path.name, forbidden_names, str(path))
             try:

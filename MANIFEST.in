@@ -1,9 +1,11 @@
 # Source distribution contents: the complete public repository tree (setuptools sdist allowlist).
 # MANIFEST.txt is the separate install mapping used by install.sh.
-include VERSION MANIFEST.txt MANIFEST.in install.sh uninstall.sh .gitignore
+include VERSION MANIFEST.txt MANIFEST.in install.sh uninstall.sh .gitignore .gitattributes
 recursive-include bin *
 recursive-include config *.json
 recursive-include docs *.md
 recursive-include systemd *
 recursive-include tests *.py
+recursive-include tests/fixtures *.txt *.json
+recursive-include .github *.yml
 global-exclude __pycache__ *.py[cod]

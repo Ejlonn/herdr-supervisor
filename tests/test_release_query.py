@@ -6,10 +6,9 @@ import json
 import re
 from pathlib import Path
 
+import herdr_query as hq  # noqa: E402
 from test_query import QueryWorkerCase
 from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, NOW, QUERY_SESSION, FakeHerdr, hs
-
-import herdr_query as hq  # noqa: E402
 
 CLAUDE_QUERY_SESSION = "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 

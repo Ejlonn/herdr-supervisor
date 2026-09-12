@@ -7,15 +7,14 @@ import json
 import os
 import socket
 import ssl
-import sys
 import urllib.error
 from pathlib import Path
 
-from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, FAKE_TOKEN, NOW, SHA_A, FakeHerdr, V2Case, hs
-
+import herdr_present as hp  # noqa: E402
 import herdr_query  # noqa: E402
 import herdr_telegram as ht  # noqa: E402
 import telegram_api as tg  # noqa: E402
+from v2_fixtures import FAKE_TOKEN, NOW, FakeHerdr, V2Case, hs
 
 OWNER = 424242
 CHAT = 424242
@@ -290,6 +289,10 @@ class CommandTests(TelegramCase):
 
 
 class CallbackTests(TelegramCase):
+    @staticmethod
+    def buttons_of(card: dict) -> dict[str, str]:
+        return {b["text"]: b["callback_data"] for row in (card["reply_markup"] or {"inline_keyboard": []})["inline_keyboard"] for b in row}
+
     def test_action_required_wait_user_guidance_button_opens_bound_reply_intent(self) -> None:
         self.plan_gate()
         with self.sup.store.transaction():
@@ -302,10 +305,21 @@ class CallbackTests(TelegramCase):
         self.bridge.handle_update(message(19, "/status"))
         card = self.api.sent[-1]
         buttons = {button["text"]: button["callback_data"] for row in card["reply_markup"]["inline_keyboard"] for button in row}
-        self.assertEqual(set(buttons), {"Send Guidance", "Cancel Task", "Status"})
-        result = self.bridge.handle_update(callback(20, buttons["Send Guidance"]))
+        self.assertEqual(set(buttons), {"Request revision", "Cancel task", "Status"})
+        self.assertIn("Task stopped: your decision is needed", card["text"])
+        self.assertNotIn("Your input needed", card["text"])
+        # the WAIT_USER card leads with the outcome and explains each button; diagnostics stay out of it
+        wait_card = hp.render_wait_user("gate rejected: unsafe payload path", self.sup.status(), "UTC", requires_action=True)
+        self.assertIn("Task stopped: your decision is needed", wait_card.html)
+        self.assertIn("No approval or next step was created", wait_card.html)
+        self.assertIn("Request revision: reply with one note", wait_card.html)
+        self.assertIn("Cancel task: end the run", wait_card.html)
+        self.assertNotIn("Send Guidance", wait_card.html)
+        self.assertEqual({label for row in wait_card.keyboard for label, _, _ in row}, {"Request revision", "Cancel task", "Status"})
+        result = self.bridge.handle_update(callback(20, buttons["Request revision"]))
         self.assertEqual(result["callback"], "revise_intent")
         self.assertIn("Reply with the revision note", self.api.sent[-1]["text"])
+        self.assertIn("voids the current result", self.api.sent[-1]["text"])
         intent = hs.load_json(self.bridge._intent_path(CHAT), label="reply intent")
         self.assertEqual((intent["run_id"], intent["gate_id"], intent["expected_state"]), (self.state()["run_id"], "-", "WAIT_USER"))
 
@@ -412,7 +426,6 @@ class OffsetAndJournalTests(TelegramCase):
         self.plan_gate()
         update = message(70, "/pause")
         original = hs.atomic_write_json
-        calls = {"n": 0}
 
         def crash_after_journal(path, value, **kw):
             original(path, value, **kw)
@@ -877,3 +890,547 @@ class F10FollowUpAndF11Tests(TelegramCase):
         self.assertEqual(oct(lock_dir.stat().st_mode & 0o777), "0o700")
         self.assertEqual(oct(fresh.state_dir.stat().st_mode & 0o777), "0o700")
         self.assertEqual([c[0] for c in self.api.calls], [], "prepare touches no network")
+
+
+class OperatorHandoffTelegramTests(TelegramCase):
+    FORBIDDEN_CLAIMS = ("PUSH READY", "push-ready", "pushed", "published", "deployed", "push approved", "runtime passed", "Task complete")
+
+    def to_handoff_ready(self) -> dict:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(runtime_validation_required=False, rebuild_required=False)))}])
+        self.approve_pending()
+        self.assertEqual(self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "done")}]), 2)
+        return self.state()
+
+    def counters(self) -> tuple[int, int, int]:
+        return (len(self.herdr.prompts), len(self.herdr.reads), len(self.herdr.waits))
+
+    def buttons(self, index: int = -1) -> dict[str, str]:
+        markup = self.api.sent[index]["reply_markup"] or {"inline_keyboard": []}
+        return {b["text"]: b["callback_data"] for row in markup["inline_keyboard"] for b in row}
+
+    def test_done_is_refused_and_hidden_while_a_gate_or_ordinary_wait_applies(self) -> None:
+        self.plan_gate()
+        self.bridge.handle_update(message(1, "/done"))
+        self.assertIn("not available", self.texts()[-1])
+        self.assertIn("typed gate is pending", self.texts()[-1])
+        self.assertEqual(self.pending_inbox(), [])
+        self.bridge.handle_update(message(2, "/status"))
+        self.assertNotIn("Done (operator handoff)", self.buttons())
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            st["pending_gate"] = None
+            st["supervisor_state"] = "WAIT_USER"
+            st["wait_user_reason"] = "pane check"
+            st["wait_user_requires_action"] = False
+            self.sup.store.write_state(st)
+        self.bridge.handle_update(message(3, "/status"))
+        self.assertNotIn("Done (operator handoff)", self.buttons())
+        self.bridge.handle_update(message(4, "/done"))
+        self.assertIn("ordinary pause", self.texts()[-1])
+        self.assertEqual(self.pending_inbox(), [])
+        self.bridge.handle_update(message(5, "/help"))
+        self.assertIn("/done", self.texts()[-1])
+        self.assertIn("NOT verified", self.texts()[-1])
+
+    def test_status_and_wait_card_offer_done_only_when_the_predicate_allows(self) -> None:
+        state = self.to_handoff_ready()
+        self.bridge.deliver_outbox()
+        wait_card = next(m for m in reversed(self.api.sent) if "Task stopped: your decision is needed" in m["text"])
+        self.assertIn("only your own actions remain", wait_card["text"])
+        self.assertIn("push approval", wait_card["text"])
+        buttons = {b["text"]: b["callback_data"] for row in wait_card["reply_markup"]["inline_keyboard"] for b in row}
+        self.assertIn("Done (operator handoff)", buttons)
+        record = json.loads((self.tg_paths.interactions_dir / f"{buttons['Done (operator handoff)']}.json").read_text())
+        self.assertEqual((record["action"], record["run_id"], record["expected_state"], record["ready_turn_id"]), ("done", state["run_id"], "WAIT_USER", state["operator_handoff_ready"]["turn_id"]))
+        self.bridge.handle_update(message(10, "/status"))
+        self.assertIn("Done (operator handoff)", self.buttons())
+        # the same predicate hides the button once the agent is working again
+        self.herdr.agents["codex-main"]["agent_status"] = "working"
+        self.bridge.handle_update(message(11, "/status"))
+        self.assertNotIn("Done (operator handoff)", self.buttons())
+
+    def test_done_command_closes_via_worker_with_zero_wakeups_and_unverified_wording(self) -> None:
+        state = self.to_handoff_ready()
+        before = self.counters()
+        result = self.bridge.handle_update(message(20, "/done I will push it myself"))
+        self.assertEqual(result["result"], "enqueued")
+        pending = self.pending_inbox()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual((pending[0]["action"], pending[0]["operator_handoff"], pending[0]["run_id"], pending[0]["ready_turn_id"], pending[0]["note"], pending[0]["actor"], pending[0]["chat_id"]),
+                         ("done", True, state["run_id"], state["operator_handoff_ready"]["turn_id"], "I will push it myself", f"telegram:{OWNER}", CHAT))
+        self.assertEqual(self.sup.worker(), 0)
+        after = self.state()
+        self.assertEqual(after["supervisor_state"], "DONE")
+        self.assertEqual(after["completion"]["chat_id"], CHAT)
+        self.assertIsNone(after["push_approval"])
+        self.assertEqual(self.counters(), before, "no prompt, transcript read, or wake-up during /done")
+        self.bridge.deliver_outbox()
+        joined = "\n".join(self.texts())
+        self.assertIn("Task closed by operator handoff", joined)
+        self.assertIn("NOT verified by Supervisor: push approval", joined)
+        self.assertIn("note: I will push it myself", joined)
+        self.assertIn("task closed by operator handoff", joined.lower())
+        for claim in self.FORBIDDEN_CLAIMS:
+            self.assertNotIn(claim, joined)
+        self.bridge.handle_update(message(21, "/status"))
+        self.assertIn("Task closed by operator handoff", self.texts()[-1])
+        self.assertIn("NOT verified", self.texts()[-1])
+        self.assertNotIn("Done (operator handoff)", self.buttons())
+        # already terminal: /done and a fresh command are inert
+        self.bridge.handle_update(message(22, "/done"))
+        self.assertIn("already DONE", self.texts()[-1])
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertEqual(self.event_types().count("TASK_HANDED_OFF"), 1)
+        self.assertEqual(self.counters(), before)
+
+    def test_done_button_is_one_time_state_bound_and_actor_bound(self) -> None:
+        self.to_handoff_ready()
+        self.bridge.deliver_outbox()
+        wait_card = next(m for m in reversed(self.api.sent) if "Task stopped: your decision is needed" in m["text"])
+        token = {b["text"]: b["callback_data"] for row in wait_card["reply_markup"]["inline_keyboard"] for b in row}["Done (operator handoff)"]
+        self.assertEqual(self.bridge.handle_update(callback(30, token, user=OWNER + 1))["rejected"], "wrong_user")
+        self.assertEqual(self.bridge.handle_update(callback(31, token, chat=CHAT + 1))["rejected"], "wrong_chat")
+        self.assertEqual(self.pending_inbox(), [])
+        # guidance supersedes readiness: the offered button becomes inert without mutation
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.guide(st, run_id=st["run_id"], actor="cli", note="retry")
+        self.assertIsNone(self.state()["operator_handoff_ready"])
+        result = self.bridge.handle_update(callback(32, token))
+        self.assertIn("no longer available", result["rejected"])
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertEqual(self.state()["supervisor_state"], "RUNNING")
+        # a later, new readiness gets a new turn id; the old token stays inert (state binding), the new one works once
+        self.assertEqual(self.resume_with([{"v2": ("review", "done")}]), 2)
+        self.bridge.deliver_outbox()
+        self.assertIn("no longer available", self.bridge.handle_update(callback(33, token))["rejected"])
+        new_card = next(m for m in reversed(self.api.sent) if "Task stopped: your decision is needed" in m["text"])
+        new_token = {b["text"]: b["callback_data"] for row in new_card["reply_markup"]["inline_keyboard"] for b in row}["Done (operator handoff)"]
+        self.assertNotEqual(new_token, token)
+        before = self.counters()
+        first = self.bridge.handle_update(callback(34, new_token))
+        self.assertEqual(first["result"], "enqueued")
+        self.assertEqual(self.bridge.handle_update(callback(35, new_token))["rejected"], "Already used (one-time action).")
+        self.assertEqual(len(self.pending_inbox()), 1)
+        self.assertEqual(self.pending_inbox()[0]["ready_turn_id"], self.state()["operator_handoff_ready"]["turn_id"])
+        self.assertEqual(self.sup.worker(), 0)
+        self.assertEqual(self.state()["supervisor_state"], "DONE")
+        self.assertEqual(self.event_types().count("TASK_HANDED_OFF"), 1)
+        self.assertEqual(self.counters(), before)
+
+    def test_shadow_mode_done_changes_nothing(self) -> None:
+        self.to_handoff_ready()
+        shadow = self.make_bridge(mode="shadow")
+        self.assertEqual(shadow.handle_update(message(40, "/done"))["result"], "shadow")
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+
+    def test_done_command_and_callback_share_the_controller_predicate(self) -> None:
+        """Both paths consult Supervisor.operator_handoff_eligibility; a monkeypatched refusal blocks both."""
+        self.to_handoff_ready()
+        self.bridge.deliver_outbox()
+        wait_card = next(m for m in reversed(self.api.sent) if "Task stopped: your decision is needed" in m["text"])
+        token = {b["text"]: b["callback_data"] for row in wait_card["reply_markup"]["inline_keyboard"] for b in row}["Done (operator handoff)"]
+        calls: list[dict] = []
+        original = type(self.bridge.enqueuer).operator_handoff_eligibility
+
+        def refusing(self_, state, **kwargs):
+            calls.append(kwargs)
+            return False, "predicate says no"
+
+        type(self.bridge.enqueuer).operator_handoff_eligibility = refusing  # type: ignore[method-assign]
+        try:
+            self.assertEqual(self.bridge.handle_update(message(50, "/done"))["result"], "ineligible")
+            self.assertIn("predicate says no", self.texts()[-1])
+            self.assertIn("predicate says no", self.bridge.handle_update(callback(51, token))["rejected"])
+        finally:
+            type(self.bridge.enqueuer).operator_handoff_eligibility = original  # type: ignore[method-assign]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["inspect_agents"], False)
+        self.assertEqual((calls[1]["inspect_agents"], calls[1]["ready_turn_id"]), (False, self.state()["operator_handoff_ready"]["turn_id"]))
+        self.assertEqual(self.pending_inbox(), [])
+
+
+class MissingResultRetryTelegramTests(TelegramCase):
+    def to_missing_result(self) -> dict:
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"output": "forgot the block\n", "status": "idle"}]), 2)
+        state = self.state()
+        self.assertIsNotNone(state["missing_result"])
+        return state
+
+    def buttons_of(self, card: dict) -> dict[str, str]:
+        return {b["text"]: b["callback_data"] for row in (card["reply_markup"] or {"inline_keyboard": []})["inline_keyboard"] for b in row}
+
+    def test_missing_result_card_explains_no_approval_and_offers_bound_retry(self) -> None:
+        state = self.to_missing_result()
+        self.bridge.deliver_outbox()
+        card = next(m for m in reversed(self.api.sent) if "Agent finished without a workflow result" in m["text"])
+        self.assertIn("The agent finished, but Supervisor did not receive the required workflow result. No approval or next step was created", card["text"])
+        self.assertIn("Retry routing result: reread the same completed turn once. No message is sent to the agent.", card["text"])
+        self.assertIn("Ask agent: send one question", card["text"])
+        self.assertIn("Request revision: ask the agent for a replacement workflow result", card["text"])
+        self.assertIn("Cancel task: end the run", card["text"])
+        self.assertNotIn("Your input needed", card["text"])
+        self.assertNotIn("Routing result not read", card["text"])
+        for internal in ("settled transcript", "protocol block", "delivery", state["delivery"]["turn_id"][:8]):
+            self.assertNotIn(internal, card["text"], internal)
+        buttons = self.buttons_of(card)
+        self.assertIn("Retry routing result", buttons)
+        self.assertIn("Ask agent", buttons)
+        self.assertIn("Request revision", buttons)
+        self.assertIn("Cancel task", buttons)
+        record = json.loads((self.tg_paths.interactions_dir / f"{buttons['Retry routing result']}.json").read_text())
+        self.assertEqual((record["action"], record["run_id"], record["turn_id"], record["expected_state"]), ("retry_routing_result", state["run_id"], state["delivery"]["turn_id"], "WAIT_USER"))
+        self.bridge.handle_update(message(5, "/status"))
+        self.assertIn("did not receive the required workflow result", self.texts()[-1])
+        self.assertIn("Retry routing result", self.buttons_of(self.api.sent[-1]))
+        self.assertIn("Prompt deliveries prepared: 1", self.texts()[-1])
+        self.assertNotIn("Supervisor prompts", self.texts()[-1])
+
+    def test_retry_button_recovers_the_gate_once_with_zero_prompts_and_is_one_time(self) -> None:
+        state = self.to_missing_result()
+        self.bridge.deliver_outbox()
+        card = next(m for m in reversed(self.api.sent) if "Agent finished without a workflow result" in m["text"])
+        token = self.buttons_of(card)["Retry routing result"]
+        self.assertEqual(self.bridge.handle_update(callback(10, token, user=OWNER + 1))["rejected"], "wrong_user")
+        # the settled transcript now carries the (wrapped) result
+        payload = str(self.plan_payload())
+        block = FakeHerdr.block_v2(state["run_id"], state["delivery"]["turn_id"], "plan", "human", "plan_approval", payload, prefix="  ")
+        self.herdr.outputs["codex-main"] = "reply\n\n" + block.replace(payload, payload[:20] + "\n  " + payload[20:]) + "\n"
+        prompts_before = len(self.herdr.prompts)
+        result = self.bridge.handle_update(callback(11, token))
+        self.assertEqual(result["result"], "enqueued")
+        self.assertEqual(self.bridge.handle_update(callback(12, token))["rejected"], "Already used (one-time action).")
+        self.assertEqual(len(self.pending_inbox()), 1)
+        self.assertEqual(self.pending_inbox()[0]["turn_id"], state["delivery"]["turn_id"])
+        # asynchronous: before the worker resolves the command nothing claims success and no card exists
+        self.bridge.deliver_outbox()
+        pre = "\n".join(self.texts())
+        self.assertNotIn("routing result recovered", pre)
+        self.assertNotIn("Plan ready for approval", pre)
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+        self.assertEqual(self.event_types().count("PLAN_APPROVAL_REQUIRED"), 0)
+        self.assertEqual(self.sup.worker(), 4)
+        after = self.state()
+        self.assertEqual(after["supervisor_state"], "WAIT_PLAN_APPROVAL")
+        self.assertIsNone(after["missing_result"])
+        self.assertEqual(len(self.herdr.prompts), prompts_before, "retry never prompts")
+        counts = self.bridge.deliver_outbox()
+        self.assertGreaterEqual(counts["sent"], 1)
+        joined = "\n".join(self.texts())
+        self.assertIn("routing result recovered", joined)
+        self.assertIn("Plan ready for approval", joined)
+        self.assertEqual(self.event_types().count("PLAN_APPROVAL_REQUIRED"), 1)
+        # restart and a fresh retry after recovery: nothing changes
+        self.assertEqual(self.make_supervisor().worker(), 4)
+        self.assertEqual(self.event_types().count("PLAN_APPROVAL_REQUIRED"), 1)
+        self.assertEqual(len(self.herdr.prompts), prompts_before)
+
+    def test_retry_token_is_inert_after_guidance_and_reports_when_still_unreadable(self) -> None:
+        self.to_missing_result()
+        self.bridge.deliver_outbox()
+        card = next(m for m in reversed(self.api.sent) if "Agent finished without a workflow result" in m["text"])
+        token = self.buttons_of(card)["Retry routing result"]
+        # still unreadable: the command applies, the wait stays, the human is told and nothing was resent
+        self.assertEqual(self.bridge.handle_update(callback(20, token))["result"], "enqueued")
+        self.assertEqual(self.sup.worker(), 2)
+        self.assertEqual(self.state()["missing_result"]["attempts"], 1)
+        self.bridge.deliver_outbox()
+        self.assertIn("still no routing result", "\n".join(self.texts()))
+        self.assertEqual(len(self.herdr.prompts), 1)
+        # the reread is spent: /status explains it and offers no retry button; the old token is inert; a
+        # replayed callback is rejected; guidance remains the recovery
+        self.bridge.handle_update(message(21, "/status"))
+        self.assertIn("one-time reread of that turn was already used", self.texts()[-1])
+        self.assertNotIn("Retry routing result", self.buttons_of(self.api.sent[-1]))
+        self.assertIn("Request revision", self.buttons_of(self.api.sent[-1]))
+        self.assertIn("Ask agent", self.buttons_of(self.api.sent[-1]))
+        self.assertEqual(self.bridge.handle_update(callback(22, token))["rejected"], "Already used (one-time action).")
+        self.bridge.deliver_outbox()
+        stale_cards = [m for m in self.api.sent if m["reply_markup"] and "Retry routing result" in self.buttons_of(m)]
+        for card in stale_cards:
+            self.assertIn("already used", self.bridge.handle_update(callback(23, self.buttons_of(card)["Retry routing result"]))["rejected"].lower())
+        self.assertEqual(len(self.pending_inbox()), 0)
+        self.assertEqual(self.make_supervisor().worker(), 2)
+        self.assertEqual(self.state()["missing_result"]["attempts"], 1)
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.guide(st, run_id=st["run_id"], actor="cli", note="emit the block")
+        self.assertIsNone(self.state()["missing_result"])
+        self.assertEqual(len(self.herdr.prompts), 1)
+
+
+class AgentFollowupTelegramTests(TelegramCase):
+    """Ask agent from Telegram: separate from Request revision, bound one-message intent, asynchronous
+    acknowledgement, one verified answer + document, then the restored decision's own controls."""
+
+    def buttons_of(self, card: dict) -> dict[str, str]:
+        return {b["text"]: b["callback_data"] for row in (card["reply_markup"] or {"inline_keyboard": []})["inline_keyboard"] for b in row}
+
+    def latest_card(self, needle: str) -> dict:
+        return next(m for m in reversed(self.api.sent) if needle in m["text"])
+
+    def deliver_plan_card(self) -> tuple[dict, dict]:
+        state = self.plan_gate()
+        self.bridge.deliver_outbox()
+        card = self.latest_card("Plan ready for approval")
+        return state, self.buttons_of(card)
+
+    def test_ask_agent_button_is_separate_from_revision_and_opens_a_bound_intent(self) -> None:
+        state, buttons = self.deliver_plan_card()
+        self.assertIn("Ask agent", buttons)
+        self.assertIn("Request Revision", buttons)
+        self.assertNotEqual(buttons["Ask agent"], buttons["Request Revision"])
+        record = json.loads((self.tg_paths.interactions_dir / f"{buttons['Ask agent']}.json").read_text())
+        self.assertEqual((record["action"], record["decision_id"], record["artifact_sha256"], record["expected_state"]), ("ask_agent", state["pending_gate"]["gate_id"], state["pending_gate"]["artifact_sha256"], "WAIT_PLAN_APPROVAL"))
+        self.assertEqual(self.bridge.handle_update(callback(10, buttons["Ask agent"], user=OWNER + 1))["rejected"], "wrong_user")
+        result = self.bridge.handle_update(callback(11, buttons["Ask agent"]))
+        self.assertEqual(result["callback"], "ask_agent_intent")
+        self.assertIn("Reply with your question", self.texts()[-1])
+        self.assertIn("decision stays as it is", self.texts()[-1])
+        self.assertEqual(self.bridge.handle_update(callback(12, buttons["Ask agent"]))["rejected"], "Already used (one-time action).")
+        intent = hs.load_json(self.bridge._intent_path(CHAT), label="reply intent")
+        self.assertEqual((intent["kind"], intent["run_id"], intent["decision_id"], intent["artifact_sha256"]), ("ask_agent", state["run_id"], state["pending_gate"]["gate_id"], state["pending_gate"]["artifact_sha256"]))
+        # the reply becomes one bound command; nothing claims success and no prompt exists until the worker runs
+        self.assertEqual(self.bridge.handle_update(message(13, "Why is a rebuild required?"))["result"], "enqueued")
+        queued = self.pending_inbox()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual((queued[0]["action"], queued[0]["decision_id"], queued[0]["expected_state"], queued[0]["question"], queued[0]["chat_id"]), ("ask_agent", state["pending_gate"]["gate_id"], "WAIT_PLAN_APPROVAL", "Why is a rebuild required?", CHAT))
+        self.assertNotIn("revise", queued[0]["action"])
+        self.assertIn("Queued: ask the agent", self.texts()[-1])
+        self.bridge.deliver_outbox()
+        pre = "\n".join(self.texts())
+        self.assertNotIn("answered", pre)
+        self.assertEqual(self.api.documents, [])
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_PLAN_APPROVAL")
+        self.assertEqual(len(self.herdr.prompts), 1)
+
+    def test_answer_arrives_once_with_document_and_restored_gate_controls_that_still_work(self) -> None:
+        state, buttons = self.deliver_plan_card()
+        self.bridge.handle_update(callback(20, buttons["Ask agent"]))
+        self.bridge.handle_update(message(21, "Is the migration flag right?"))
+        self.herdr.responses = [{"followup": {"summary": "migration_flag_is_correct_no_change_needed", "content": "# Answer\n\nThe flag is right.\n\n# Recommendation\n\nApprove.\n\n# Change needed\n\nno\n\n# Next operator action\n\nApprove.\n"}}]
+        self.assertEqual(self.sup.worker(), 4)
+        after = self.state()
+        self.assertEqual((after["supervisor_state"], after["pending_gate"]["gate_id"], after["pending_gate"]["status"]), ("WAIT_PLAN_APPROVAL", state["pending_gate"]["gate_id"], "pending"))
+        self.assertEqual(len(self.herdr.prompts), 2)
+        counts = self.bridge.deliver_outbox()
+        self.assertGreaterEqual(counts["sent"], 1)
+        joined = "\n".join(self.texts())
+        self.assertIn("Question to the agent accepted", joined)
+        card = self.latest_card("Codex answered")
+        self.assertIn("The plan approval decision is unchanged. Nothing was approved, revised, or advanced.", card["text"])
+        self.assertIn("migration_flag_is_correct_no_change_needed", card["text"])
+        self.assertIn("Is the migration flag right?", card["text"])
+        self.assertIn("full answer is attached", card["text"])
+        self.assertEqual(len(self.api.documents), 1)
+        self.assertIn(b"The flag is right.", self.api.documents[0]["data"])
+        self.assertTrue(self.api.documents[0]["filename"].startswith("followup-"))
+        restored = self.buttons_of(card)
+        self.assertEqual(set(restored), {"View Plan", "Approve", "Request Revision", "Reject", "Ask agent"})
+        record = json.loads((self.tg_paths.interactions_dir / f"{restored['Approve']}.json").read_text())
+        self.assertEqual((record["gate_id"], record["artifact_sha256"], record["expected_state"]), (state["pending_gate"]["gate_id"], state["pending_gate"]["artifact_sha256"], "WAIT_PLAN_APPROVAL"))
+        # exactly one answer card and one document, also after a restart and another delivery pass
+        self.assertEqual(self.make_supervisor().worker(), 4)
+        self.bridge.deliver_outbox()
+        self.assertEqual(sum("Codex answered" in t for t in self.texts()), 1)
+        self.assertEqual(len(self.api.documents), 1)
+        # the restored Approve button approves the very same gate
+        self.assertEqual(self.bridge.handle_update(callback(22, restored["Approve"]))["result"], "enqueued")
+        self.assertEqual(self.sup.process_inbox()[-1]["ok"], True)
+        self.assertEqual(self.state()["pending_gate"]["status"], "approved")
+        self.assertEqual(self.state()["approved_plan"]["gate_id"], state["pending_gate"]["gate_id"])
+
+    def test_ask_agent_command_and_stale_intent_handling(self) -> None:
+        state = self.plan_gate()
+        self.assertEqual(self.bridge.handle_update(message(30, "/ask-agent"))["result"], "intent")
+        # the decision changed before the reply: nothing is sent
+        self.approve_pending()
+        self.assertEqual(self.bridge.handle_update(message(31, "still there?"))["result"], "stale_intent")
+        self.assertIn("decision changed", self.texts()[-1])
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertEqual(self.bridge.handle_update(message(32, "/ask-agent anything?"))["result"], "none")
+        self.assertIn("needs a pending decision", self.texts()[-1])
+        # /ask stays the independent read-only facility
+        self.assertEqual(self.bridge.handle_update(message(33, "/ask what is the quota?"))["result"], "state")
+        # a direct /ask-agent <question> at a gate enqueues one bound command
+        self.reset_fixture()
+        state = self.plan_gate()
+        self.assertEqual(self.bridge.handle_update(message(34, "/ask-agent " + "q" * 1001))["result"], "too_long")
+        self.assertEqual(self.bridge.handle_update(message(35, "/ask-agent Why this scope?"))["result"], "enqueued")
+        self.assertEqual(self.pending_inbox()[0]["decision_id"], state["pending_gate"]["gate_id"])
+        self.sup.process_inbox()
+        self.assertEqual(self.state()["agent_followup"]["status"], "PREPARED")
+        # an undelivered gate card is held, not superseded, while the question is out
+        held = self.bridge.deliver_outbox()
+        self.assertEqual(held["superseded"], 0)
+        self.assertNotIn("Plan ready for approval", "\n".join(self.texts()))
+        self.assertEqual(self.bridge.handle_update(message(36, "/ask-agent another?"))["result"], "followup_in_flight")
+        self.assertEqual(self.bridge.handle_update(message(37, "/revise change it"))["result"], "enqueued")
+        self.assertFalse(self.sup.process_inbox()[-1]["ok"], "a revision cannot slip in while the question is out")
+        self.assertEqual(self.bridge.handle_update(message(39, "/status"))["result"], "status")
+        self.assertIn("Question with the agent", self.texts()[-1])
+        self.assertEqual(set(self.buttons_of(self.api.sent[-1])), {"Status", "Pause"})
+        # the held gate card arrives once the decision is restored; gate buttons from before are inert while the question is out
+        self.reset_fixture()
+        state, plan_buttons = self.deliver_plan_card()
+        self.assertEqual(self.bridge.handle_update(message(40, "/ask-agent Why this scope?"))["result"], "enqueued")
+        self.sup.process_inbox()
+        self.assertIn("in flight", self.bridge.handle_update(callback(41, plan_buttons["Approve"]))["rejected"])
+        self.reset_fixture()
+        shadow = self.make_bridge(mode="shadow")
+        self.plan_gate()
+        self.assertEqual(shadow.handle_update(message(42, "/ask-agent shadow?"))["result"], "shadow")
+        self.assertEqual(self.pending_inbox(), [])
+
+    def test_missing_result_ask_agent_returns_to_the_same_recovery_card(self) -> None:
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"output": "prose only\n", "status": "idle"}]), 2)
+        state = self.state()
+        self.bridge.deliver_outbox()
+        card = self.latest_card("Agent finished without a workflow result")
+        buttons = self.buttons_of(card)
+        record = json.loads((self.tg_paths.interactions_dir / f"{buttons['Ask agent']}.json").read_text())
+        self.assertEqual((record["action"], record["turn_id"], record["decision_id"]), ("ask_agent", state["missing_result"]["turn_id"], state["missing_result"]["turn_id"]))
+        self.assertEqual(self.bridge.handle_update(callback(50, buttons["Ask agent"]))["callback"], "ask_agent_intent")
+        self.assertEqual(self.bridge.handle_update(message(51, "What did you conclude?"))["result"], "enqueued")
+        self.herdr.responses = [{"followup": {"summary": "I_concluded_the_plan_is_ready"}}]
+        self.assertEqual(self.sup.worker(), 2)
+        after = self.state()
+        self.assertEqual(after["missing_result"], state["missing_result"])
+        self.bridge.deliver_outbox()
+        answer = self.latest_card("Codex answered")
+        self.assertIn("unread-result recovery is unchanged", answer["text"])
+        restored = self.buttons_of(answer)
+        self.assertEqual(set(restored), {"Retry routing result", "Request revision", "Cancel task", "Status", "Ask agent"})
+        # the original retry still works from the restored card, with zero prompts
+        self.herdr.outputs["codex-main"] = FakeHerdr.block_v2(state["run_id"], state["delivery"]["turn_id"], "plan", "human", "plan_approval", str(self.plan_payload()))
+        prompts = len(self.herdr.prompts)
+        self.assertEqual(self.bridge.handle_update(callback(52, restored["Retry routing result"]))["result"], "enqueued")
+        self.assertEqual(self.sup.worker(), 4)
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_PLAN_APPROVAL")
+        self.assertEqual(len(self.herdr.prompts), prompts)
+
+    def test_unverified_answer_card_explains_and_every_button_works(self) -> None:
+        state, buttons = self.deliver_plan_card()
+        self.bridge.handle_update(callback(60, buttons["Ask agent"]))
+        self.bridge.handle_update(message(61, "Why?"))
+        self.herdr.responses = [{"output": "prose without the frame\n", "status": "idle"}]
+        self.assertEqual(self.sup.worker(), 2)
+        self.bridge.deliver_outbox()
+        card = self.latest_card("Answer not verified")
+        self.assertIn("may have reached Codex, but no verified answer came back", card["text"])
+        self.assertIn("plan approval decision is unchanged: nothing was approved, revised, or advanced", card["text"])
+        self.assertIn("Retry reading answer: read the agent's finished turn once more. No message is sent.", card["text"])
+        self.assertIn("Return to decision: drop this question", card["text"])
+        self.assertIn("Request revision: ask the agent for a replacement", card["text"])
+        for internal in ("settled transcript", "delivery", "turn_id", state["run_id"][:8]):
+            self.assertNotIn(internal, card["text"], internal)
+        wait_buttons = self.buttons_of(card)
+        self.assertEqual(set(wait_buttons), {"Retry reading answer", "Return to decision", "Request revision", "Status"})
+        turn = self.state()["agent_followup"]["followup_turn_id"]
+        for label in ("Retry reading answer", "Return to decision", "Request revision"):
+            record = json.loads((self.tg_paths.interactions_dir / f"{wait_buttons[label]}.json").read_text())
+            self.assertEqual(record["followup_turn_id"], turn, label)
+        # /status shows the same explanation and controls; resume is refused
+        self.bridge.handle_update(message(62, "/status"))
+        self.assertIn("Answer not verified", self.texts()[-1])
+        self.assertIn("Retry reading answer", self.buttons_of(self.api.sent[-1]))
+        self.assertEqual(self.bridge.handle_update(message(63, "/resume"))["result"], "enqueued")
+        self.assertFalse(self.sup.process_inbox()[-1]["ok"])
+        # 1) retry reading: the transcript now carries the answer -> restored, once
+        prompt = self.sup.build_followup_prompt(self.state(), turn)
+        self.herdr.outputs["codex-main"] = "late\n" + FakeHerdr.followup_reply(prompt, {"summary": "late_but_verified"})
+        prompts = len(self.herdr.prompts)
+        self.assertEqual(self.bridge.handle_update(callback(64, wait_buttons["Retry reading answer"]))["result"], "enqueued")
+        self.assertEqual(self.bridge.handle_update(callback(65, wait_buttons["Retry reading answer"]))["rejected"], "Already used (one-time action).")
+        self.assertEqual(self.sup.worker(), 4)
+        self.assertEqual(len(self.herdr.prompts), prompts)
+        self.bridge.deliver_outbox()
+        self.assertIn("late_but_verified", self.latest_card("Codex answered")["text"])
+        self.assertIn("pending any more", self.bridge.handle_update(callback(66, wait_buttons["Return to decision"]))["rejected"].lower())
+        # 2) return to decision (fresh failure): restored controls come with the confirmation
+        self.reset_fixture()
+        state, buttons = self.deliver_plan_card()
+        self.bridge.handle_update(callback(70, buttons["Ask agent"]))
+        self.bridge.handle_update(message(71, "Why?"))
+        self.herdr.responses = [{"output": "prose\n", "status": "idle"}]
+        self.assertEqual(self.sup.worker(), 2)
+        self.bridge.deliver_outbox()
+        wait_buttons = self.buttons_of(self.latest_card("Answer not verified"))
+        self.assertEqual(self.bridge.handle_update(callback(72, wait_buttons["Return to decision"]))["result"], "enqueued")
+        self.assertEqual(self.sup.worker(), 4)
+        self.assertEqual(self.state()["agent_followup"]["status"], "ABANDONED")
+        self.bridge.deliver_outbox()
+        confirmation = self.latest_card("Return to decision accepted")
+        self.assertIn("returned to the plan approval decision", confirmation["text"])
+        self.assertEqual(set(self.buttons_of(confirmation)), {"View Plan", "Approve", "Request Revision", "Reject", "Ask agent"})
+        self.assertNotIn("Codex answered", "\n".join(self.texts()))
+        # 3) request revision from the wait: voids the gate through the ordinary revision path
+        self.reset_fixture()
+        state, buttons = self.deliver_plan_card()
+        self.bridge.handle_update(callback(80, buttons["Ask agent"]))
+        self.bridge.handle_update(message(81, "Why?"))
+        self.herdr.responses = [{"output": "prose\n", "status": "idle"}]
+        self.assertEqual(self.sup.worker(), 2)
+        self.bridge.deliver_outbox()
+        wait_buttons = self.buttons_of(self.latest_card("Answer not verified"))
+        self.assertEqual(self.bridge.handle_update(callback(82, wait_buttons["Request revision"]))["callback"], "revise_intent")
+        self.assertEqual(self.bridge.handle_update(message(83, "rewrite the scope"))["result"], "enqueued")
+        self.assertEqual(self.pending_inbox()[0]["gate_id"], state["pending_gate"]["gate_id"])
+        self.herdr.responses = [{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]
+        self.assertEqual(self.sup.worker(), 4)
+        after = self.state()
+        self.assertEqual((after["agent_followup"]["status"], after["gate_history"][-1]["status"], after["pending_gate"]["sequence"]), ("ABANDONED", "revision_requested", state["pending_gate"]["sequence"] + 1))
+        self.assertIn("rewrite the scope", self.herdr.prompts[-1][1])
+
+    def test_f1_ask_before_the_gate_card_is_delivered_yields_exactly_one_decision_card(self) -> None:
+        state = self.plan_gate()  # PLAN_APPROVAL_REQUIRED is still undelivered
+        self.assertEqual(self.bridge.handle_update(message(90, "/ask-agent Why this scope?"))["result"], "enqueued")
+        self.sup.process_inbox()
+        self.assertEqual(self.bridge.deliver_outbox()["superseded"], 0)  # held, not superseded, while the question is out
+        self.assertNotIn("Plan ready for approval", "\n".join(self.texts()))
+        self.herdr.responses = [{"followup": {"summary": "scope_is_fine"}}]
+        self.assertEqual(self.sup.worker(), 4)
+        self.bridge.deliver_outbox()
+        cards = [m for m in self.api.sent if m["reply_markup"] and "Approve" in self.buttons_of(m)]
+        self.assertEqual(len(cards), 1, "exactly one live decision card after the answer")
+        self.assertIn("Codex answered", cards[0]["text"])
+        self.assertNotIn("Plan ready for approval", "\n".join(self.texts()))
+        held = [hs.load_json(p, label="d") for p in (self.paths.outbox_dir / "delivery").glob("*.json")]
+        self.assertEqual([d["status"] for d in held if d.get("reason") == "decision controls delivered with the answer card"], ["superseded"])
+        # the answer card's controls are live and bound to the still-pending gate
+        buttons = self.buttons_of(cards[0])
+        self.assertEqual(self.bridge.handle_update(callback(91, buttons["Approve"]))["result"], "enqueued")
+        self.assertTrue(self.sup.process_inbox()[-1]["ok"])
+        self.assertEqual(self.state()["approved_plan"]["gate_id"], state["pending_gate"]["gate_id"])
+        # a second delivery pass sends nothing more for that gate
+        self.assertEqual(self.bridge.deliver_outbox()["superseded"], 0)
+        self.assertEqual(len([m for m in self.api.sent if m["reply_markup"] and "Approve" in self.buttons_of(m)]), 1)
+
+    def test_f1_missing_result_ask_before_delivery_yields_one_recovery_card(self) -> None:
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"output": "prose only\n", "status": "idle"}]), 2)
+        self.assertEqual(self.bridge.handle_update(message(95, "/ask-agent What happened?"))["result"], "enqueued")
+        self.sup.process_inbox()
+        self.herdr.responses = [{"followup": {"summary": "I_forgot_the_block"}}]
+        self.assertEqual(self.sup.worker(), 2)
+        self.bridge.deliver_outbox()
+        cards = [m for m in self.api.sent if m["reply_markup"] and "Retry routing result" in self.buttons_of(m)]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("Codex answered", cards[0]["text"])
+
+    def test_f2_credential_questions_are_refused_before_the_journal_and_inbox(self) -> None:
+        self.plan_gate()
+        self.assertEqual(self.bridge.handle_update(message(96, "/ask-agent Authorization: Bearer sk-test-secret-material-1234567890 failed?"))["result"], "credential_refused")
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertIn("Nothing was sent or stored", self.texts()[-1])
+        self.assertEqual(self.bridge.handle_update(message(97, "/ask-agent"))["result"], "intent")
+        self.assertEqual(self.bridge.handle_update(message(98, "postgres://app:s3cretpw@db/prod fails?"))["result"], "credential_refused")
+        self.assertEqual(self.pending_inbox(), [])
+        for path in list(self.tg_paths.updates_dir.glob("*.json")) + list(self.tg_paths.intents_dir.glob("*.json")):
+            self.assertNotIn("s3cretpw", path.read_text())
+            self.assertNotIn("sk-test-secret-material", path.read_text())
+        self.assertEqual(self.bridge.handle_update(message(99, "/ask-agent how is the bot token read?"))["result"], "enqueued")

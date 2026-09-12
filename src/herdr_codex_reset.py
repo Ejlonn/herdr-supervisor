@@ -91,7 +91,10 @@ class ResetInventory:
 def parse_inventory(result: Any, *, now: float | None = None) -> ResetInventory:
     if not isinstance(result, dict):
         raise ResetError("rate-limit response is not an object")
-    inventory = result.get("rateLimitResetCredits")
+    # Accept the supported app-server response and the deliberately sanitized
+    # record returned by the journal helper.  The latter is already a reset
+    # inventory, so it has availableCount at the top level.
+    inventory = result if "availableCount" in result and "rateLimitResetCredits" not in result else result.get("rateLimitResetCredits")
     if not isinstance(inventory, dict):
         raise ResetError("rate-limit response has no reset-credit inventory")
     count = inventory.get("availableCount")
@@ -145,20 +148,22 @@ class AppServerClient:
         environment.update(self.extra_env)
         process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    text=True, bufsize=1, env=environment)
-        assert process.stdin and process.stdout
+        if process.stdin is None or process.stdout is None:  # pragma: no cover - PIPE always provides both
+            raise ResetError("Codex app-server pipes are unavailable")
+        stdin, stdout = process.stdin, process.stdout
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(stdout, selectors.EVENT_READ)
 
         def send(value: dict[str, Any]) -> None:
-            process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
-            process.stdin.flush()
+            stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
+            stdin.flush()
 
         def receive(wanted: int) -> Any:
             deadline = time.monotonic() + self.timeout
             while time.monotonic() < deadline:
                 if not selector.select(max(0, deadline - time.monotonic())):
                     break
-                line = process.stdout.readline()
+                line = stdout.readline()
                 if not line:
                     break
                 try:
@@ -218,7 +223,10 @@ def make_request(operation: str, payload: dict[str, Any], request_id: str) -> di
 def validate_request(value: Any, filename_id: str) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("request_id") != filename_id:
         raise ResetError("reset-helper request identity mismatch")
-    expected = make_request(value.get("operation"), value.get("payload"), filename_id)
+    operation, payload = value.get("operation"), value.get("payload")
+    if not isinstance(operation, str) or not isinstance(payload, dict):
+        raise ResetError("reset-helper request operation or payload is malformed")
+    expected = make_request(operation, payload, filename_id)
     if value != expected:
         raise ResetError("reset-helper request digest or schema mismatch")
     return expected

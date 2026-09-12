@@ -9,7 +9,6 @@ The authoritative source is never modified. No command accepts an arbitrary file
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import stat
@@ -18,9 +17,10 @@ from pathlib import Path
 from typing import Any
 
 import herdr_present as hp
-from herdr_supervisor import MAX_EPOCH, Paths, SupervisorError, _number, atomic_write_json, iso_utc, load_json, sha256_bytes
+import herdr_redaction as hr
+from herdr_supervisor import Paths, SupervisorError, atomic_write_json, iso_utc, load_json, sha256_bytes
 
-CATEGORIES = ("plan", "brief", "review", "handoff", "report", "final_report", "query_answer", "logs", "details", "audit", "validation")
+CATEGORIES = ("plan", "brief", "review", "handoff", "report", "final_report", "query_answer", "logs", "details", "audit", "validation", "followup")
 ALLOWED_SUFFIXES = (".md", ".txt")
 PROTECTED_NAME_RE = re.compile(r"(?i)(^|[/\\])(\.env(\..*)?|bot-token|owners\.json|state\.json|control\.json|query-providers\.json|query-owner\.json|\.netrc|id_rsa.*|id_ed25519.*|.*\.pem|.*\.key|credentials.*|\.credentials\.json|config\.json|.*\.lock|.*\.sock|known_hosts|authorized_keys|\.git($|[/\\]).*)$")
 PROTECTED_DIR_PARTS = {".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", ".herdr", "herdr-telegram", "herdr-telegram-locks", ".env.d", "secrets", "credentials", ".mozilla", ".chrome", "chromium", "wireguard", "openvpn"}
@@ -149,8 +149,8 @@ def _derive(raw: bytes, *, max_bytes: int) -> str:
         raise SupervisorError("artifact is not UTF-8 text") from error
     if "\x00" in text:
         raise SupervisorError("artifact contains NUL bytes")
-    redacted = hp.redact(text, limit=max_bytes)
-    if hp.has_sensitive_remainder(redacted):
+    redacted = hr.redact(text, limit=max_bytes)
+    if hr.has_sensitive_remainder(redacted):
         raise SupervisorError("artifact may contain sensitive material that could not be classified safely")
     # Fail closed when redaction removed something we cannot classify as safe to summarize away entirely.
     if redacted.count("[redacted]") > 50:
@@ -200,7 +200,7 @@ def _register(paths: Paths, config: dict[str, Any], *, category: str, source: Pa
         raise SupervisorError("redacted artifact exceeds max_artifact_bytes")
     _write_exclusive(derivative, derivative_bytes)
     record = {
-        "schema_version": 1, "artifact_id": artifact_id, "category": category, "title": hp.redact(title, limit=120),
+        "schema_version": 1, "artifact_id": artifact_id, "category": category, "title": hr.redact(title, limit=120),
         "run_id": run_id, "task_id": task_id, "event_id": event_id,
         "source_path": str(source), "source_sha256": sha256_bytes(raw), "source_bytes": len(raw),
         "derivative_path": str(derivative), "derivative_sha256": sha256_bytes(derivative_bytes), "derivative_bytes": len(derivative_bytes),

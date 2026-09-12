@@ -4,16 +4,15 @@ delivery, protected artifact access, and the human-readable presentation layer (
 from __future__ import annotations
 
 import json
-import os
+import unittest
 from pathlib import Path
 from unittest import mock
-
-from test_telegram import CHAT, OWNER, FakeApi, TelegramCase, callback, message
-from v2_fixtures import FAKE_TOKEN, NOW, SHA_A, FakeHerdr, hs
 
 import herdr_artifacts as ha  # noqa: E402
 import herdr_present as hp  # noqa: E402
 import telegram_api as tg  # noqa: E402
+from test_telegram import CHAT, TelegramCase, callback, message
+from v2_fixtures import FAKE_TOKEN, NOW, SHA_A, hs
 
 LONG_MD = "# Big report\n\n" + "\n".join(f"- line {i} with **bold** and `code`" for i in range(400)) + "\n\n## Section\n\ntext\n"
 
@@ -393,7 +392,7 @@ class ArtifactAccessTests(OutputCase):
         source = self.review_dir / "small.md"
         source.write_bytes(b"safe")
         # Character bounds are insufficient for UTF-8 document limits; assert the final bytes are checked.
-        with mock.patch.object(ha.hp, "redact", return_value="🚀" * 4):
+        with mock.patch.object(ha.hr, "redact", return_value="🚀" * 4):  # artifacts consume the redaction module directly
             with self.assertRaisesRegex(hs.SupervisorError, "redacted artifact exceeds"):
                 ha.register_file(self.paths, self.config, category="report", source_path=str(source), run_id="r")
 
@@ -455,7 +454,7 @@ class RendererSnapshotTests(OutputCase):
             "WAIT_RUNTIME_VALIDATION": {"View Report", "Status"},
             "WAIT_PUSH_APPROVAL": {"Approve Push Stage", "Keep Waiting", "Cancel"},
             "PAUSED": {"Resume", "Cancel"},
-            "WAIT_USER": {"Send Guidance", "Cancel Task", "Status"},
+            "WAIT_USER": {"Request revision", "Cancel task", "Status"},
             "RUNNING": {"Status", "Pause"},
             "DONE": {"Status"},
             "NO_TASK": set(),
@@ -511,3 +510,20 @@ class RendererSnapshotTests(OutputCase):
         self.assertIn("Answered by Claude because the preferred Codex query session is quota-blocked until", texts)
         self.assertIn("<b>Query not answered</b>", texts)
         self.assertIn("cannot be run safely", texts)
+
+
+class HandoffPresentationTests(unittest.TestCase):
+    def test_handoff_display_is_the_exact_stored_value(self) -> None:
+        cases = [
+            "Review_my_file.py_then_bump_reset_sequence_in_config",  # contract form with literal identifiers
+            "Approve the plan; see CODEX_PLAN.md and reset_sequence",  # legacy spaced text with a literal underscore
+            "/home/user/work/my_project/plan-approval.json",
+        ]
+        for value in cases:
+            with self.subTest(value=value):
+                self.assertEqual(hp.handoff_text(value), value)
+                event = {"type": "TASK_HANDED_OFF", "data": {"stage": "review", "handoff": value, "unmet": ["push_approval"], "verified_by_supervisor": False}}
+                self.assertIn(hp.esc(value, limit=160), hp.render_task_handed_off(event, None, "UTC").html)
+                done = {"type": "TASK_DONE", "data": {"stage": "review", "handoff": value}}
+                self.assertIn(hp.esc(value, limit=200), hp.render_task_done(done, None, "UTC").html)
+        self.assertEqual(hp.handoff_text(None), "")

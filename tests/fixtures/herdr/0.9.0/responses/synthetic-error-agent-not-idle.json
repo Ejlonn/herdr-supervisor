@@ -1,0 +1,12 @@
+{
+  "exit_code": 1,
+  "response": {
+    "error": {
+      "code": "agent_not_idle",
+      "message": "agent output is on an alternate screen"
+    },
+    "id": "cli:agent:read"
+  },
+  "stream": "stderr",
+  "synthetic": true
+}

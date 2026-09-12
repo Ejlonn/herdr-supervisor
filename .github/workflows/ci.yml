@@ -1,0 +1,107 @@
+# Deterministic, offline quality gate. Nothing here contacts a live Herdr, Telegram, model provider, or
+# reset service: the suite uses fakes and recorded fixtures only. The only network use is dependency
+# installation from PyPI at the pinned versions in pyproject.toml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  test:
+    name: unittest + coverage (py${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install pinned dev tools
+        run: python -m pip install --no-cache-dir -e ".[dev]"
+      - name: Compile
+        run: python -m compileall -q src tests
+      - name: Shell syntax
+        run: sh -n install.sh && sh -n uninstall.sh && for f in bin/*; do sh -n "$f"; done
+      - name: Full test discovery with branch-aware coverage (isolated HOME)
+        run: |
+          export HOME="$(mktemp -d)"
+          PYTHONPATH=src coverage run --branch --source=src -m unittest discover -s tests
+          coverage report --fail-under=80
+          coverage xml
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python }}
+          path: coverage.xml
+          retention-days: 7
+
+  lint-and-types:
+    name: ruff + mypy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --no-cache-dir -e ".[dev]"
+      - name: Ruff (lint + import order)
+        run: ruff check src tests
+      - name: mypy (all src modules, check_untyped_defs)
+        run: mypy
+
+  package-and-release-checks:
+    name: sdist/wheel, entry points, installer, fixtures, versions, secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --no-cache-dir -e ".[dev]"
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel --outdir dist .
+      - name: sdist inventory equals the repository inventory
+        run: |
+          git ls-files | sort > /tmp/tree.txt
+          tar -tzf dist/*.tar.gz | sed 's#^[^/]*/##' | grep -v '/$' | grep -v -E 'egg-info|PKG-INFO|setup.cfg' | grep -v '^$' | sort > /tmp/sdist.txt
+          diff /tmp/tree.txt /tmp/sdist.txt
+      - name: Extracted sdist runs its own suite
+        run: |
+          mkdir /tmp/sdist && tar -xzf dist/*.tar.gz -C /tmp/sdist
+          cd /tmp/sdist/*/ && HOME="$(mktemp -d)" PYTHONPATH=src python -m unittest discover -s tests
+      - name: Wheel installs and every console entry point answers --help
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install --no-cache-dir dist/*.whl
+          for ep in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker; do HOME="$(mktemp -d)" /tmp/wheelenv/bin/$ep --help > /dev/null; done
+      - name: Installer dry run in an isolated HOME
+        run: |
+          export HOME="$(mktemp -d)"; mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/herdr"; chmod +x "$HOME/.local/bin/herdr"
+          ./install.sh --dry-run
+      - name: Fixture privacy, version consistency, and secret markers
+        run: HOME="$(mktemp -d)" PYTHONPATH=src python -m unittest tests.test_release_checks tests.test_herdr_contract.FixturePrivacyTests tests.test_distribution -v

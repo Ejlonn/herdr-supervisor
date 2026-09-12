@@ -25,5 +25,54 @@ herdr-backup = "herdr_backup:main"
 herdr-codex-reset-worker = "herdr_codex_reset:main"
 
 [tool.setuptools]
-py-modules = ["herdr_supervisor", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "telegram_api"]
+py-modules = ["herdr_supervisor", "herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_runtime", "herdr_command", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "telegram_api"]
 package-dir = {"" = "src"}
+
+[project.optional-dependencies]
+# Pinned, mutually compatible development tools (CI installs exactly these).
+dev = [
+  "ruff==0.14.14",
+  "mypy==1.19.1",
+  "coverage[toml]==7.13.4",
+  "build==1.6.1",
+  "setuptools==84.0.0",
+  "wheel==0.48.0",
+]
+
+[tool.ruff]
+line-length = 200
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Correctness and import hygiene; style rules that would only reformat the accepted candidate are not enabled.
+select = ["E4", "E7", "E9", "F", "I", "B006", "B008", "B015", "B017", "PLC0415"]
+# E701/E702 (compound statements) are pure layout in the accepted candidate; reformatting it would
+# hide the behavioral diff. E731/E741 are stylistic too.
+ignore = ["E701", "E702", "E731", "E741"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["herdr_supervisor", "herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_runtime", "herdr_command", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "telegram_api"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "PLC0415"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+mypy_path = "src"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
+# No global error suppression; every module under src is checked. Narrow exclusions would be documented here.
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = false

@@ -670,7 +670,7 @@ class RecoveryTests(SupervisorTestCase):
         self.assertIn("required live agent is missing", self.state_error())
         # But an in-flight task whose agent disappears is restored, not recreated.
         self.herdr.agents["codex-main"] = FakeHerdr._agent("codex", "codex-main", "w3:p2", CODEX_SESSION)
-        state = self.supervisor.initialize("task", "codex")
+        self.supervisor.initialize("task", "codex")
         del self.herdr.agents["codex-main"]
         agent = self.supervisor.ensure_agent("codex")
         self.assertEqual(self.herdr.starts, [("codex-main", "codex", "w3:p2", ["resume", CODEX_SESSION])])
@@ -869,15 +869,16 @@ class ReviewRegressionTests(SupervisorTestCase):
                 captured.update(task=task, start=start, task_reference=task_reference)
                 return 0
 
-        original = hs.Supervisor
-        hs.Supervisor = Recorder  # type: ignore[misc]
+        import herdr_command
+        original = herdr_command.Supervisor
+        herdr_command.Supervisor = Recorder  # type: ignore[misc]  # main() resolves the class in its own module
         try:
             self.paths.config_file.write_text(json.dumps({"schema_version": 1, "herdr_bin": sys.executable}))
             os.environ["HERDR_SUPERVISOR_CONFIG"] = str(self.paths.config_file)
             os.environ["HERDR_SUPERVISOR_STATE_DIR"] = str(self.state_dir)
             self.assertEqual(hs.main(["run", "--start", "claude", str(task_file)]), 0)
         finally:
-            hs.Supervisor = original  # type: ignore[misc]
+            herdr_command.Supervisor = original  # type: ignore[misc]
             os.environ.pop("HERDR_SUPERVISOR_CONFIG", None)
             os.environ.pop("HERDR_SUPERVISOR_STATE_DIR", None)
         self.assertEqual(captured, {"task": "CLI task\n", "start": "claude", "task_reference": str(task_file.resolve())})

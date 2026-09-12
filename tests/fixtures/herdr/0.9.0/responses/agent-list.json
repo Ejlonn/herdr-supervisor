@@ -1,0 +1,81 @@
+{
+  "exit_code": 0,
+  "response": {
+    "id": "cli:agent:list",
+    "result": {
+      "agents": [
+        {
+          "agent": "claude",
+          "agent_session": {
+            "agent": "claude",
+            "kind": "id",
+            "source": "herdr:claude",
+            "value": "22222222-2222-4222-8222-222222222222"
+          },
+          "agent_status": "working",
+          "cwd": "/home/user/workspace",
+          "focused": false,
+          "foreground_cwd": "/home/user/workspace",
+          "interactive_ready": true,
+          "name": "claude-main",
+          "pane_id": "w1:p1",
+          "revision": 1,
+          "state_change_seq": 1,
+          "tab_id": "w1:t1",
+          "terminal_id": "term_000000000000",
+          "terminal_title": "example terminal title",
+          "terminal_title_stripped": "example terminal title",
+          "tokens": {
+            "quota_5h_normal": "sanitized",
+            "quota_cache": "sanitized",
+            "quota_cache_ttl": "sanitized",
+            "quota_context_warning": "sanitized",
+            "quota_headroom": "sanitized",
+            "quota_model": "sanitized",
+            "quota_provider": "sanitized",
+            "quota_provider_model": "sanitized",
+            "quota_topic": "sanitized",
+            "quota_week_warning": "sanitized"
+          },
+          "workspace_id": "w1"
+        },
+        {
+          "agent": "codex",
+          "agent_session": {
+            "agent": "codex",
+            "kind": "id",
+            "source": "herdr:codex",
+            "value": "11111111-1111-4111-8111-111111111111"
+          },
+          "agent_status": "idle",
+          "cwd": "/home/user/workspace",
+          "focused": true,
+          "foreground_cwd": "/home/user/workspace",
+          "name": "codex-main",
+          "pane_id": "w1:p2",
+          "revision": 1,
+          "state_change_seq": 1,
+          "tab_id": "w1:t1",
+          "terminal_id": "term_000000000000",
+          "terminal_title": "example terminal title",
+          "terminal_title_stripped": "example terminal title",
+          "tokens": {
+            "quota_5h_normal": "sanitized",
+            "quota_cache": "sanitized",
+            "quota_cache_ttl": "sanitized",
+            "quota_context_normal": "sanitized",
+            "quota_headroom": "sanitized",
+            "quota_model": "sanitized",
+            "quota_provider": "sanitized",
+            "quota_provider_model": "sanitized",
+            "quota_topic": "sanitized",
+            "quota_week_normal": "sanitized"
+          },
+          "workspace_id": "w1"
+        }
+      ],
+      "type": "agent_list"
+    }
+  },
+  "stream": "stdout"
+}

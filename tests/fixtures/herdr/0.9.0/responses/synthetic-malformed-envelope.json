@@ -1,0 +1,10 @@
+{
+  "exit_code": 0,
+  "response": {
+    "id": "cli:agent:get",
+    "result": {
+      "agent": "not-an-object"
+    }
+  },
+  "synthetic": true
+}

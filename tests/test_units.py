@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import unittest
@@ -73,7 +72,8 @@ class UnitFileTests(unittest.TestCase):
     def test_public_units_and_defaults_are_generic(self) -> None:
         for unit in sorted(UNITS.glob("*")):
             self.assertNotIn("V2", unit.read_text(), unit.name)
-        import herdr_present, herdr_telegram
+        import herdr_present
+        import herdr_telegram
         self.assertEqual(herdr_telegram.DEFAULT_TIMEZONE, "UTC")
         self.assertEqual(herdr_present.DEFAULT_TIMEZONE, "UTC")
         for example in ("supervisor.example.json", "telegram.example.json"):
@@ -104,7 +104,7 @@ class UnitFileTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
 
     def test_no_listener_no_vpn_no_firewall_code_in_v2_modules(self) -> None:
-        for module in ("herdr_telegram.py", "telegram_api.py", "herdr_query.py", "herdr_supervisor.py"):
+        for module in ("herdr_telegram.py", "telegram_api.py", "herdr_query.py", "herdr_supervisor.py", "herdr_core.py", "herdr_cli.py", "herdr_quota.py", "herdr_protocol.py", "herdr_validation.py", "herdr_workflow.py", "herdr_runtime.py", "herdr_command.py"):
             text = (LIB / module).read_text()
             for forbidden in (".bind(", ".listen(", "iptables", "nft ", "ufw ", "wg-quick", "openvpn", "ssh -R", "setWebhook", "deleteWebhook", "HTTPServer", "socketserver"):
                 self.assertNotIn(forbidden, text, f"{module}: {forbidden}")

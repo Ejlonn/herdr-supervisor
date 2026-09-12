@@ -1,0 +1,11 @@
+{
+  "exit_code": 1,
+  "response": {
+    "error": {
+      "code": "pane_not_found",
+      "message": "pane w99:p99 not found"
+    },
+    "id": "cli:pane:get"
+  },
+  "stream": "stderr"
+}

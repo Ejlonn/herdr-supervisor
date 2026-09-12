@@ -4,10 +4,6 @@ deadline-plus-recheck early wake without any LLM involvement. All fixtures are m
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-import textwrap
 from pathlib import Path
 
 from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, NOW, FakeHerdr, V2Case, hs, quota_json
@@ -209,8 +205,8 @@ class PrecedenceTests(StateCase):
         original, reconciliation = self.herdr.prompts[0][1], self.herdr.prompts[1][1]
         self.assertNotEqual(original, reconciliation, "original prompt never replayed")
         self.assertNotIn("Task:\nAdd the widget", reconciliation)
-        self.assertIn("Do NOT redo the previous task", reconciliation)
-        self.assertIn("settled before emitting a valid supervisor protocol result", reconciliation)
+        self.assertIn("Do not redo it", reconciliation)
+        self.assertIn("settled without a valid routing result", reconciliation)
         first_run, first_turn = FakeHerdr.ids(original)
         second_run, second_turn = FakeHerdr.ids(reconciliation)
         self.assertEqual(first_run, second_run)
@@ -660,7 +656,8 @@ class MonitoringInstrumentationTests(StateCase):
         self.assertEqual(self.herdr.sent_keys, [])
         self.assertEqual(self.herdr.starts, [])
         self.assertEqual(len(self.herdr.waits), 40)
-        source = Path(hs.__file__).read_text()
+        import herdr_runtime
+        source = Path(herdr_runtime.__file__).read_text()  # the engine module owns wait_for_quota
         wait_body = source[source.index("    def wait_for_quota("):source.index("    def _snapshot_fetched_at(")]
         for forbidden in (".prompt(", "read_output(", "read_agent(", "send_keys(", "start_agent(", "herdr.wait("):
             self.assertNotIn(forbidden, wait_body, f"quota wait must not call {forbidden}")

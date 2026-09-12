@@ -1,0 +1,12 @@
+{
+  "exit_code": 1,
+  "response": {
+    "error": {
+      "code": "agent_prompt_stalled",
+      "message": "no working or blocked state observed within 5000ms"
+    },
+    "id": "cli:agent:prompt"
+  },
+  "stream": "stderr",
+  "synthetic": true
+}

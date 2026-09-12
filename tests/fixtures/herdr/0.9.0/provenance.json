@@ -1,0 +1,58 @@
+{
+  "capture_method": "read-only: herdr --version; herdr <command> --help for every adapter command; herdr agent list; herdr agent get <pane>; herdr pane get <pane>; documented error probes against non-existent targets. No prompt, wait, rename, start, send-keys, workspace, or plugin mutation was executed.",
+  "captured_on": "2026-09-11",
+  "herdr_version": "herdr 0.9.0",
+  "placeholders": {
+    "cwd": "/home/user/workspace",
+    "panes": [
+      "w1:p1",
+      "w1:p2"
+    ],
+    "probe_targets": {
+      "missing_agent": "no-such-agent-zz",
+      "missing_pane": "w99:p99"
+    },
+    "session_ids": {
+      "claude": "22222222-2222-4222-8222-222222222222",
+      "codex": "11111111-1111-4111-8111-111111111111"
+    },
+    "tab": "w1:t1",
+    "terminal_id": "term_000000000000",
+    "terminal_title": "example terminal title",
+    "workspace": "w1"
+  },
+  "recorded_responses": {
+    "agent-get": "agent get <pane>",
+    "agent-list": "agent list",
+    "error-agent-get-not-found": "agent get <missing-target>",
+    "error-agent-read-not-found": "agent read <missing-target> --source recent-unwrapped --format text",
+    "error-pane-get-not-found": "pane get <missing-pane>",
+    "pane-get": "pane get <pane>"
+  },
+  "sanitized_fields": [
+    "agent_session.value",
+    "cwd",
+    "foreground_cwd",
+    "name normalized to <provider>-main",
+    "pane_id",
+    "pane_id (original locators replaced by the placeholder panes; the originals are not recorded)",
+    "revision",
+    "state_change_seq",
+    "tab_id",
+    "terminal_id",
+    "terminal_title",
+    "terminal_title_stripped",
+    "tokens.*",
+    "workspace_id"
+  ],
+  "statement": "No real account, session, pane, tab, workspace, terminal, path, title, quota, or secret data remains; recorded envelopes keep the exact Herdr 0.9.0 key structure with the placeholder values above. Original identifiers are not recorded anywhere in this fixture set.",
+  "synthetic_responses": [
+    "synthetic-error-agent-blocked",
+    "synthetic-error-agent-not-idle",
+    "synthetic-error-prompt-stalled",
+    "synthetic-error-timeout",
+    "synthetic-malformed-envelope",
+    "synthetic-not-json",
+    "synthetic-unknown-lifecycle"
+  ]
+}

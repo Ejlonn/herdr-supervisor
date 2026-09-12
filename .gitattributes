@@ -1,0 +1,2 @@
+# Captured terminal/CLI fixtures are verbatim: trailing whitespace and final blank rows are part of the evidence.
+tests/fixtures/** -whitespace

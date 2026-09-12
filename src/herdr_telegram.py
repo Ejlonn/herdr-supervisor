@@ -28,17 +28,18 @@ from typing import Any, Callable
 
 import herdr_artifacts as ha
 import herdr_backup as hb
+import herdr_codex_reset as hcr
 import herdr_present as hp
 import herdr_query
+import herdr_redaction as hr
 import herdr_supervisor as hs
-import herdr_codex_reset as hcr
 import telegram_api as tg
 
 CONFIG_SCHEMA = 1
 MODES = ("unconfigured", "shadow", "actionable")
 CHUNK = 3800
 DEFAULT_TIMEZONE = "UTC"
-COMMANDS = ("status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "logs", "doctor", "ask", "revise", "answer", "backup", "help")
+COMMANDS = ("status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "done", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
 UPLOAD_STATUSES = ("pending_confirmation", "reset_authorization", "start_enqueued", "started", "cancelled", "expired", "failed", "superseded")
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9._ ()\-]")
 INFO_CONTROLS = (("Status", "status"), ("Pause", "pause"), ("Cancel", "cancel"))
@@ -63,9 +64,9 @@ DEFAULT_TG_CONFIG: dict[str, Any] = {
     "max_document_replacements": 1,
 }
 
-_SECRET_PATTERNS = hp._SECRET_PATTERNS
-_CONTROL_RE = hp.CONTROL_RE
-redact = hp.redact
+_SECRET_PATTERNS = hr._SECRET_PATTERNS
+_CONTROL_RE = hr.CONTROL_RE
+redact = hr.redact
 fmt_local = hp.fmt_local
 chunks = hp.chunks
 
@@ -264,8 +265,9 @@ class Bridge:
     # ----- authentication
 
     def authenticate(self, message_like: dict[str, Any]) -> tuple[bool, str, int | None, int | None]:
-        user = message_like.get("from") if isinstance(message_like.get("from"), dict) else {}
-        chat = message_like.get("chat") if isinstance(message_like.get("chat"), dict) else {}
+        raw_user, raw_chat = message_like.get("from"), message_like.get("chat")
+        user: dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+        chat: dict[str, Any] = raw_chat if isinstance(raw_chat, dict) else {}
         user_id = user.get("id") if isinstance(user.get("id"), int) and not isinstance(user.get("id"), bool) else None
         chat_id = chat.get("id") if isinstance(chat.get("id"), int) and not isinstance(chat.get("id"), bool) else None
         owner = self.config.get("owner_user_id")
@@ -276,6 +278,8 @@ class Bridge:
         if chat.get("type") != "private":
             return False, "not_private", user_id, chat_id
         if self.config.get("chat_id") is not None and chat_id != self.config["chat_id"]:
+            return False, "wrong_chat", user_id, chat_id
+        if user_id is None or chat_id is None:  # a malformed update cannot be authenticated
             return False, "wrong_chat", user_id, chat_id
         return True, "ok", user_id, chat_id
 
@@ -481,6 +485,7 @@ class Bridge:
         text = message.get("text")
         if not ok:
             return {"rejected": reason, "user_id": user_id}  # no details leak to unknown users/chats
+        assert user_id is not None and chat_id is not None  # authenticate() never returns ok without both
         if isinstance(message.get("document"), dict) and not isinstance(text, str):
             return {"document": True, **self.handle_document(update_id, message, user_id, chat_id)}
         if not isinstance(text, str) or not text.strip():
@@ -512,10 +517,13 @@ class Bridge:
             "/task <text> – start a gated task with Codex (rejected while a task is active)\n"
             "/plan – pending plan summary; /pending – current human gate\n"
             "/pause /resume /cancel – supervisor control (sessions preserved)\n"
+            "/done [note] – close a handoff-ready task as an operator handoff: remaining git/runtime actions are yours and are NOT verified\n"
             "/logs – recent events; /doctor – health; /backup – backup health (/backup now requests a run)\n"
             "/ask <question> – read-only. State questions are answered without a model; repository questions use the\n"
             "  an eligible configured read-only query session and may consume that provider's quota. /ask never starts or changes a task.\n"
-            "/revise <note> – revision for the pending gate; /answer <text> – answer a pending question\n"
+            "/ask-agent <question> – one read-only question to the active agent while the pending gate or unread-result wait stays exactly as it is;\n"
+            "  the answer comes back here and the same decision returns. It never approves, revises, or implements anything.\n"
+            "/revise <note> – revision for the pending gate (voids it; the agent must produce a replacement); /answer <text> – answer a pending question\n"
             f"mode: {self.config.get('mode')}"
         )
 
@@ -611,8 +619,8 @@ class Bridge:
             token=self.new_interaction(action="reset_budget",event=pseudo,gate=None,chat_id=chat_id,
                                        extra={"pending_id":pending_id,"budget":budget,"available_count":available,
                                               "account_fingerprint":fingerprint,"task_sha256":record["task_sha256"]})
-            buttons.append({"text":"Start task · 0 resets" if budget==0 else f"Start task · {budget} reset{'s' if budget != 1 else ''}","callback_data":token})
-        rows=[buttons[i:i+4] for i in range(0,len(buttons),4)]
+            buttons.append({"text":f"Start · {budget}","callback_data":token})
+        rows=[buttons[i:i+2] for i in range(0,len(buttons),2)]  # complete labels, at most two choices per row
         cancel=self.new_interaction(action="reset_budget_cancel",event=pseudo,gate=None,chat_id=chat_id,
                                     extra={"pending_id":pending_id,"task_sha256":record["task_sha256"]})
         rows.append([{"text":"Cancel","callback_data":cancel}])
@@ -621,8 +629,21 @@ class Bridge:
         identity_note="" if fingerprint else "\nAutomatic redemption is unavailable because the account identity could not be verified; choose 0."
         mode_note="\n\nSHADOW: selecting a budget will not start a task." if self.config.get("mode") != "actionable" else ""
         shown_count = str(inventory_count) if inventory_count is not None else "unavailable"
-        self.safe_send(chat_id,f"Codex reset policy\n\nBanked resets available: {shown_count}\n\nChoose the reset budget and start this task.\n\n{consequence}{identity_note}{suffix}{mode_note}",reply_markup={"inline_keyboard":rows})
+        self.safe_send(chat_id,f"Start this task?\n\nTask to start:\n{self._task_preview(task)}\n\nTapping Start · N starts this task now as ONE gated Codex run; N is the maximum automatic banked-reset budget the run may use (0 = none, the default).\nBanked resets available: {shown_count}\n{consequence}{identity_note}{suffix}{mode_note}",reply_markup={"inline_keyboard":rows})
         return {"result":"reset_budget_required","pending_id":pending_id,"available":inventory_count,"authorizable":available}
+
+    def _task_preview(self, task: dict[str, Any]) -> str:
+        """Body text for the start card: the typed task itself, or the already-validated upload name and
+        bounded excerpt from upload metadata. Never file contents into callbacks or command journals."""
+        if isinstance(task.get("task_text"), str):
+            return task["task_text"]
+        upload_id = task.get("upload_id")
+        meta = self._load_upload(upload_id) if isinstance(upload_id, str) else None
+        if not isinstance(meta, dict):
+            return "uploaded task file"
+        head = f"file {redact(meta.get('display_filename'), limit=80)} ({meta.get('suffix')}, {meta.get('chars')} chars)"
+        excerpt = meta.get("excerpt")
+        return f"{head}\n{redact(excerpt, limit=420)}" if isinstance(excerpt, str) and excerpt else head
 
     def cmd_reset_budget(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         if not re.fullmatch(r"\d+", argument):
@@ -754,6 +775,24 @@ class Bridge:
     def cmd_cancel(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         return self._control(update_id, "cancel", user_id, chat_id)
 
+    def cmd_done(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        """Operator handoff. The controller's predicate decides (state-only here; the applying worker
+        repeats it with live agent inspection). Nothing is inferred from text and nothing is woken."""
+        state = self._state()
+        eligible, reason = self.enqueuer.operator_handoff_eligibility(state, inspect_agents=False)
+        if not eligible or state is None:
+            self.safe_send(chat_id, f"Operator handoff is not available: {redact(reason, limit=200)}")
+            return {"result": "ineligible", "reason": reason}
+        note = argument.strip()
+        if len(note) > hs.MAX_HANDOFF_NOTE_CHARS:
+            self.safe_send(chat_id, f"Note exceeds {hs.MAX_HANDOFF_NOTE_CHARS} characters.")
+            return {"result": "note_too_long"}
+        command = {"request_id": self.request_id_for(update_id), "action": "done", "operator_handoff": True, "run_id": state["run_id"], "expected_state": "WAIT_USER",
+                   "ready_turn_id": state["operator_handoff_ready"]["turn_id"], "actor": f"telegram:{user_id}", "chat_id": chat_id, "source": "telegram", "created_at": hs.iso_utc(self.clock())}
+        if note:
+            command["note"] = note
+        return self._enqueue_or_shadow(command, chat_id, f"close run {state['run_id'][:8]} as an operator handoff (remaining actions unverified)")
+
     def cmd_logs(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         events = self.enqueuer.list_events()
         if not events:
@@ -811,6 +850,43 @@ class Bridge:
 
     def cmd_ask(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         return self._query(update_id, argument, user_id, chat_id, source="/ask")
+
+    def _followup_binding(self, state: dict[str, Any] | None) -> dict[str, Any] | None:
+        """The exact decision an Ask-agent command is bound to, from live state (never from a card)."""
+        decision = self.enqueuer.followup_decision(state)
+        if state is None or decision is None:
+            return None
+        binding = {"run_id": state["run_id"], "decision_id": decision["decision_id"], "expected_state": state["supervisor_state"]}
+        if decision["kind"] == "gate":
+            binding.update(artifact_sha256=decision["artifact_sha256"], payload_sha256=decision["payload_sha256"])
+        return binding
+
+    def cmd_ask_agent(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        state = self._state()
+        if self.enqueuer.followup_unresolved(state) is not None:
+            self.safe_send(chat_id, "A question to the agent is already in flight. Wait for its answer, or use Return to decision first.")
+            return {"result": "followup_in_flight"}
+        binding = self._followup_binding(state)
+        if binding is None:
+            self.safe_send(chat_id, "Ask agent needs a pending decision (plan, question, runtime, push) or an unread-result wait. Use /ask for read-only questions at any other time.")
+            return {"result": "none"}
+        if not argument:
+            self._set_intent(chat_id, {"kind": "ask_agent", **binding})
+            self.safe_send(chat_id, "Reply with your question (one message). The current decision stays as it is; the answer comes back here.")
+            return {"result": "intent"}
+        return self._enqueue_ask_agent(update_id, argument, user_id, chat_id, binding)
+
+    def _enqueue_ask_agent(self, update_id: int, question: str, user_id: int, chat_id: int, binding: dict[str, Any], *, suffix: str = "") -> dict[str, Any]:
+        limit = hs.MAX_FOLLOWUP_QUESTION_CHARS
+        if len(question) > limit:
+            self.safe_send(chat_id, f"Question exceeds {limit} characters.")
+            return {"result": "too_long"}
+        if hr.credential_value_present(question):
+            # Never journaled, enqueued, persisted, or forwarded: the question would be stored and sent verbatim.
+            self.safe_send(chat_id, "The question looks like it contains a credential value. Nothing was sent or stored; remove the secret and ask again.")
+            return {"result": "credential_refused"}
+        command = {"request_id": self.request_id_for(update_id, suffix), "action": "ask_agent", "question": question, **binding, "actor": f"telegram:{user_id}", "chat_id": chat_id, "source": "telegram", "created_at": hs.iso_utc(self.clock())}
+        return self._enqueue_or_shadow(command, chat_id, "ask the agent one read-only question (the current decision is preserved)")
 
     def handle_plain_text(self, update_id: int, text: str, user_id: int, chat_id: int) -> dict[str, Any]:
         intent = self._live_intent(chat_id)
@@ -910,6 +986,13 @@ class Bridge:
         return intent
 
     def _consume_intent(self, update_id: int, intent: dict[str, Any], text: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        if intent.get("kind") == "ask_agent":
+            live = self._followup_binding(self._state())
+            bound = {k: intent.get(k) for k in ("run_id", "decision_id", "expected_state", "artifact_sha256", "payload_sha256") if intent.get(k) is not None}
+            if live is None or any(live.get(k) != v for k, v in bound.items()):
+                self.safe_send(chat_id, "The decision changed since you tapped Ask agent; nothing was sent. Use the newest card or /status.")
+                return {"result": "stale_intent", "action": "ask_agent"}
+            return self._enqueue_ask_agent(update_id, text, user_id, chat_id, live, suffix="ask-agent")
         action = "revise" if intent.get("kind") == "revise" else "answer"
         command = {"request_id": self.request_id_for(update_id), "action": action, "run_id": intent.get("run_id"), "gate_id": intent.get("gate_id"), "expected_state": intent.get("expected_state"), "actor": f"telegram:{user_id}", "chat_id": chat_id, "source": "telegram", "created_at": hs.iso_utc(self.clock())}
         command["note" if action == "revise" else "answer"] = text
@@ -919,13 +1002,15 @@ class Bridge:
 
     def handle_callback(self, update_id: int, callback: dict[str, Any]) -> dict[str, Any]:
         callback_id = str(callback.get("id", ""))
-        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        raw_message = callback.get("message")
+        message: dict[str, Any] = raw_message if isinstance(raw_message, dict) else {}
         probe = {"from": callback.get("from"), "chat": message.get("chat")}
         ok, reason, user_id, chat_id = self.authenticate(probe)
         data = callback.get("data")
         if not ok:
             self._ack(callback_id, "Not authorized.")
             return {"rejected": reason}
+        assert user_id is not None and chat_id is not None  # authenticate() never returns ok without both
         if not isinstance(data, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,63}", data):
             self._ack(callback_id, "Unknown action.")
             return {"rejected": "malformed_callback"}
@@ -1013,8 +1098,18 @@ class Bridge:
             self._consume(record_path, record)
             self._set_intent(chat_id, {"kind": "revise", "run_id": record["run_id"], "gate_id": record["gate_id"], "expected_state": record["expected_state"]})
             self._ack(callback_id, "Reply with the revision note.")
-            self.safe_send(chat_id, "Reply with the revision note (one message), or /revise <note>.")
+            self.safe_send(chat_id, "Reply with the revision note (one message), or /revise <note>. This voids the current result; the agent must produce a replacement.")
             return {"callback": "revise_intent"}
+        if action == "ask_agent":
+            self._consume(record_path, record)
+            binding = self._followup_binding(self._state())
+            if binding is None or binding.get("decision_id") != record.get("decision_id"):
+                self._ack(callback_id, "This decision is no longer pending.")
+                return {"rejected": "stale_decision"}
+            self._set_intent(chat_id, {"kind": "ask_agent", **binding})
+            self._ack(callback_id, "Reply with your question.")
+            self.safe_send(chat_id, "Reply with your question (one message). The current decision stays as it is; the answer comes back here.")
+            return {"callback": "ask_agent_intent"}
         command = {"request_id": self.request_id_for(update_id, data), "action": action, "actor": f"telegram:{user_id}", "chat_id": chat_id, "source": "telegram", "callback_query_id": callback_id, "interaction_id": data, "created_at": hs.iso_utc(self.clock())}
         if action in ("approve", "reject", "answer"):
             command.update(run_id=record["run_id"], gate_id=record["gate_id"], expected_state=record["expected_state"], artifact_sha256=record.get("artifact_sha256"), payload_sha256=record.get("payload_sha256"))
@@ -1022,6 +1117,12 @@ class Bridge:
                 command["answer"] = record.get("choice")
         if action in ("pause", "cancel", "resume", "refresh_quota"):
             command["run_id"] = record.get("run_id")
+        if action == "done":
+            command.update(run_id=record.get("run_id"), expected_state=record.get("expected_state"), ready_turn_id=record.get("ready_turn_id"), operator_handoff=True)
+        if action == "retry_routing_result":
+            command.update(run_id=record.get("run_id"), turn_id=record.get("turn_id"))
+        if action in ("retry_followup_response", "return_to_decision"):
+            command.update(run_id=record.get("run_id"), followup_turn_id=record.get("followup_turn_id"))
         if self.config.get("mode") != "actionable":
             self._consume(record_path, record, note="shadow")
             self._ack(callback_id, f"SHADOW: would {action}; no state changed.")
@@ -1062,11 +1163,41 @@ class Bridge:
             return "No task."
         if state.get("run_id") != record.get("run_id"):
             return "This card belongs to an earlier run; use the newest card."
+        followup = self.enqueuer.followup_unresolved(state)
+        if record.get("action") in ("retry_followup_response", "return_to_decision") or (record.get("action") == "revise" and record.get("followup_turn_id")):
+            if followup is None or followup.get("status") != "FAILED":
+                return "No unanswered question is pending any more; use /status."
+            if followup.get("followup_turn_id") != record.get("followup_turn_id"):
+                return "This card belongs to an earlier question; use the newest card."
+            if record.get("action") == "retry_followup_response" and (followup.get("reread_attempts") or not followup.get("delivery_uncertain")):
+                return "The one-time reread is not available; return to the decision or request a revision."
+            return None
+        if followup is not None and record.get("action") in ("approve", "reject", "answer", "revise", "done", "retry_routing_result", "ask_agent"):
+            return "A question to the agent is in flight; wait for the answer or return to the decision."
+        if record.get("action") == "ask_agent":
+            decision = self.enqueuer.followup_decision(state)
+            if decision is None or decision.get("decision_id") != record.get("decision_id"):
+                return "This decision is no longer pending; use the newest card or /status."
+            if decision.get("kind") == "gate" and record.get("artifact_sha256") and decision.get("artifact_sha256") != record["artifact_sha256"]:
+                return hs.PLAN_CHANGED_MESSAGE
+            return None
         if record.get("action") == "revise" and record.get("gate_id") == "-":
             if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action"):
-                return "This guidance request is no longer valid; use the newest card or /status."
+                return "This revision request is no longer valid; use the newest card or /status."
             if state.get("supervisor_state") != record.get("expected_state"):
                 return f"State changed ({state.get('supervisor_state')}); use the newest card."
+            return None
+        if record.get("action") == "done":
+            eligible, reason = self.enqueuer.operator_handoff_eligibility(state, run_id=record.get("run_id"), ready_turn_id=record.get("ready_turn_id"), inspect_agents=False)
+            return None if eligible else f"Operator handoff is no longer available: {redact(reason, limit=160)}"
+        if record.get("action") == "retry_routing_result":
+            missing = state.get("missing_result")
+            if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action") or not isinstance(missing, dict):
+                return "No unread routing result is pending any more; use /status."
+            if missing.get("turn_id") != record.get("turn_id"):
+                return "This retry belongs to an earlier turn; use the newest card."
+            if missing.get("attempts"):
+                return "The one-time routing retry was already used; ask the agent, request a revision, or cancel."
             return None
         if record.get("action") in ("pause", "cancel", "status", "keep_waiting", "resume", "refresh_quota", "view_report"):
             if state.get("supervisor_state") in hs.TERMINAL_STATES and record.get("action") not in ("status", "view_report"):
@@ -1290,7 +1421,7 @@ class Bridge:
     def _finish_upload(self, meta: dict[str, Any], status: str, *, delete_content: bool) -> None:
         # `meta` is always a validated record: its id is hex32 and equals the trusted filename stem, and
         # its content path is exactly <task_files_dir>/<id><suffix>. Paths are rebuilt from those values.
-        upload_id = hs.validate_upload_record(meta, expected_upload_id=meta.get("upload_id"), task_files_dir=self.task_files_dir, config=self.sup_config)["upload_id"]
+        upload_id = hs.validate_upload_record(meta, expected_upload_id=str(meta.get("upload_id")), task_files_dir=self.task_files_dir, config=self.sup_config)["upload_id"]
         if delete_content:
             content = self.task_files_dir / f"{upload_id}{meta['suffix']}"
             if content.is_file() and not content.is_symlink():
@@ -1360,9 +1491,9 @@ class Bridge:
 
     def handle_upload_callback(self, update_id: int, callback_id: str, record_path: Path, record: dict[str, Any], user_id: int, chat_id: int) -> dict[str, Any]:
         meta, problem = self._validate_upload_record(record)
-        if problem:
-            self._ack(callback_id, problem)
-            return {"rejected": problem}
+        if problem or meta is None:
+            self._ack(callback_id, problem or "This upload is no longer valid.")
+            return {"rejected": problem or "invalid_upload"}
         action = record["action"]
         if action == "upload_cancel":
             self._finish_upload(meta, "cancelled", delete_content=True)  # consumes both buttons
@@ -1507,9 +1638,10 @@ class Bridge:
             if sidecar.get("status") in ("pending", "delivery_uncertain"):
                 pending.append((event, sidecar, sidecar_path))
         pending.sort(key=lambda item: (item[0].get("run_id", ""), item[0].get("sequence", 0)))
+        pending = self._supersede_decision_cards_replaced_by_answers(pending, delivery_dir, counts)
         now = self.clock()
         summarize_paths: list[Path] = []
-        informational = [item for item in pending if not item[0].get("actionable") and item[0].get("type") not in ("COMMAND_RESULT", "QUERY_RESULT")]
+        informational = [item for item in pending if not item[0].get("actionable") and item[0].get("type") not in ("COMMAND_RESULT", "QUERY_RESULT", "AGENT_FOLLOWUP_READY")]
         collapse = len(informational) > int(self.config["informational_collapse_after"])
         for event, sidecar, sidecar_path in pending:
             summarize_paths = []
@@ -1523,10 +1655,16 @@ class Bridge:
                 self._mark(sidecar_path, sidecar, "expired")
                 counts["superseded"] += 1
                 continue
-            status_view = self.status_reader() if event.get("type") in ("TASK_DONE", "WAIT_QUOTA", "WAIT_USER", "PLAN_APPROVAL_REQUIRED") else None
+            status_view = self.status_reader() if event.get("type") in ("TASK_DONE", "TASK_HANDED_OFF", "WAIT_QUOTA", "WAIT_USER", "PLAN_APPROVAL_REQUIRED", "AGENT_FOLLOWUP_READY") or (event.get("type") == "COMMAND_RESULT" and (event.get("data") or {}).get("action") == "return_to_decision") else None
             gate = None
+            if event.get("type") == "AGENT_FOLLOWUP_READY":
+                # Restored decision controls bind to the still-pending gate (its hashes), never to the answer.
+                gate = self._gate_for_event({**event, "gate_id": (event.get("data") or {}).get("gate_id")})
             if event.get("actionable"):
                 gate = self._gate_for_event(event)
+                if gate is None and self._gate_suspended_by_followup(event):
+                    counts["skipped"] += 1  # the gate is only suspended behind a follow-up; deliver it when it is restored
+                    continue
                 if gate is None:
                     self._mark(sidecar_path, sidecar, "superseded", reason="gate no longer pending")
                     self.supersede_interactions(event.get("gate_id"), event.get("event_id"))
@@ -1584,7 +1722,7 @@ class Bridge:
 
     def _done_highlights(self, status: dict[str, Any], event: dict[str, Any]) -> list[str]:
         data = event.get("data") or {}
-        items = [f"final stage: {data.get('stage')}", str(data.get("handoff") or "")[:160]]
+        items = [f"final stage: {data.get('stage')}", hp.handoff_text(data.get("handoff") or "")[:160]]
         policy = status.get("runtime_policy") or {}
         evidence = status.get("runtime_evidence") or {}
         if policy.get("runtime_validation_required"):
@@ -1603,7 +1741,7 @@ class Bridge:
             return existing
         data = event.get("data") or {}
         artifact_id = data.get("artifact_id") if isinstance(data.get("artifact_id"), str) else None
-        if not artifact_id and event.get("type") == "TASK_DONE":
+        if not artifact_id and event.get("type") in ("TASK_DONE", "TASK_HANDED_OFF"):
             try:
                 artifact_id = self._final_report_artifact(event)["artifact_id"]
             except hs.SupervisorError:
@@ -1688,6 +1826,39 @@ class Bridge:
         doc.update(status="delivered", message_id=result.get("message_id"), file_id=(result.get("document") or {}).get("file_id"))
         self._mark(sidecar_path, sidecar, "delivered", message_id=(parts.get("summary") or {}).get("message_id"))
         counts["sent"] += 1
+
+    def _supersede_decision_cards_replaced_by_answers(self, pending: list[tuple[dict[str, Any], dict[str, Any], Path]], delivery_dir: Path, counts: dict[str, int]) -> list[tuple[dict[str, Any], dict[str, Any], Path]]:
+        """An answer card carries the restored decision's own controls. A decision card for the same
+        decision that was still undelivered when the answer arrived (held while the question was out) would
+        be a second live control surface: supersede it and its tokens instead. Already-delivered cards are
+        untouched; the answer card itself is delivered normally."""
+        answers = [event for event, _, _ in pending if event.get("type") == "AGENT_FOLLOWUP_READY"]
+        if not answers:
+            return pending
+        kept: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+        for event, sidecar, sidecar_path in pending:
+            replaced = False
+            for answer in answers:
+                data = answer.get("data") or {}
+                if event.get("run_id") != answer.get("run_id") or int(event.get("sequence", 0)) >= int(answer.get("sequence", 0)):
+                    continue
+                same_gate = event.get("actionable") and data.get("gate_id") and event.get("gate_id") == data.get("gate_id")
+                same_wait = event.get("type") == "WAIT_USER" and data.get("decision_kind") == "missing_result"
+                if same_gate or same_wait:
+                    replaced = True
+                    break
+            if replaced:
+                self._mark(sidecar_path, sidecar, "superseded", reason="decision controls delivered with the answer card")
+                self.supersede_interactions(event.get("gate_id"), event.get("event_id"))
+                counts["superseded"] += 1
+                continue
+            kept.append((event, sidecar, sidecar_path))
+        return kept
+
+    def _gate_suspended_by_followup(self, event: dict[str, Any]) -> bool:
+        state = self._state()
+        gate = (state or {}).get("pending_gate") or {}
+        return self.enqueuer.followup_unresolved(state) is not None and gate.get("status") == "pending" and gate.get("gate_id") == event.get("gate_id")
 
     def _gate_for_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
         state = self._state()
@@ -1927,6 +2098,15 @@ def load_telegram_config_from_dict(config: dict[str, Any]) -> None:
         load_telegram_config(path)
 
 
+def journal_reset_inventory_reader(sup_paths: hs.Paths, sup_config: dict[str, Any]) -> Callable[[], hcr.ResetInventory]:
+    """Return a read-only inventory reader backed by the hardened user-systemd helper."""
+    reset_gateway = hcr.JournalGateway(
+        sup_paths.codex_reset_dir,
+        timeout=float(sup_config["codex_reset"]["helper_timeout_seconds"]),
+    )
+    return lambda: reset_gateway.inventory(f"telegram-inventory-{uuid.uuid4().hex}")
+
+
 def build_bridge(tg_paths: TelegramPaths | None = None, *, api: Any = None) -> Bridge:
     tg_paths = tg_paths or TelegramPaths()
     tg_config = load_telegram_config(tg_paths.config_file)
@@ -1942,7 +2122,10 @@ def build_bridge(tg_paths: TelegramPaths | None = None, *, api: Any = None) -> B
     supervisor = hs.Supervisor(sup_paths, sup_config, herdr)
     return Bridge(sup_paths=sup_paths, sup_config=sup_config, tg_paths=tg_paths, tg_config=tg_config, api=api,
                   bot_id=int(me["id"]), status_reader=supervisor.status,
-                  reset_inventory_reader=lambda: hcr.AppServerClient().inventory())
+                  # Codex app-server needs writable Codex-owned state. The Telegram daemon is deliberately
+                  # more restricted, so all inventory reads use the same user-systemd journal worker as
+                  # redemption. Inventory is read-only; each request still gets a unique durable identity.
+                  reset_inventory_reader=journal_reset_inventory_reader(sup_paths, sup_config))
 
 
 def main(argv: list[str] | None = None) -> int:

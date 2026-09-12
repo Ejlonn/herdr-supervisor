@@ -29,9 +29,11 @@ from herdr_supervisor import (
     HerdrCli,
     HerdrError,
     Paths,
+    QuotaError,
     StateStore,
     SupervisorError,
     atomic_write_json,
+    blocking_windows,
     iso_utc,
     load_config,
     load_json,
@@ -39,8 +41,6 @@ from herdr_supervisor import (
     parse_quota_snapshot,
     resolve_herdr_bin,
     session_identity,
-    QuotaError,
-    blocking_windows,
 )
 
 REFUSAL_TEXT = "Read-only query only; use /task to request an action."
@@ -189,7 +189,7 @@ REASON_TEXT = {
 
 
 def reason_sentence(provider: str, info: dict[str, Any], *, timezone: str = "UTC") -> str:
-    text = f"{provider.title()}: {REASON_TEXT.get(info.get('reason'), 'unavailable')}"
+    text = f"{provider.title()}: {REASON_TEXT.get(str(info.get('reason')), 'unavailable')}"
     if info.get("reason") == "quota_blocked" and info.get("resets_at"):
         import herdr_telegram  # noqa: PLC0415 - render helper only
         text += f" until {herdr_telegram.fmt_local(info['resets_at'], timezone)}"
@@ -467,7 +467,7 @@ class QueryWorker:
             self._finish(request, processing, ok=False, answer="State questions are answered by the bridge directly; nothing was sent to a model.")
             return {"request_id": request.get("request_id"), "ok": False, "reason": "state_intent"}
         provider, agent, report = self.select_provider()
-        if agent is None:
+        if agent is None or provider is None:
             text = unavailable_text(report)
             self._finish(request, processing, ok=False, answer=text, provider=None, report=report)
             return {"request_id": request.get("request_id"), "ok": False, "reason": text}
@@ -574,7 +574,7 @@ class QueryWorker:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="herdr-query-worker", description="Read-only query worker for the dedicated codex-query session (no workflow mutation).")
     parser.add_argument("--once", action="store_true", help="process the spool once and exit (the systemd path unit uses this)")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)  # validates --once; the worker always processes the spool once per invocation
     paths = Paths.from_environment()
     try:
         config = load_config(paths.config_file)

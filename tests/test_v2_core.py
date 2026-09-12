@@ -199,7 +199,7 @@ class PlanApprovalTests(V2Case):
         self.assertEqual(code, 4)
         names = [n for n, _ in self.herdr.prompts]
         self.assertEqual(names, ["codex-main", "codex-main", "claude-main", "codex-main"])
-        self.assertIn("APPROVED the plan with SHA-256", self.herdr.prompts[1][1])
+        self.assertIn("APPROVED the plan (SHA-256", self.herdr.prompts[1][1])
         self.assertIn("CODEX_BRIEF.md", self.herdr.prompts[1][1])
         self.assertEqual(self.state()["supervisor_state"], "WAIT_RUNTIME_VALIDATION")
 
@@ -414,7 +414,7 @@ class RuntimePushTests(V2Case):
         self.to_runtime_gate()
         self.record("PASS")
         state = self.state()
-        gate = state["pending_gate"]
+        self.assertEqual(state["pending_gate"]["gate_type"], "push_approval")
         with self.assertRaises(hs.SupervisorError):
             self.approve_pending(artifact_sha256="0" * 64)
         result = self.approve_pending(actor="telegram:1", chat_id=5)
@@ -607,33 +607,51 @@ class InboxWorkerRecoveryTests(V2Case):
             holder.wait()
             holder.stdout.close()
 
-    def test_recovery_finds_exact_session_under_new_alias_and_pane(self) -> None:
+    def test_recovery_finds_exact_session_under_new_alias_in_the_recorded_pane_and_refuses_a_pane_change(self) -> None:
         self.write_plan()
         self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
         self.approve_pending()
-        # After a reboot the same native session lives under another alias/pane; alias 'codex-main' is gone.
-        moved = FakeHerdr.agent("codex", "codex-2", "w7:p3", CODEX_SESSION)
+        owners_before = self.paths.owners_file.read_text()
+        # The same native session lives under another alias in its recorded pane; alias 'codex-main' is gone.
+        renamed = FakeHerdr.agent("codex", "codex-2", "w3:p2", CODEX_SESSION)
         del self.herdr.agents["codex-main"]
-        self.herdr.agents["codex-2"] = moved
+        self.herdr.agents["codex-2"] = renamed
         self.assertEqual(self.resume_with([{"v2": ("brief", "human", "generic_question", str(self.question_payload()))}]), 2)
-        self.assertEqual(self.herdr.prompts[-1][0], "codex-2", "prompted the exact session under its live alias")
+        self.assertEqual(self.herdr.prompts[-1][0], "codex-2", "prompted the exact session in its recorded pane (pane target)")
+        self.assertEqual(self.herdr.targets[-1][1] if self.herdr.targets[-1][0] == "read" else "w3:p2", "w3:p2")
         self.assertEqual(self.herdr.starts, [])
-        owners = json.loads(self.paths.owners_file.read_text())
-        self.assertEqual(owners["codex"], {"pane_id": "w7:p3", "session_id": CODEX_SESSION}, "only the locator changed")
+        self.assertEqual(self.paths.owners_file.read_text(), owners_before, "identity and locator unchanged")
+        # The exact session reporting a DIFFERENT pane is a pane conflict: fail closed, no command, no owner change.
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.answer_gate(st, run_id=st["run_id"], gate_id=st["pending_gate"]["gate_id"], actor="cli", answer="enum")
+        self.herdr.agents["codex-2"] = FakeHerdr.agent("codex", "codex-2", "w7:p3", CODEX_SESSION)
+        self.herdr.targets.clear()
+        self.assertEqual(self.resume_with([]), 2)
+        self.assertIn("pane conflict", self.state()["wait_user_reason"])
+        self.assertEqual([t for t in self.herdr.targets if t[0] in ("prompt", "read", "wait", "send-keys")], [])
+        self.assertEqual(self.herdr.starts, [])
+        self.assertEqual(self.paths.owners_file.read_text(), owners_before, "a pane conflict never rewrites the locator")
 
     def test_recovery_alias_reused_by_other_session_is_not_trusted(self) -> None:
         self.write_plan()
         self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
         self.approve_pending()
+        owners_before = self.paths.owners_file.read_text()
         self.herdr.agents["codex-main"] = FakeHerdr.agent("codex", "codex-main", "w3:p2", "another-session")
         self.assertEqual(self.resume_with([]), 2)
         self.assertEqual(self.herdr.prompts[-1][0], "codex-main")  # only the original planning prompt exists
         self.assertEqual(len(self.herdr.prompts), 1)
         self.assertIn("refusing", self.state()["wait_user_reason"])
-        # exact session live under another alias while the alias is reused: the exact session wins
+        # the exact session live under another alias in ANOTHER pane while the recorded pane is reused:
+        # a pane conflict, refused without adopting either record
         self.herdr.agents["codex-real"] = FakeHerdr.agent("codex", "codex-real", "w8:p1", CODEX_SESSION)
-        self.assertEqual(self.resume_with([{"v2": ("brief", "human", "generic_question", str(self.question_payload()))}]), 2)
-        self.assertEqual(self.herdr.prompts[-1][0], "codex-real")
+        self.herdr.targets.clear()
+        self.assertEqual(self.resume_with([]), 2)
+        self.assertIn("pane conflict", self.state()["wait_user_reason"])
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual([t for t in self.herdr.targets if t[0] in ("prompt", "read", "wait", "send-keys")], [])
+        self.assertEqual(self.paths.owners_file.read_text(), owners_before)
 
     def test_recovery_missing_pane_creates_nonfocused_workspace_and_verifies_id(self) -> None:
         self.write_plan()
@@ -804,6 +822,9 @@ class ReviewRegressionTests(V2Case):
         self.approve_pending()
 
     def test_same_agent_same_stage_self_route_stops_instead_of_waking_again(self) -> None:
+        # The historical 59-turn loop: the first turn routed plan -> codex (itself). A self-route from the
+        # initial turn is no handoff at all, so it stops after ONE submission; a later same-stage
+        # self-route stops as before.
         self.write_plan()
         self.herdr.responses = [{"v2": ("plan", "codex")}, {"v2": ("plan", "codex")}]
         self.assertEqual(self.sup.run_new("task", "codex", workflow_policy="gated_v2"), 2)
@@ -811,8 +832,9 @@ class ReviewRegressionTests(V2Case):
         self.assertEqual(state["supervisor_state"], "WAIT_USER")
         self.assertTrue(state["wait_user_requires_action"])
         self.assertIn("without changing stage", state["wait_user_reason"])
-        self.assertEqual(len(self.herdr.prompts), 2)
+        self.assertEqual(len(self.herdr.prompts), 1)
         self.assertEqual(state["delivery"]["outcome"], "rejected_by_policy")
+        self.assertEqual(state["prompt_metrics"]["prompts"], 1)
 
     def test_v2_prompt_names_configured_review_root(self) -> None:
         state = self.sup.initialize("task", "codex", workflow_policy="gated_v2")
@@ -1063,3 +1085,1181 @@ class F10RunBindingTests(V2Case):
             st = self.sup.store.read_state()
         self.assertFalse(self.sup.check_control(st))
         self.assertEqual(self.state()["supervisor_state"], "PAUSED")
+
+
+class OperatorHandoffTests(V2Case):
+    """Operator-handoff completion: one controller predicate, durable readiness/completion records,
+    zero LLM prompts/reads/wake-ups, and every advertised rejection."""
+
+    def to_handoff_ready(self) -> dict:
+        """Approved plan requiring push approval only; Codex routes done; nothing but push approval is missing."""
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(runtime_validation_required=False, rebuild_required=False)))}])
+        self.approve_pending()
+        self.assertEqual(self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "done")}]), 2)
+        state = self.state()
+        self.assertEqual(state["supervisor_state"], "WAIT_USER")
+        return state
+
+    def counters(self) -> tuple[int, int, int, int]:
+        return (len(self.herdr.prompts), len(self.herdr.reads), len(self.herdr.waits), len(self.herdr.starts))
+
+    def complete(self, **kwargs) -> dict:
+        with self.sup.store.transaction():
+            state = self.sup.store.read_state()
+            return self.sup.complete_operator_handoff(state, run_id=kwargs.pop("run_id", state["run_id"]), actor=kwargs.pop("actor", "cli"), **kwargs)
+
+    def assert_refused(self, expected_reason: str, **kwargs) -> None:
+        """The predicate and the completion path refuse for the same reason, mutate nothing, emit nothing."""
+        before_state = self.paths.state_file.read_text()
+        before_events = self.event_types()
+        before = self.counters()
+        state = self.sup.store.read_state(required=False)
+        ok, reason = self.sup.operator_handoff_eligibility(state, run_id=kwargs.get("run_id"), ready_turn_id=kwargs.get("ready_turn_id"))
+        self.assertFalse(ok, reason)
+        self.assertIn(expected_reason, reason)
+        with self.assertRaises(hs.SupervisorError) as caught:
+            self.complete(**kwargs)
+        self.assertIn(expected_reason, str(caught.exception))
+        self.assertEqual(self.paths.state_file.read_text(), before_state, "refusal must not mutate state")
+        self.assertEqual(self.event_types(), before_events, "refusal must not emit events")
+        self.assertEqual(self.counters(), before, "refusal must not touch agents")
+
+    def test_agent_done_blocked_only_by_push_policy_records_bound_readiness(self) -> None:
+        state = self.to_handoff_ready()
+        self.assertTrue(state["wait_user_requires_action"])
+        self.assertIn("push approval is required", state["wait_user_reason"])
+        self.assertIn("/done", state["wait_user_reason"])
+        ready = state["operator_handoff_ready"]
+        self.assertEqual(ready["run_id"], state["run_id"])
+        self.assertEqual(ready["turn_id"], state["delivery"]["turn_id"])
+        self.assertEqual((ready["stage"], ready["agent"], ready["unmet"]), ("review", "codex", ["push_approval"]))
+        self.assertEqual(state["delivery"]["outcome"], "rejected_by_policy")
+        self.assertIsNone(state["completion"])
+        self.assertNotIn("TASK_DONE", self.event_types())
+        self.assertNotIn("TASK_HANDED_OFF", self.event_types())
+        ok, reason = self.sup.operator_handoff_eligibility(self.sup.store.read_state())
+        self.assertTrue(ok, reason)
+        # Text is never the trigger: the same wait without the marker is not eligible.
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            st["operator_handoff_ready"] = None
+            self.sup.store.write_state(st)
+        self.assert_refused("has not reported completion")
+
+    def test_done_blocked_by_deeper_problems_records_no_readiness(self) -> None:
+        # no approval at all
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"v2": ("plan", "done")}]), 2)
+        self.assertIsNone(self.state()["operator_handoff_ready"])
+        self.assert_refused("has not reported completion")
+        # HEAD drift with runtime policy: candidate invalidated, no readiness
+        self.reset_fixture()
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload(SHA_A)))}])
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            st["pending_gate"]["status"] = "superseded"
+            st["supervisor_state"] = "RUNNING"
+            self.sup.store.write_state(st)
+        self.head = SHA_B
+        self.assertEqual(self.resume_with([{"v2": ("fix", "done")}]), 2)
+        self.assertIn("candidate changed", self.state()["wait_user_reason"])
+        self.assertIsNone(self.state()["operator_handoff_ready"])
+
+    def test_operator_done_closes_exact_state_without_evidence_approval_or_wakeup(self) -> None:
+        state = self.to_handoff_ready()
+        before = self.counters()
+        events_before = len(self.events())
+        result = self.complete(actor="telegram:7", chat_id=5, note="I will push manually")
+        self.assertTrue(result["ok"])
+        self.assertIn("did not verify", result["message"])
+        after = self.state()
+        self.assertEqual(after["supervisor_state"], "DONE")
+        completion = after["completion"]
+        self.assertEqual((completion["mode"], completion["run_id"], completion["stage"], completion["actor"], completion["chat_id"]), ("operator_handoff", state["run_id"], "review", "telegram:7", 5))
+        self.assertEqual(completion["ready_turn_id"], state["operator_handoff_ready"]["turn_id"])
+        self.assertEqual(completion["unmet"], ["push_approval"])
+        self.assertIs(completion["verified_by_supervisor"], False)
+        self.assertEqual(completion["note"], "I will push manually")
+        self.assertIsNone(after["push_approval"], "no approval is synthesized")
+        self.assertIsNone(after["runtime_evidence"], "no evidence is synthesized")
+        self.assertIsNone(after["continuation"])
+        self.assertFalse(after["wait_user_requires_action"])
+        self.assertIsNone(after["wait_user_reason"])
+        self.assertEqual(after["operator_handoff_ready"]["turn_id"], completion["ready_turn_id"], "readiness is preserved as history")
+        self.assertEqual(self.event_types().count("TASK_HANDED_OFF"), 1)
+        self.assertEqual(len(self.events()), events_before + 1)
+        self.assertNotIn("TASK_DONE", self.event_types())
+        handed = [e for e in self.events() if e["type"] == "TASK_HANDED_OFF"][0]
+        self.assertIs(handed["data"]["verified_by_supervisor"], False)
+        self.assertEqual(handed["data"]["unmet"], ["push_approval"])
+        self.assertEqual(self.counters(), before, "completion submits no prompt, reads no transcript, wakes nothing")
+        # already terminal: idempotent refusal
+        self.assert_refused("already DONE")
+
+    def test_normal_verified_done_is_unchanged(self) -> None:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(push_approval_required=False, runtime_validation_required=False, rebuild_required=False)))}])
+        self.approve_pending()
+        self.assertEqual(self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "done")}]), 0)
+        state = self.state()
+        self.assertEqual(state["supervisor_state"], "DONE")
+        self.assertIsNone(state["completion"])
+        self.assertIsNone(state["operator_handoff_ready"])
+        self.assertEqual(self.event_types().count("TASK_DONE"), 1)
+        self.assertNotIn("TASK_HANDED_OFF", self.event_types())
+
+    def test_pending_gates_reject_operator_handoff(self) -> None:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.assert_refused("typed gate is pending")
+        self.approve_pending()
+        self.resume_with([{"v2": ("brief", "human", "generic_question", str(self.question_payload()))}])
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+        self.assert_refused("typed gate is pending")
+        self.reset_fixture()
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload()))}])
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_RUNTIME_VALIDATION")
+        self.assert_refused("typed gate is pending")
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.record_runtime_evidence(st, run_id=st["run_id"], candidate_sha=SHA_A, environment="TEST", evidence_file=str(self.evidence_file()), result="PASS", head_resolver=self.head_resolver)
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_PUSH_APPROVAL")
+        self.assert_refused("typed gate is pending")
+
+    def test_lifecycle_delivery_quota_reset_and_continuation_states_reject(self) -> None:
+        self.to_handoff_ready()
+
+        def with_state(mutate) -> None:
+            with self.sup.store.transaction():
+                st = self.sup.store.read_state()
+                mutate(st)
+                self.sup.store.write_state(st)
+
+        snapshot = self.paths.state_file.read_text()
+
+        def restore() -> None:
+            self.paths.state_file.write_text(snapshot)
+
+        cases = [
+            ("ordinary WAIT_USER", lambda st: st.update(wait_user_requires_action=False), "ordinary pause"),
+            ("RUNNING", lambda st: st.update(supervisor_state="RUNNING"), "task is RUNNING"),
+            ("PAUSED", lambda st: st.update(supervisor_state="PAUSED"), "task is PAUSED"),
+            ("WAIT_QUOTA", lambda st: st.update(supervisor_state="WAIT_QUOTA", quota_wait={"provider": "codex", "midturn": False, "resume_at": NOW + 100, "blocking_windows": [{"kind": "five_hour", "used_percent": 100, "remaining_percent": 0, "resets_at": NOW + 100}]}), "task is WAIT_QUOTA"),
+            ("quota wait record under WAIT_USER", lambda st: st.update(quota_wait={"provider": "codex", "midturn": False, "resume_at": NOW + 100, "blocking_windows": [{"kind": "five_hour", "used_percent": 100, "remaining_percent": 0, "resets_at": NOW + 100}]}), "quota wait is in flight"),
+            ("pending continuation", lambda st: st.update(continuation={"kind": "revision", "gate_id": None, "gate_type": "wait_user", "note": "x"}), "continuation is still pending"),
+            ("uncertain delivery", lambda st: st["delivery"].update(status="uncertain"), "delivery is uncertain"),
+            ("prepared delivery", lambda st: st["delivery"].update(status="prepared"), "delivery is prepared"),
+            ("live worker pid", lambda st: st.update(worker_pid=os.getpid()), "worker still owns"),
+            ("in-flight reset", lambda st: st["codex_reset"].update(current_redemption_state="RESET_CONSUMING", current_idempotency_key="k" * 32, blocking_event_id="c" * 64, account_fingerprint="d" * 64), "reset is being reconciled"),
+            ("wrong run marker", lambda st: st.update(run_id="0bbbbbbb-cccc-4ddd-8eee-ffffffffffff", operator_handoff_ready={**st["operator_handoff_ready"], "run_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"}, delivery=None, last_successful_handoff=None), None),
+        ]
+        for label, mutate, expected in cases:
+            with self.subTest(label):
+                restore()
+                with_state(mutate)
+                if expected is None:
+                    self.assert_refused("run_id does not match", run_id=json.loads(snapshot)["run_id"])
+                else:
+                    self.assert_refused(expected)
+        restore()
+        self.assert_refused("run_id does not match", run_id="0bbbbbbb-cccc-4ddd-8eee-ffffffffffff")
+        self.assert_refused("readiness changed", ready_turn_id="0bbbbbbb-cccc-4ddd-8eee-ffffffffffff")
+
+    def test_active_or_unlocatable_agent_and_missing_herdr_reject(self) -> None:
+        self.to_handoff_ready()
+        self.herdr.agents["codex-main"]["agent_status"] = "working"
+        self.assert_refused("still working")
+        self.herdr.agents["codex-main"]["agent_status"] = "idle"
+        self.herdr.agents["codex-twin"] = FakeHerdr.agent("codex", "codex-twin", "w3:p9", CODEX_SESSION)
+        self.assert_refused("not settled")
+        del self.herdr.agents["codex-twin"]
+        del self.herdr.agents["codex-main"]
+        self.assert_refused("not settled")
+        # Telegram-side supervisor has no Herdr access: state-only answer, full check refused.
+        bridge_side = hs.Supervisor(self.paths, self.config, herdr=None, clock=self.clock.time)
+        self.herdr.agents["codex-main"] = FakeHerdr.agent("codex", "codex-main", "w3:p2", CODEX_SESSION)
+        state = self.sup.store.read_state()
+        self.assertTrue(bridge_side.operator_handoff_eligibility(state, inspect_agents=False)[0])
+        ok, reason = bridge_side.operator_handoff_eligibility(state)
+        self.assertFalse(ok)
+        self.assertIn("cannot be inspected", reason)
+        with self.assertRaises(hs.SupervisorError):
+            with bridge_side.store.transaction():
+                bridge_side.complete_operator_handoff(bridge_side.store.read_state(), run_id=state["run_id"], actor="x")
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+
+    def test_another_worker_holding_the_lock_rejects_but_the_applying_worker_may_complete(self) -> None:
+        self.to_handoff_ready()
+        other = hs.WorkerLock(self.paths.lock_file)
+        other.acquire()
+        try:
+            self.paths.lock_file.write_text("999999\n")  # simulate a different holder pid
+            self.assert_refused("worker still owns")
+        finally:
+            other.release()
+        # The detached worker applies the inbox command while holding its own lock; no turn is active.
+        self.sup.enqueue_command({"request_id": "done-request-0001", "action": "done", "operator_handoff": True, "run_id": self.state()["run_id"], "actor": "telegram:1", "chat_id": 9})
+        before = self.counters()
+        self.assertEqual(self.sup.worker(), 0)
+        self.assertEqual(self.state()["supervisor_state"], "DONE")
+        self.assertEqual(self.state()["completion"]["actor"], "telegram:1")
+        self.assertEqual(self.counters(), before)
+        result = [e for e in self.events() if e["type"] == "COMMAND_RESULT"][-1]
+        self.assertTrue(result["data"]["ok"])
+        # replaying the same request or a new done: idempotent, no second event
+        self.sup.enqueue_command({"request_id": "done-request-0002", "action": "done", "operator_handoff": True, "run_id": self.state()["run_id"], "actor": "telegram:1"})
+        self.assertEqual(self.sup.worker(), 0)
+        self.assertEqual(self.event_types().count("TASK_HANDED_OFF"), 1)
+        self.assertIn("already DONE", [e for e in self.events() if e["type"] == "COMMAND_RESULT"][-1]["data"]["message"])
+
+    def test_inbox_done_requires_binding_and_explicit_flag(self) -> None:
+        self.to_handoff_ready()
+        run_id = self.state()["run_id"]
+        for label, command in (
+            ("unbound", {"action": "done", "operator_handoff": True}),
+            ("no flag", {"action": "done", "run_id": run_id}),
+            ("truthy string flag", {"action": "done", "run_id": run_id, "operator_handoff": "yes"}),
+            ("stale ready turn", {"action": "done", "run_id": run_id, "operator_handoff": True, "ready_turn_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"}),
+        ):
+            with self.subTest(label):
+                with self.sup.store.transaction():
+                    st = self.sup.store.read_state()
+                    with self.assertRaises(hs.SupervisorError):
+                        self.sup.apply_command(st, command)
+                self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+        self.assertNotIn("TASK_HANDED_OFF", self.event_types())
+
+    def test_restart_preserves_readiness_and_completion_without_events_or_prompts(self) -> None:
+        self.to_handoff_ready()
+        before = self.counters()
+        # worker restart while handoff-ready: stays waiting, no wake-up, readiness intact
+        self.herdr.responses = []
+        self.assertEqual(self.sup.worker(), 2)
+        self.assertIsNotNone(self.state()["operator_handoff_ready"])
+        self.assertEqual(self.counters(), before)
+        # The worker stamped its pid before stopping at the human wait; in the test that pid is this live
+        # process, so the predicate fails closed until the worker process is actually gone.
+        self.assertEqual(self.state()["worker_pid"], os.getpid())
+        self.assert_refused("worker still owns")
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            st["worker_pid"] = None  # what the OS reports once the detached worker has exited
+            self.sup.store.write_state(st)
+        self.complete()
+        events = self.event_types()
+        fresh = self.make_supervisor()
+        self.assertEqual(fresh.worker(), 0)
+        with self.assertRaises(hs.SupervisorError):
+            fresh.resume()  # a handed-off task cannot be reopened
+        self.assertEqual(self.event_types(), events, "restart emits no duplicate TASK_HANDED_OFF or continuation")
+        self.assertEqual(self.state()["completion"]["mode"], "operator_handoff")
+        self.assertEqual(self.counters(), before)
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            with self.assertRaises(hs.SupervisorError):
+                self.sup.apply_command(st, {"action": "resume", "run_id": st["run_id"]})
+
+    def test_status_uses_the_same_predicate_and_never_claims_push_ready(self) -> None:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(runtime_validation_required=False, rebuild_required=False)))}])
+        report = self.sup.status()
+        self.assertFalse(report["operator_handoff"]["available"])
+        self.assertIn("typed gate is pending", report["operator_handoff"]["reason"])
+        self.approve_pending()
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "done")}])
+        report = self.sup.status()
+        self.assertTrue(report["operator_handoff"]["available"], report["operator_handoff"]["reason"])
+        self.assertEqual(report["operator_handoff_ready"]["unmet"], ["push_approval"])
+        self.herdr.agents["codex-main"]["agent_status"] = "working"
+        self.assertFalse(self.sup.status()["operator_handoff"]["available"])
+        self.herdr.agents["codex-main"]["agent_status"] = "idle"
+        self.complete(actor="cli")
+        report = self.sup.status()
+        self.assertEqual(report["completion"]["mode"], "operator_handoff")
+        self.assertFalse(report["operator_handoff"]["available"])
+        import contextlib as _ctx
+        import io
+        buffer = io.StringIO()
+        with _ctx.redirect_stdout(buffer):
+            hs.print_status(report)
+        text = buffer.getvalue()
+        self.assertIn("NOT verified by Supervisor: push_approval", text)
+        for forbidden in ("PUSH READY", "pushed", "published", "deployed", "push approved", "runtime passed"):
+            self.assertNotIn(forbidden, text)
+
+    def test_schema_rejects_malformed_readiness_and_completion_records(self) -> None:
+        self.to_handoff_ready()
+        good = self.state()
+        ready = good["operator_handoff_ready"]
+        run_id = good["run_id"]
+        bad_ready = [
+            {**ready, "schema_version": True}, {**ready, "run_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"}, {**ready, "turn_id": "x"},
+            {**ready, "stage": "bad stage!"}, {**ready, "agent": "human"}, {**ready, "unmet": []}, {**ready, "unmet": ["push_approval", "push_approval"]},
+            {**ready, "unmet": ["git_push"]}, {**ready, "unmet": [True]}, {**ready, "unmet": [{}]}, {**ready, "unmet": [["push_approval"]]}, {**ready, "unmet": {"push_approval": 1}},
+            {**ready, "unmet": ["push_approval", {"x": 1}]}, {**ready, "created_at_unix": True}, {**ready, "created_at_unix": "now"},
+            {**ready, "handoff": 5}, {**ready, "handoff": "h" * 301}, "ready", ["x"],
+        ]
+        for index, value in enumerate(bad_ready):
+            with self.subTest(f"ready {index}"):
+                st = json.loads(self.paths.state_file.read_text())
+                st["operator_handoff_ready"] = value
+                with self.assertRaises(hs.SupervisorError):
+                    hs.validate_state_v2(st)
+        completion = {"schema_version": 1, "mode": "operator_handoff", "run_id": run_id, "stage": "review", "ready_turn_id": ready["turn_id"], "actor": "cli", "chat_id": None,
+                      "at_unix": NOW, "at_utc": hs.iso_utc(NOW), "note": None, "unmet": ["push_approval"], "verified_by_supervisor": False}
+        st = json.loads(self.paths.state_file.read_text())
+        st["supervisor_state"] = "DONE"
+        st["completion"] = completion
+        hs.validate_state_v2(st)  # the well-formed record is accepted
+        st["supervisor_state"] = "WAIT_USER"
+        with self.assertRaises(hs.SupervisorError):
+            hs.validate_state_v2(st)  # a completion record outside DONE is invalid
+        st["supervisor_state"] = "DONE"
+        bad_completion = [
+            {**completion, "mode": "verified"}, {**completion, "mode": 1}, {**completion, "run_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"},
+            {**completion, "chat_id": True}, {**completion, "chat_id": "5"}, {**completion, "chat_id": 5.0}, {**completion, "at_unix": True}, {**completion, "at_unix": "1"},
+            {**completion, "actor": ""}, {**completion, "actor": 7}, {**completion, "note": "n" * 501}, {**completion, "note": 3},
+            {**completion, "unmet": []}, {**completion, "unmet": "push_approval"}, {**completion, "unmet": [{}]}, {**completion, "unmet": [["push_approval"]]},
+            {**completion, "unmet": ["push_approval", "push_approval"]}, {**completion, "unmet": [None]}, {**completion, "ready_turn_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"},
+            {**completion, "verified_by_supervisor": True},
+            {**completion, "verified_by_supervisor": 0}, {**completion, "verified_by_supervisor": None}, {**completion, "ready_turn_id": None}, {**completion, "schema_version": 1.0},
+        ]
+        for index, value in enumerate(bad_completion):
+            with self.subTest(f"completion {index}"):
+                st["completion"] = value
+                with self.assertRaises(hs.SupervisorError):  # never a raw TypeError/KeyError
+                    hs.validate_state_v2(st)
+        # cross-field: a completion may only cite the persisted readiness event; without a marker the
+        # UUID-shaped ready_turn_id is accepted on its own (legacy-safe), with a marker it must match
+        st["completion"] = completion
+        st["operator_handoff_ready"] = {**ready, "turn_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"}
+        with self.assertRaises(hs.SupervisorError):
+            hs.validate_state_v2(st)
+        st["operator_handoff_ready"] = None
+        hs.validate_state_v2(st)
+        # every malformed case surfaces as SupervisorError through the store as well
+        st["operator_handoff_ready"] = {**ready, "unmet": [{"nested": True}]}
+        self.paths.state_file.write_text(json.dumps(st))
+        with self.assertRaises(hs.SupervisorError):
+            self.sup.store.read_state()
+        # existing states load with no completion authority
+        self.assertIsNone(hs.new_v2_fields("gated_v2")["completion"])
+        self.assertIsNone(hs.migrate_state_v1({"schema_version": 1, "supervisor_state": "DONE"})["operator_handoff_ready"])
+
+    def test_cli_done_requires_explicit_operator_handoff_flag(self) -> None:
+        self.to_handoff_ready()
+        run_id = self.state()["run_id"]
+        self.paths.config_file.write_text(json.dumps({"schema_version": 1, "herdr_bin": sys.executable, "project_root": str(self.project_root), "review_root": str(self.review_root), "product_repo": str(self.product_repo), "quota_dir": str(self.quota_dir)}))
+        os.environ["HERDR_SUPERVISOR_CONFIG"] = str(self.paths.config_file)
+        os.environ["HERDR_SUPERVISOR_STATE_DIR"] = str(self.state_dir)
+        try:
+            import contextlib as _ctx
+            import io
+            err = io.StringIO()
+            with _ctx.redirect_stderr(err):
+                self.assertEqual(hs.main(["done", "--run-id", run_id]), 2)
+            self.assertIn("requires --operator-handoff", err.getvalue())
+            self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+            with self.assertRaises(SystemExit):
+                hs.build_parser().parse_args(["done", "--operator-handoff"])  # --run-id is mandatory
+            # with the flag, the real CLI runs the full predicate; this Python binary is not Herdr, so the
+            # lifecycle cannot be established and the run stays open (fail closed, no mutation)
+            err = io.StringIO()
+            with _ctx.redirect_stderr(err):
+                self.assertEqual(hs.main(["done", "--run-id", run_id, "--operator-handoff"]), 2)
+            self.assertIn("operator handoff refused", err.getvalue())
+            self.assertEqual(self.state()["supervisor_state"], "WAIT_USER")
+        finally:
+            os.environ.pop("HERDR_SUPERVISOR_CONFIG", None)
+            os.environ.pop("HERDR_SUPERVISOR_STATE_DIR", None)
+        # the same call through the supervisor object with a settled fake Herdr completes
+        self.assertTrue(self.complete(note="x")["ok"])
+
+
+class PromptAcknowledgementTests(V2Case):
+    """Delivery is acknowledged by an observed lifecycle transition (`--wait --until working|blocked`),
+    never by elapsed time or terminal text; the settlement wait stays as the bounded fallback."""
+
+    FIXTURE = Path(__file__).resolve().parent / "fixtures" / "herdr-0.9.0-agent-prompt-help.txt"
+
+    def log_events(self) -> list[dict]:
+        return [json.loads(line) for line in (self.paths.logs_dir / f"{self.state()['run_id']}.jsonl").read_text().splitlines()]
+
+    def test_capability_parser_uses_the_captured_help_contract(self) -> None:
+        help_text = self.FIXTURE.read_text()
+        self.assertIn("--until <STATUS>", help_text)
+        self.assertIn("agent_prompt_stalled", help_text)
+        self.assertTrue(hs.HerdrCli.prompt_help_supports_ack(help_text))
+        older = help_text.replace("--until", "--unti1")
+        self.assertFalse(hs.HerdrCli.prompt_help_supports_ack(older))
+        self.assertFalse(hs.HerdrCli.prompt_help_supports_ack(""))
+
+    def test_adapter_argv_and_single_cached_probe(self) -> None:
+        cli = hs.HerdrCli("/fake/herdr")
+        calls: list[list[str]] = []
+
+        def fake_run(args, *, timeout, json_result=True):
+            calls.append(list(args))
+            if list(args) == ["agent", "prompt", "--help"]:
+                return self.FIXTURE.read_text()
+            return {"result": {"agent": {"name": "codex-main", "agent_status": "working"}}}
+
+        cli._run = fake_run  # type: ignore[method-assign]
+        self.assertTrue(cli.prompt_ack_supported())
+        self.assertTrue(cli.prompt_ack_supported())
+        self.assertEqual(calls.count(["agent", "prompt", "--help"]), 1, "one read-only probe per process")
+        response = cli.prompt_ack("codex-main", "hello", timeout_ms=8000)
+        self.assertEqual(calls[-1], ["agent", "prompt", "codex-main", "hello", "--wait", "--until", "working", "--until", "blocked", "--timeout", "8000"])
+        self.assertEqual(response["result"]["agent"]["agent_status"], "working")
+        # the settlement path is untouched
+        cli.prompt("codex-main", "hello", timeout_ms=20000)
+        self.assertEqual(calls[-1], ["agent", "prompt", "codex-main", "hello", "--wait", "--timeout", "20000"])
+        # a failing probe means fallback, not an error
+        broken = hs.HerdrCli("/fake/herdr")
+
+        def failing_run(args, *, timeout, json_result=True):
+            raise hs.HerdrError("no such option", code="command_error")
+
+        broken._run = failing_run  # type: ignore[method-assign]
+        self.assertFalse(broken.prompt_ack_supported())
+        sup = hs.Supervisor(self.paths, self.config, broken, clock=self.clock.time, sleeper=self.clock.sleep)
+        self.assertFalse(sup.prompt_ack_available())
+        self.assertEqual(sup.doctor()["prompt_ack_mode"], "settle")
+
+    def test_lifecycle_ack_accepts_immediately_with_exactly_one_submission(self) -> None:
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]), 4)
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual(len(self.herdr.ack_calls), 1)
+        self.assertEqual(self.herdr.ack_calls[0][1], 8000)
+        delivery = self.state()["delivery"]
+        self.assertEqual((delivery["ack_mode"], delivery["accepted_via"], delivery["ack_observed_status"], delivery["status"]), ("lifecycle", "lifecycle_ack", "working", "completed"))
+        accepted = [e for e in self.log_events() if e["event"] == "prompt_accepted"][0]
+        self.assertEqual((accepted["ack_mode"], accepted["latency_ms"], accepted["observed_status"]), ("lifecycle", 0, "working"))
+        self.assertNotIn("prompt_accepted_by_activity", [e["event"] for e in self.log_events()])
+        self.assertEqual(self.sup.doctor()["prompt_ack_mode"], "lifecycle")
+
+    def test_settlement_fallback_when_cli_lacks_acknowledgement_measures_the_bound(self) -> None:
+        self.herdr.ack_supported = False
+        self.write_plan()
+
+        def twenty_seconds(fake, name, text):
+            self.clock.current += 20.0  # the settlement wait consumes its full bound before `timeout`
+
+        payload = str(self.plan_payload())
+        self.assertEqual(self.start_gated([{"v2": ("plan", "human", "plan_approval", payload), "error": "timeout", "before": twenty_seconds}]), 4)
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual(self.herdr.ack_calls, [])
+        events = self.log_events()
+        prepared = next(e for e in events if e["event"] == "prompt_prepared")
+        accepted = next(e for e in events if e["event"] == "gate_created")  # the turn was routed
+        self.assertEqual(self.state()["delivery"]["ack_mode"], "settle")
+        self.assertIn("prompt_delivery_uncertain", [e["event"] for e in events])
+        # latency evidence: prepared -> routed took the whole 20 s bound on the settle path
+        import datetime as dt
+        gap = (dt.datetime.fromisoformat(accepted["time"].replace("Z", "+00:00")) - dt.datetime.fromisoformat(prepared["time"].replace("Z", "+00:00"))).total_seconds()
+        self.assertEqual(gap, 20.0)
+
+    def test_lifecycle_ack_prepared_to_routed_latency_is_zero_on_the_same_fixture(self) -> None:
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]), 4)
+        events = self.log_events()
+        import datetime as dt
+        prepared = next(e for e in events if e["event"] == "prompt_prepared")
+        accepted = next(e for e in events if e["event"] == "gate_created")
+        gap = (dt.datetime.fromisoformat(accepted["time"].replace("Z", "+00:00")) - dt.datetime.fromisoformat(prepared["time"].replace("Z", "+00:00"))).total_seconds()
+        self.assertEqual(gap, 0.0)
+
+    def test_slow_working_turn_after_ack_waits_deterministically_without_reads_or_resend(self) -> None:
+        self.write_plan()
+        payload = str(self.plan_payload())
+        waits = {"n": 0}
+
+        def settle_later(fake, name):
+            waits["n"] += 1
+            if waits["n"] == 3:
+                fake.agents[name]["agent_status"] = "idle"
+
+        self.herdr.on_wait = settle_later
+        self.assertEqual(self.start_gated([{"v2": ("plan", "human", "plan_approval", payload), "status": "working"}]), 4)
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual(waits["n"], 3)
+        self.assertEqual([src for _, src in self.herdr.reads], ["recent-unwrapped"], "nothing is read while working; one settled read at the end")
+        events = [e["event"] for e in self.log_events()]
+        self.assertIn("prompt_accepted", events)
+        self.assertNotIn("prompt_accepted_by_activity", events)
+        self.assertNotIn("prompt_delivery_uncertain", events)
+
+    def test_stalled_ack_stays_uncertain_then_activity_confirms(self) -> None:
+        self.write_plan()
+        payload = str(self.plan_payload())
+        waits = {"n": 0}
+
+        def settle_later(fake, name):
+            waits["n"] += 1
+            if waits["n"] == 2:
+                fake.agents[name]["agent_status"] = "idle"
+
+        self.herdr.on_wait = settle_later
+        self.assertEqual(self.start_gated([{"v2": ("plan", "human", "plan_approval", payload), "error": "agent_prompt_stalled", "status": "working"}]), 4)
+        self.assertEqual(len(self.herdr.prompts), 1, "a stalled acknowledgement is never resent")
+        events = [e["event"] for e in self.log_events()]
+        self.assertIn("prompt_delivery_uncertain", events)
+        self.assertIn("prompt_accepted_by_activity", events)
+        self.assertEqual(self.state()["delivery"]["ack_mode"], "lifecycle")
+
+    def test_timeout_or_stalled_ack_with_idle_agent_and_no_block_fails_closed(self) -> None:
+        for code in ("agent_prompt_stalled", "timeout"):
+            with self.subTest(code):
+                self.reset_fixture()
+                self.write_plan()
+                self.assertEqual(self.start_gated([{"output": "nothing that parses\n", "error": code, "status": "idle"}]), 2)
+                state = self.state()
+                self.assertEqual(state["supervisor_state"], "WAIT_USER")
+                self.assertTrue(state["wait_user_requires_action"])
+                self.assertIn("never confirmed accepted", state["wait_user_reason"])
+                self.assertEqual(state["delivery"]["status"], "completed")
+                self.assertEqual(state["delivery"]["error_code"], code)
+                self.assertEqual(len(self.herdr.prompts), 1)
+
+    def test_rejected_before_input_paths_are_unchanged_under_ack(self) -> None:
+        self.write_plan()
+        self.assertEqual(self.start_gated([{"error": "agent_blocked", "status": "blocked", "output": "Allow? (y/n)"}]), 2)
+        self.assertIsNone(self.state()["delivery"], "rejected before input: no delivery record survives")
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertIn("prompt_rejected_before_delivery", [e["event"] for e in self.log_events()])
+
+    def test_restart_after_uncertain_ack_recovers_without_a_second_submission(self) -> None:
+        self.write_plan()
+
+        def die_midturn(fake, name):
+            raise KeyboardInterrupt
+
+        self.herdr.on_wait = die_midturn
+        self.assertEqual(self.start_gated([{"error": "agent_prompt_stalled", "status": "working"}]), 3)
+        persisted = self.state()
+        self.assertEqual(persisted["supervisor_state"], "PAUSED")
+        self.assertEqual(persisted["delivery"]["status"], "accepted")  # activity confirmed it before the crash
+        self.assertEqual(len(self.herdr.prompts), 1)
+        herdr2 = FakeHerdr()
+        herdr2.agents["codex-main"]["agent_status"] = "idle"
+        herdr2.outputs["codex-main"] = FakeHerdr.block_v2(persisted["run_id"], persisted["delivery"]["turn_id"], "plan", "human", "plan_approval", str(self.plan_payload()))
+        sup2 = hs.Supervisor(self.paths, self.config, herdr2, clock=self.clock.time, sleeper=self.clock.sleep)
+        sup2.head_resolver = self.head_resolver
+        self.assertEqual(sup2.resume(), 4)
+        self.assertEqual(herdr2.prompts, [])
+        self.assertEqual(herdr2.ack_calls, [])
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_PLAN_APPROVAL")
+
+    def test_config_rejects_invalid_ack_timeout(self) -> None:
+        for bad in (0, "soon", -5, True):
+            with self.subTest(bad):
+                self.paths.config_file.write_text(json.dumps({"schema_version": 1, "prompt_ack_timeout_ms": bad, "project_root": str(self.project_root)}))
+                with self.assertRaises(hs.SupervisorError):
+                    hs.load_config(self.paths.config_file)
+        self.paths.config_file.write_text(json.dumps({"schema_version": 1, "project_root": str(self.project_root)}))
+        self.assertEqual(hs.load_config(self.paths.config_file)["prompt_ack_timeout_ms"], 8000)
+
+
+class ProtocolWidthTests(V2Case):
+    """Terminal width is part of the protocol: a valid result wrapped below its logical line length
+    must recover the same bound block; anything structurally outside the frame stays rejected."""
+
+    FIXTURES = Path(__file__).resolve().parent / "fixtures"
+    RUN = "20598ca2-d049-4cb9-967a-5652e7bf6eff"
+    TURN = "9945228c-bb87-493a-96ea-14d190c49510"
+    PAYLOAD = "/home/user/workspace/reviews/hs-token-cost-start-buttons/plan-approval.json"
+    HANDOFF = "Approve the reissued plan to resume; the technical scope is unchanged from the previous token-cost and Telegram button proposal."  # legacy spaced text as captured live
+    HANDOFF_COMPLIANT = "Approve_the_reissued_plan_to_resume;_the_technical_scope_is_unchanged_from_the_previous_token-cost_and_Telegram_button_proposal."
+
+    def logical(self) -> list[str]:
+        return ["HERDR_PROTOCOL=2", f"HERDR_RUN={self.RUN}", f"HERDR_TURN={self.TURN}", "HERDR_STAGE=plan", "HERDR_NEXT=human",
+                "HERDR_GATE=plan_approval", f"HERDR_PAYLOAD={self.PAYLOAD}", f"HERDR_HANDOFF={self.HANDOFF}"]
+
+    @staticmethod
+    def wrap(lines: list[str], width: int, *, prefix: str = "  ") -> str:
+        """Emulate a terminal: machine rows hard-wrap at `width`; free text wraps at whitespace (the
+        space is dropped) and a token longer than the remaining row is split mid-token on a full row."""
+        rows = []
+        budget = width - len(prefix)
+        for line in lines:
+            if line.startswith("HERDR_HANDOFF="):
+                current = ""
+                for word in line.split(" "):
+                    while len(word) > budget:  # over-long token: hard split on full rows
+                        if current:
+                            rows.append(prefix + current)
+                            current = ""
+                        rows.append(prefix + word[:budget])
+                        word = word[budget:]
+                    candidate = word if not current else current + " " + word
+                    if len(candidate) > budget and current:
+                        rows.append(prefix + current)
+                        current = word
+                    else:
+                        current = candidate
+                rows.append(prefix + current)
+            else:
+                for start in range(0, len(line), budget):
+                    rows.append(prefix + line[start:start + budget])
+        return "\n".join(rows) + "\n"
+
+    def test_exact_captured_wrapped_result_recovers_the_bound_block(self) -> None:
+        text = (self.FIXTURES / "codex-recent-unwrapped-wrapped-result.txt").read_text()
+        block = hs.parse_protocol(text, self.RUN, self.TURN)
+        self.assertIsNotNone(block)
+        self.assertEqual((block.stage, block.next_agent, block.gate, block.payload, block.handoff), ("plan", "human", "plan_approval", self.PAYLOAD, self.HANDOFF))
+        self.assertIsNone(hs.parse_protocol(text, self.RUN, "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"), "exact turn binding survives reconstruction")
+
+    def test_captured_prompt_echo_and_wrapped_template_never_parse(self) -> None:
+        echo = (self.FIXTURES / "codex-recent-unwrapped-prompt-echo.txt").read_text()
+        self.assertEqual(hs.find_protocol_blocks(echo), [])
+        template = self.sup.protocol_instructions({"run_id": self.RUN}, self.TURN)
+        for width in (40, 60, 80, 200):
+            self.assertEqual(hs.find_protocol_blocks(self.wrap(template.splitlines(), width)), [], width)
+
+    def test_40_60_80_column_variants_recover_the_same_block(self) -> None:
+        lines = self.logical()
+        lines[7] = f"HERDR_HANDOFF={self.HANDOFF_COMPLIANT}"  # the emitted contract: words joined with underscores, no spaces
+        reference = hs.parse_protocol("\n".join(lines), self.RUN, self.TURN)
+        for width in (40, 60, 80, 120):
+            with self.subTest(width=width):
+                for prefix in ("", "  ", "│ "):
+                    block = hs.parse_protocol(self.wrap(lines, width, prefix=prefix), self.RUN, self.TURN)
+                    self.assertIsNotNone(block, (width, prefix))
+                    self.assertEqual((block.run_id, block.turn_id, block.stage, block.next_agent, block.gate, block.payload), (reference.run_id, reference.turn_id, "plan", "human", "plan_approval", self.PAYLOAD))
+                    self.assertEqual(block.handoff, self.HANDOFF_COMPLIANT)
+        # legacy spaced text is re-joined best-effort: exact whenever no row is filled to the terminal width
+        # (the captured live case); a word ending exactly at the row edge is the one boundary no unframed
+        # transcript can disambiguate, which is why the contract now forbids spaces
+        legacy = hs.parse_protocol(self.wrap(self.logical(), 60), self.RUN, self.TURN)
+        self.assertIsNotNone(legacy)
+        self.assertEqual(legacy.handoff.replace(" ", ""), self.HANDOFF.replace(" ", ""))
+
+    def test_leading_dash_in_a_wrapped_payload_fragment_survives(self) -> None:
+        lines = self.logical()
+        lines[6] = "HERDR_PAYLOAD=/home/user/workspace/reviews/hs-token/plan"
+        text = "  HERDR_PROTOCOL=2\n" + "\n".join("  " + l for l in lines[1:6]) + "\n  HERDR_PAYLOAD=/home/user/workspace/reviews/hs-token/plan\n  -approval.json\n  " + lines[7] + "\n"
+        block = hs.parse_protocol(text, self.RUN, self.TURN)
+        self.assertEqual(block.payload, "/home/user/workspace/reviews/hs-token/plan-approval.json")
+
+    def test_40_column_length_edges_preserve_content_and_enforce_bounds(self) -> None:
+        def frame(payload: str, handoff: str) -> list[str]:
+            return ["HERDR_PROTOCOL=2", f"HERDR_RUN={self.RUN}", f"HERDR_TURN={self.TURN}", "HERDR_STAGE=plan", "HERDR_NEXT=human", "HERDR_GATE=plan_approval", f"HERDR_PAYLOAD={payload}", f"HERDR_HANDOFF={handoff}"]
+
+        def words(n: int) -> str:  # a compliant handoff of exactly n characters (words joined with underscores)
+            text = ""
+            i = 0
+            while len(text) < n:
+                text += ("" if not text else "_") + f"w{i}"
+                i += 1
+            return text[:n]
+
+        for width in (40, 60, 80):
+            for label, payload, handoff, ok in (
+                ("emitted maximum handoff", "/p/plan-approval.json", words(299), True),
+                ("parser maximum handoff", "/p/plan-approval.json", words(600), True),
+                ("one over the handoff limit", "/p/plan-approval.json", words(601), False),
+                ("500-char payload", "/" + "d" * 499, "ok", True),
+                ("maximum payload", "/" + "d" * 1023, "ok", True),
+                ("one over the payload limit", "/" + "d" * 1024, "ok", False),
+            ):
+                with self.subTest(width=width, case=label):
+                    block = hs.parse_protocol(self.wrap(frame(payload, handoff), width), self.RUN, self.TURN)
+                    if ok:
+                        self.assertIsNotNone(block, label)
+                        self.assertEqual(block.payload, payload)
+                        self.assertEqual(block.handoff, handoff)
+                    else:
+                        self.assertIsNone(block, label)
+        # an excessive transcript: thousands of continuation rows never build a value or exhaust the parser
+        excessive = "\n".join(frame("/p/x", "start")[:7]) + "\n" + "\n".join(["y" * 38] * 5000)
+        self.assertIsNone(hs.parse_protocol(excessive, self.RUN, self.TURN))
+
+    def test_mid_token_and_whitespace_wraps_reconstruct_the_exact_handoff(self) -> None:
+        cases = [
+            "Review_/home/user/workspace/reviews/hs-token-cost-start-buttons/CLAUDE_HANDOFF.md_then_run_python3_-m_unittest_discover_-s_tests",
+            "supercalifragilisticexpialidocious_is_longer_than_a_forty_column_row_and_must_stay_one_token",
+            "id=0bbbbbbbcccc4ddd8eeeffffffffffff-0bbbbbbbcccc4ddd8eeeffffffffffff-0bbbbbbbcccc4ddd8eeeffffffffffff_ok",
+            "short_words_only,_wrapped_anywhere,_exactly_reproduced_across_every_width",
+            "x" * 299,  # the maximum emitted handoff as one token
+        ]
+        for handoff in cases:
+            for width in (40, 60, 80):
+                with self.subTest(width=width, handoff=handoff[:24]):
+                    lines = self.logical()
+                    lines[7] = f"HERDR_HANDOFF={handoff}"
+                    block = hs.parse_protocol(self.wrap(lines, width), self.RUN, self.TURN)
+                    self.assertIsNotNone(block)
+                    self.assertEqual(block.handoff, handoff)
+                    self.assertEqual(block.payload, self.PAYLOAD)
+
+    def test_nearby_text_truncation_reorder_duplicates_and_conflicts_are_rejected(self) -> None:
+        base = self.logical()
+        # neighboring HERDR_ text and prose around a valid frame do not leak into values
+        around = "HERDR_HANDOFF=stale from earlier\nsome prose\n" + "\n".join(base) + "\n\nHERDR_PAYLOAD=/evil\nmore prose\n"
+        block = hs.parse_protocol(around, self.RUN, self.TURN)
+        self.assertEqual((block.payload, block.handoff), (self.PAYLOAD, self.HANDOFF))
+        # prose directly after a legacy spaced handoff (no blank line) is bounded by the row cap, never merged into a long value
+        trailing = "\n".join(base) + "\n" + "\n".join(["filler prose line that is not part of the block"] * 8)
+        self.assertIsNone(hs.parse_protocol(trailing, self.RUN, self.TURN))
+        # prose after a contract (underscore-joined) handoff ends the value exactly where the whitespace begins
+        compliant = base[:7] + [f"HERDR_HANDOFF={self.HANDOFF_COMPLIANT}"]
+        trailing = "\n".join(compliant) + "\n" + "\n".join(["filler prose line that is not part of the block"] * 8)
+        block = hs.parse_protocol(trailing, self.RUN, self.TURN)
+        self.assertEqual(block.handoff, self.HANDOFF_COMPLIANT)
+        wrapped_then_prose = self.wrap(compliant, 40) + "\n".join(["prose right after the wrapped block"] * 3)
+        self.assertEqual(hs.parse_protocol(wrapped_then_prose, self.RUN, self.TURN).handoff, self.HANDOFF_COMPLIANT)
+        # truncated frames (any missing key) are not blocks
+        for cut in range(1, 8):
+            self.assertIsNone(hs.parse_protocol("\n".join(base[:cut]), self.RUN, self.TURN), cut)
+        # a blank row inside the machine fields breaks the frame
+        broken = base[:4] + [""] + base[4:]
+        self.assertIsNone(hs.parse_protocol("\n".join(broken), self.RUN, self.TURN))
+        # reordered keys
+        reordered = base[:5] + [base[6], base[5], base[7]]
+        self.assertIsNone(hs.parse_protocol("\n".join(reordered), self.RUN, self.TURN))
+        # a wrapped value that swallows a foreign HERDR_ row is rejected, not concatenated
+        foreign = base[:6] + ["HERDR_PAYLOAD=/home/user/x/", "HERDR_STAGE=fix", "approval.json", base[7]]
+        self.assertIsNone(hs.parse_protocol("\n".join(foreign), self.RUN, self.TURN))
+        # identical duplicate frames agree; conflicting frames are an error
+        self.assertIsNotNone(hs.parse_protocol("\n".join(base) + "\n\n" + self.wrap(base, 60), self.RUN, self.TURN))
+        other = list(base)
+        other[4] = "HERDR_NEXT=codex"
+        other[5] = "HERDR_GATE=none"
+        other[6] = "HERDR_PAYLOAD=-"
+        with self.assertRaises(hs.SupervisorError):
+            hs.parse_protocol("\n".join(base) + "\n\n" + self.wrap(other, 60), self.RUN, self.TURN)
+        # continuation text beyond the value's validated size is malformed, however many rows it takes
+        too_much = base[:6] + ["HERDR_PAYLOAD=/a"] + ["b" * 200] * 6 + [base[7]]
+        self.assertIsNone(hs.parse_protocol("\n".join(too_much), self.RUN, self.TURN))
+
+
+class TokenCostGuardrailTests(V2Case):
+    """Durable prompt accounting, the consecutive same-provider circuit breaker, compact prompts, and
+    the missing-result retry — all with zero prompts, reads, or wakes outside accepted routes."""
+
+    def counters(self) -> tuple[int, int, int]:
+        return (len(self.herdr.prompts), len(self.herdr.reads), len(self.herdr.waits))
+
+    def test_accounting_counts_each_prepared_prompt_once_and_never_on_restart(self) -> None:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(self.runtime_payload()))}])
+        metrics = self.state()["prompt_metrics"]
+        self.assertEqual(metrics["prompts"], 4)
+        self.assertEqual((metrics["by_provider"]["codex"]["prompts"], metrics["by_provider"]["claude"]["prompts"]), (3, 1))
+        self.assertEqual(metrics["chars"], sum(len(text) for _, text in self.herdr.prompts))
+        self.assertEqual(metrics["chars"], metrics["by_provider"]["codex"]["chars"] + metrics["by_provider"]["claude"]["chars"])
+        # restart at a human gate: no prompt, no count
+        before = self.counters()
+        self.assertEqual(self.make_supervisor().worker(), 4)
+        self.assertEqual(self.state()["prompt_metrics"]["prompts"], 4)
+        self.assertEqual(self.counters(), before)
+        report = self.sup.status()
+        self.assertEqual(report["prompt_metrics"]["prompts"], 4)
+        self.assertEqual(report["auto_turn_limit"], 8)
+        import contextlib as _ctx
+        import io
+        buffer = io.StringIO()
+        with _ctx.redirect_stdout(buffer):
+            hs.print_status(report)
+        self.assertIn("Prompt deliveries prepared: 4 (", buffer.getvalue())
+        self.assertIn("codex 3", buffer.getvalue())
+        self.assertIn("claude 1", buffer.getvalue())
+        self.assertNotIn("sent", buffer.getvalue().split("Prompt deliveries")[1].splitlines()[0])
+        self.assertIn("not provider tokens", buffer.getvalue())
+
+    def test_accounting_crash_windows_never_double_count(self) -> None:
+        self.write_plan()
+
+        # (a) crash after the prepared record, before submission: restart fails closed and prepares nothing new
+        def die_before_submit(fake, name, text):
+            raise KeyboardInterrupt
+
+        self.herdr.responses = [{"before": die_before_submit}]
+        self.assertEqual(self.sup.run_new("task", "codex", workflow_policy="gated_v2"), 3)
+        prepared = self.state()
+        self.assertEqual(prepared["prompt_metrics"]["prompts"], 1)
+        self.assertEqual(prepared["delivery"]["status"], "prepared")
+        sup2 = self.make_supervisor()
+        self.assertEqual(sup2.resume(), 2)
+        self.assertEqual(self.state()["prompt_metrics"]["prompts"], 1)
+        self.assertEqual(len(self.herdr.prompts), 1)
+        # F6: the record counts a PREPARED delivery; status wording must not claim it was sent
+        import contextlib as _ctx
+        import io
+        buffer = io.StringIO()
+        with _ctx.redirect_stdout(buffer):
+            hs.print_status(sup2.status())
+        line = next(l for l in buffer.getvalue().splitlines() if l.startswith("Prompt deliveries prepared:"))
+        self.assertIn("prepared: 1 (", line)
+        self.assertIn("characters prepared", line)
+        self.assertNotIn("sent", line)
+        self.assertNotIn("submitted", line)
+        # (b) crash during uncertain delivery (stalled ack, agent working) then restart: reused record, no recount
+        self.reset_fixture()
+        self.write_plan()
+
+        def die_midturn(fake, name):
+            raise KeyboardInterrupt
+
+        self.herdr.on_wait = die_midturn
+        self.assertEqual(self.start_gated([{"error": "agent_prompt_stalled", "status": "working"}]), 3)
+        persisted = self.state()
+        self.assertEqual(persisted["prompt_metrics"]["prompts"], 1)
+        herdr2 = FakeHerdr()
+        herdr2.agents["codex-main"]["agent_status"] = "idle"
+        herdr2.outputs["codex-main"] = FakeHerdr.block_v2(persisted["run_id"], persisted["delivery"]["turn_id"], "plan", "human", "plan_approval", str(self.plan_payload()))
+        sup3 = hs.Supervisor(self.paths, self.config, herdr2, clock=self.clock.time, sleeper=self.clock.sleep)
+        sup3.head_resolver = self.head_resolver
+        self.assertEqual(sup3.resume(), 4)
+        self.assertEqual(self.state()["prompt_metrics"]["prompts"], 1)
+        self.assertEqual(herdr2.prompts, [])
+        # (c) after routing: a plain resume at the gate adds nothing
+        self.assertEqual(sup3.resume(), 4)
+        self.assertEqual(self.state()["prompt_metrics"]["prompts"], 1)
+
+    def test_metrics_and_breaker_state_validation(self) -> None:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        good = json.loads(self.paths.state_file.read_text())
+        m = good["prompt_metrics"]
+        bad_metrics = [
+            None, [], {**m, "prompts": True}, {**m, "prompts": -1}, {**m, "chars": "9"}, {**m, "prompts": 10**13},
+            {**m, "by_provider": {"codex": m["by_provider"]["codex"]}}, {**m, "by_provider": {**m["by_provider"], "claude": {"prompts": 1.0, "chars": 0}}},
+            {**m, "prompts": m["prompts"] + 1},  # totals must equal provider counters
+        ]
+        for index, value in enumerate(bad_metrics):
+            with self.subTest(f"metrics {index}"):
+                st = json.loads(self.paths.state_file.read_text())
+                st["prompt_metrics"] = value
+                with self.assertRaises(hs.SupervisorError):
+                    hs.validate_state_v2(st)
+        for value in ({"provider": "human", "count": 0}, {"provider": "codex", "count": -1}, {"provider": "codex", "count": True}, {"count": 1}, {"provider": None, "count": 1_000_001}):
+            with self.subTest(f"breaker {value}"):
+                st = json.loads(self.paths.state_file.read_text())
+                st["consecutive_auto_turns"] = value
+                with self.assertRaises(hs.SupervisorError):
+                    hs.validate_state_v2(st)
+        for value in ({"schema_version": 1}, {"schema_version": 1, "run_id": good["run_id"], "turn_id": "x", "agent": "codex", "attempts": 0, "created_at_unix": NOW},
+                      {"schema_version": 1, "run_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff", "turn_id": good["delivery"]["turn_id"], "agent": "codex", "attempts": 0, "created_at_unix": NOW},
+                      {"schema_version": 1, "run_id": good["run_id"], "turn_id": good["delivery"]["turn_id"], "agent": "codex", "attempts": True, "created_at_unix": NOW}):
+            with self.subTest(f"missing {value}"):
+                st = json.loads(self.paths.state_file.read_text())
+                st["missing_result"] = value
+                with self.assertRaises(hs.SupervisorError):
+                    hs.validate_state_v2(st)
+        # old schema-2 state without the fields loads with zero metrics and a fresh count
+        st = json.loads(self.paths.state_file.read_text())
+        for key in ("prompt_metrics", "consecutive_auto_turns", "missing_result"):
+            st.pop(key, None)
+        self.paths.state_file.write_text(json.dumps(st))
+        loaded = self.sup.store.read_state()
+        self.assertEqual(loaded["prompt_metrics"]["prompts"], 0)
+        self.assertEqual(loaded["consecutive_auto_turns"], {"provider": None, "count": 0})
+        self.assertIsNone(loaded.get("missing_result"))
+        # config bounds
+        for bad in (0, 1001, "8", True, 2.0):
+            with self.subTest(f"config {bad!r}"):
+                self.paths.config_file.write_text(json.dumps({"schema_version": 1, "max_consecutive_auto_turns": bad, "project_root": str(self.project_root)}))
+                with self.assertRaises(hs.SupervisorError):
+                    hs.load_config(self.paths.config_file)
+
+    def test_historical_loop_stops_after_one_submission_even_across_restart_and_resume(self) -> None:
+        self.write_plan()
+        self.herdr.responses = [{"v2": ("plan", "codex")}] + [{"v2": ("plan", "codex")}] * 58
+        self.assertEqual(self.sup.run_new("historical loop", "codex", workflow_policy="gated_v2"), 2)
+        self.assertEqual(len(self.herdr.prompts), 1)
+        state = self.state()
+        self.assertEqual((state["supervisor_state"], state["wait_user_requires_action"]), ("WAIT_USER", True))
+        for attempt in range(3):
+            self.assertEqual(self.make_supervisor().worker(), 2)
+            with self.sup.store.transaction():
+                st = self.sup.store.read_state()
+                with self.assertRaises(hs.SupervisorError):
+                    self.sup.apply_command(st, {"action": "resume", "run_id": st["run_id"]})
+        self.assertEqual(len(self.herdr.prompts), 1, "restart and resume never wake the agent again")
+        self.assertEqual(self.state()["prompt_metrics"]["prompts"], 1)
+
+    def test_stage_changing_loop_stops_before_limit_plus_one_and_human_revision_continues_once(self) -> None:
+        limit = 3
+        self.config = hs.resolve_config_defaults(hs.deep_merge(self.config, {"max_consecutive_auto_turns": limit}))
+        self.sup = self.make_supervisor()
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        stages = [f"stage{i}" for i in range(1, 20)]
+        # the approval continuation carries human authority; every following codex -> codex route changes stage
+        self.assertEqual(self.resume_with([{"v2": (stage, "codex")} for stage in stages]), 2)
+        # initial + approval continuation (both human authority) + `limit` automatic turns; turn limit+1 is never prepared
+        self.assertEqual(len(self.herdr.prompts), 2 + limit)
+        state = self.state()
+        self.assertEqual(state["consecutive_auto_turns"], {"provider": "codex", "count": limit})
+        self.assertEqual(state["prompt_metrics"]["prompts"], 2 + limit)
+        self.assertTrue(state["wait_user_requires_action"])
+        self.assertIn(f"limit {limit}", state["wait_user_reason"])
+        self.assertIn("/revise", state["wait_user_reason"])
+        self.assertIsNone(state["missing_result"])
+        # restart/resume do not reset or bypass the limit
+        self.assertEqual(self.make_supervisor().worker(), 2)
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            with self.assertRaises(hs.SupervisorError):
+                self.sup.apply_command(st, {"action": "resume", "run_id": st["run_id"]})
+        self.assertEqual(self.state()["consecutive_auto_turns"]["count"], limit)
+        self.assertEqual(len(self.herdr.prompts), 2 + limit)
+        # an authenticated human revision resets the count and continues exactly once, then the chain is bounded again
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.guide(st, run_id=st["run_id"], actor="telegram:1", note="carry on")
+        self.assertEqual(self.state()["consecutive_auto_turns"], {"provider": None, "count": 0})
+        self.assertEqual(self.sup.resume(), 2)
+        self.assertEqual(len(self.herdr.prompts), 2 + limit + 1 + limit, "one continuation, then at most `limit` automatic turns")
+        self.assertEqual(self.state()["consecutive_auto_turns"]["count"], limit)
+
+    def test_cross_provider_handoff_resets_the_streak_and_polling_never_changes_it(self) -> None:
+        self.config = hs.resolve_config_defaults(hs.deep_merge(self.config, {"max_consecutive_auto_turns": 2}))
+        self.sup = self.make_supervisor()
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(runtime_validation_required=False, rebuild_required=False)))}])
+        self.approve_pending()
+        # codex: a1, a2 (2 automatic) -> claude (cross-provider: streak cleared) -> claude: b1 (1) -> codex (cleared) -> c1, c2, then blocked
+        observed: list[dict] = []
+
+        def snapshot(fake, name, text):
+            observed.append(dict(self.state()["consecutive_auto_turns"]))
+
+        responses = [{"v2": ("a1", "codex")}, {"v2": ("a2", "codex")}, {"v2": ("brief", "claude")}, {"v2": ("b1", "claude")}, {"v2": ("impl", "codex")},
+                     {"v2": ("c1", "codex")}, {"v2": ("c2", "codex")}, {"v2": ("c3", "codex")}]
+        self.assertEqual(self.resume_with([{**r, "before": snapshot} for r in responses]), 2)
+        # streak observed at the moment each prompt was prepared (i.e. after the previous route was recorded)
+        self.assertEqual(observed, [
+            {"provider": None, "count": 0},      # approval continuation (human authority)
+            {"provider": "codex", "count": 1},   # after a1 -> codex
+            {"provider": "codex", "count": 2},   # after a2 -> codex
+            {"provider": None, "count": 0},      # after brief -> claude (cross-provider handoff clears the streak)
+            {"provider": "claude", "count": 1},  # after b1 -> claude
+            {"provider": None, "count": 0},      # after impl -> codex (cross-provider)
+            {"provider": "codex", "count": 1},   # after c1 -> codex
+            {"provider": "codex", "count": 2},   # after c2 -> codex; c3 -> codex is then refused
+        ])
+        self.assertEqual(self.state()["consecutive_auto_turns"], {"provider": "codex", "count": 2})
+        self.assertIn("consecutive automatic turns", self.state()["wait_user_reason"])
+        # quota refresh requests and repeated worker invocations do not touch the streak or prompts
+        before = self.counters()
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            with self.assertRaises(hs.SupervisorError):
+                self.sup.apply_command(st, {"action": "refresh_quota", "run_id": st["run_id"]})  # no quota wait: refused, unchanged
+        self.assertEqual(self.make_supervisor().worker(), 2)
+        self.assertEqual(self.state()["consecutive_auto_turns"], {"provider": "codex", "count": 2})
+        self.assertEqual(self.counters(), before)
+
+    def test_task_sentinel_only_in_initial_prompt_and_boilerplate_ceiling(self) -> None:
+        sentinel = "SENTINEL-" + "7c1e5a2f" * 3
+        self.write_plan()
+        self.herdr.responses = [{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]
+        self.assertEqual(self.sup.run_new(f"Do the thing {sentinel} carefully", "codex", workflow_policy="gated_v2"), 4)
+        self.approve_pending()
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "human", "generic_question", str(self.question_payload()))}])
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.answer_gate(st, run_id=st["run_id"], gate_id=st["pending_gate"]["gate_id"], actor="cli", answer="enum")
+        self.resume_with([{"v2": ("implement", "codex")}, {"v2": ("review", "human", "generic_question", str(self.question_payload()))}])
+        texts = [text for _, text in self.herdr.prompts]
+        self.assertGreaterEqual(len(texts), 4)
+        self.assertIn(sentinel, texts[0])
+        for later in texts[1:]:
+            self.assertNotIn(sentinel, later)
+            self.assertNotIn("Task:\n", later)
+        # fixed boilerplate ceiling (paths excluded); the previous builder produced ~1,600-1,700 characters
+        review_root, project_root = self.config["review_root"], self.config["project_root"]
+        state = self.state()
+        for kind, cont in (("continuation:revision", {"kind": "revision", "gate_type": "plan_approval", "note": ""}), ("continuation:answer", {"kind": "answer", "gate_id": "g", "note": ""}),
+                           ("continuation:plan_approved", {"kind": "plan_approved", "plan_sha256": "p" * 64, "payload_sha256": "q" * 64}), ("handoff", None)):
+            state["continuation"] = cont
+            prompt = self.sup.build_prompt_v2(state, "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff", kind)
+            fixed = len(prompt) - len(review_root) - len(project_root)
+            self.assertLessEqual(fixed, 1300, (kind, fixed))  # previous builder: 1,419 (continuation) and 1,718 (handoff) with the same inputs
+            self.assertEqual(hs.find_protocol_blocks(prompt), [], f"{kind} prompt must not parse as a response")
+            for width in (40, 60, 80):
+                self.assertEqual(hs.find_protocol_blocks(ProtocolWidthTests.wrap(prompt.splitlines(), width)), [], (kind, width))
+        for required in ("HERDR_PROTOCOL=2", f"HERDR_RUN={state['run_id']}", "HERDR_TURN=", "HERDR_STAGE=", "HERDR_NEXT=", "HERDR_GATE=", "HERDR_PAYLOAD=", "HERDR_HANDOFF=", "CODEX_PLAN.md", "push"):
+            self.assertIn(required, prompt)
+
+    def to_missing_result(self, *, after_approval: bool = False) -> dict:
+        self.write_plan()
+        silent = {"output": "The plan is at reviews/feature-widget but I forgot the block.\n", "status": "idle"}
+        if after_approval:
+            self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(runtime_validation_required=False, rebuild_required=False)))}])
+            self.approve_pending()
+            self.assertEqual(self.resume_with([silent]), 2)
+        else:
+            self.assertEqual(self.start_gated([silent]), 2)
+        state = self.state()
+        self.assertEqual((state["supervisor_state"], state["wait_user_requires_action"]), ("WAIT_USER", True))
+        self.assertEqual(state["missing_result"]["turn_id"], state["delivery"]["turn_id"])
+        self.assertEqual(state["missing_result"]["attempts"], 0)
+        self.assertNotEqual((state["pending_gate"] or {}).get("status"), "pending")
+        return state
+
+    def retry(self, **overrides) -> dict:
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            command = {"action": "retry_routing_result", "run_id": st["run_id"], "turn_id": st["missing_result"]["turn_id"] if st.get("missing_result") else None, **overrides}
+            return self.sup.apply_command(st, command)
+
+    def test_failed_retry_is_spent_and_never_repeats(self) -> None:
+        state = self.to_missing_result()
+        before = self.counters()
+        result = self.retry()
+        self.assertFalse(result["ok"])
+        self.assertIn("no approval was created", result["message"])
+        after = self.state()
+        self.assertEqual((after["missing_result"]["attempts"], after["supervisor_state"], after["wait_user_requires_action"]), (1, "WAIT_USER", True))
+        self.assertEqual(len(self.herdr.prompts), before[0])
+        self.assertEqual([src for _, src in self.herdr.reads][-1], "recent-unwrapped")
+        # the one-time reread is spent: later commands are refused without mutation, even if the transcript now parses
+        self.herdr.outputs["codex-main"] = FakeHerdr.block_v2(state["run_id"], state["delivery"]["turn_id"], "plan", "human", "plan_approval", str(self.plan_payload()))
+        snapshot = self.paths.state_file.read_text()
+        reads = len(self.herdr.reads)
+        with self.assertRaises(hs.SupervisorError) as caught:
+            self.retry()
+        self.assertIn("already used", str(caught.exception))
+        self.assertEqual(self.paths.state_file.read_text(), snapshot)
+        self.assertEqual(len(self.herdr.reads), reads, "a spent retry does not even read")
+        self.assertEqual(self.make_supervisor().worker(), 2)
+        self.assertEqual(self.state()["missing_result"]["attempts"], 1, "restart preserves the spent descriptor")
+        report = self.sup.status()
+        self.assertEqual(report["missing_result"]["attempts"], 1)
+        self.assertNotIn("Retry routing result", [b[0] for row in __import__("herdr_present").keyboard_for_status(report) for b in row])
+        # guidance remains the recovery
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.guide(st, run_id=st["run_id"], actor="cli", note="emit the block")
+        self.assertIsNone(self.state()["missing_result"])
+
+    def test_retry_rereads_settled_turn_and_creates_the_gate_once_without_prompts(self) -> None:
+        state = self.to_missing_result()
+        before = self.counters()
+        # the transcript now shows the wrapped result (as the live pane did): the single retry recovers the gate
+        payload = str(self.plan_payload())
+        wrapped = ProtocolWidthTests.wrap(FakeHerdr.block_v2(state["run_id"], state["delivery"]["turn_id"], "plan", "human", "plan_approval", payload, prefix="").splitlines(), 60)
+        self.herdr.outputs["codex-main"] = "reply text\n\n" + wrapped
+        result = self.retry()
+        self.assertTrue(result["ok"], result)
+        after = self.state()
+        self.assertEqual(after["supervisor_state"], "WAIT_PLAN_APPROVAL")
+        self.assertEqual(after["pending_gate"]["gate_type"], "plan_approval")
+        self.assertIsNone(after["missing_result"])
+        self.assertEqual(self.event_types().count("PLAN_APPROVAL_REQUIRED"), 1)
+        self.assertEqual(len(self.herdr.prompts), before[0], "retry submits nothing")
+        self.assertEqual(len(self.herdr.waits), before[2], "retry wakes nothing")
+        # duplicate retry after recovery, restart, and resume: no second gate, no prompt
+        with self.assertRaises(hs.SupervisorError):
+            self.retry(turn_id=state["delivery"]["turn_id"])
+        self.assertEqual(self.make_supervisor().worker(), 4)
+        self.assertEqual(self.event_types().count("PLAN_APPROVAL_REQUIRED"), 1)
+        self.assertEqual(len(self.herdr.prompts), before[0])
+
+    def test_retry_is_zero_prompt_for_every_recovered_route_across_the_whole_worker_call(self) -> None:
+        """A recovered human gate is created; a recovered provider or done route is recorded but the retry
+        worker never prepares, submits, reads more than the settled transcript, or waits for an agent."""
+        cases = {
+            "human": ("plan", "human", "plan_approval", None, "WAIT_PLAN_APPROVAL", False),
+            "codex": ("brief", "codex", "none", "-", "WAIT_USER", True),
+            "claude": ("brief", "claude", "none", "-", "WAIT_USER", True),
+            "done": ("plan", "done", "none", "-", "WAIT_USER", False),
+        }
+        for route, (stage, nxt, gate, payload, expected_state, after_approval) in cases.items():
+            with self.subTest(route=route):
+                self.reset_fixture()
+                state = self.to_missing_result(after_approval=after_approval)
+                turn = state["delivery"]["turn_id"]
+                payload_path = str(self.plan_payload()) if payload is None else payload
+                self.herdr.outputs["codex-main"] = FakeHerdr.block_v2(state["run_id"], turn, stage, nxt, gate, payload_path)
+                self.sup.enqueue_command({"request_id": f"retry-{route}-0001", "action": "retry_routing_result", "run_id": state["run_id"], "turn_id": turn, "actor": "telegram:1"})
+                prompts, reads, waits = self.counters()
+                self.herdr.responses = []  # any prompt would raise inside the fake
+                exit_code = self.sup.worker()
+                after = self.state()
+                self.assertEqual(after["supervisor_state"], expected_state, route)
+                self.assertEqual(len(self.herdr.prompts), prompts, f"{route}: retry worker must not prepare or submit a prompt")
+                self.assertEqual(len(self.herdr.waits), waits, f"{route}: retry worker must not wait on an agent")
+                self.assertEqual(len(self.herdr.reads), reads + 1, f"{route}: exactly one settled transcript read")
+                self.assertEqual(after["prompt_metrics"]["prompts"], 2 if after_approval else 1, route)
+                self.assertIsNone(after["missing_result"], route)
+                result = [e for e in self.events() if e["type"] == "COMMAND_RESULT" and e["data"]["action"] == "retry_routing_result"][-1]["data"]
+                self.assertTrue(result["ok"], result)
+                if route == "human":
+                    self.assertEqual(exit_code, 4)
+                    self.assertEqual(after["pending_gate"]["gate_type"], "plan_approval")
+                elif route == "done":
+                    self.assertEqual(exit_code, 2)
+                    self.assertIn("done is not allowed before a plan approval", after["wait_user_reason"])
+                else:
+                    self.assertEqual(exit_code, 2)
+                    self.assertFalse(after["wait_user_requires_action"], "a recovered handoff waits for a plain /resume")
+                    self.assertEqual(after["active_agent"], route)
+                    self.assertIsNone(after["delivery"])
+                    self.assertIn("/resume delivers that turn", after["wait_user_reason"])
+                    self.assertIn("nothing was sent", result["message"])
+                    # a restart still does not deliver it; an explicit resume does, exactly once
+                    self.assertEqual(self.make_supervisor().worker(), 2)
+                    self.assertEqual(len(self.herdr.prompts), prompts)
+                    self.herdr.responses = [{"v2": ("next", "human", "generic_question", str(self.question_payload()))}]
+                    self.assertEqual(self.sup.resume(), 2)  # the delivered turn ends at a question gate (WAIT_USER)
+                    self.assertEqual(len(self.herdr.prompts), prompts + 1)
+                    self.assertEqual(self.herdr.prompts[-1][0], f"{route}-main")
+                    self.assertEqual(self.state()["pending_gate"]["gate_type"], "generic_question")
+
+    def test_retry_is_bound_and_refuses_unsafe_states(self) -> None:
+        state = self.to_missing_result()
+        for label, overrides in (("wrong run", {"run_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"}), ("wrong turn", {"turn_id": "0bbbbbbb-cccc-4ddd-8eee-ffffffffffff"}), ("no turn", {"turn_id": None})):
+            with self.subTest(label):
+                with self.assertRaises(hs.SupervisorError):
+                    self.retry(**overrides)
+        self.herdr.agents["codex-main"]["agent_status"] = "working"
+        with self.assertRaises(hs.SupervisorError):
+            self.retry()
+        self.herdr.agents["codex-main"]["agent_status"] = "idle"
+        # bridge-side supervisor without Herdr cannot read
+        bridge_side = hs.Supervisor(self.paths, self.config, herdr=None, clock=self.clock.time)
+        with self.assertRaises(hs.SupervisorError):
+            with bridge_side.store.transaction():
+                bridge_side.apply_command(bridge_side.store.read_state(), {"action": "retry_routing_result", "run_id": state["run_id"], "turn_id": state["delivery"]["turn_id"]})
+        self.assertEqual(self.state()["missing_result"]["attempts"], 0)
+        # guidance clears the descriptor; a later retry has nothing to do
+        with self.sup.store.transaction():
+            st = self.sup.store.read_state()
+            self.sup.guide(st, run_id=st["run_id"], actor="cli", note="add the block")
+        self.assertIsNone(self.state()["missing_result"])
+        with self.assertRaises(hs.SupervisorError):
+            self.retry(turn_id=state["delivery"]["turn_id"])
+        self.assertEqual(len(self.herdr.prompts), 1)
+
+    def test_retry_via_inbox_is_idempotent_per_request(self) -> None:
+        state = self.to_missing_result()
+        payload = str(self.plan_payload())
+        self.herdr.outputs["codex-main"] = FakeHerdr.block_v2(state["run_id"], state["delivery"]["turn_id"], "plan", "human", "plan_approval", payload)
+        command = {"request_id": "retry-request-0001", "action": "retry_routing_result", "run_id": state["run_id"], "turn_id": state["delivery"]["turn_id"], "actor": "telegram:1", "chat_id": 9}
+        self.sup.enqueue_command(command)
+        self.assertEqual(self.sup.worker(), 4)
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_PLAN_APPROVAL")
+        self.sup.enqueue_command(command)  # replay of the same request id
+        self.sup.enqueue_command({**command, "request_id": "retry-request-0002"})  # a fresh duplicate
+        self.assertEqual(self.sup.worker(), 4)
+        self.assertEqual(self.event_types().count("PLAN_APPROVAL_REQUIRED"), 1)
+        self.assertEqual(len(self.herdr.prompts), 1)
+        results = [e for e in self.events() if e["type"] == "COMMAND_RESULT" and e["data"]["action"] == "retry_routing_result"]
+        self.assertTrue(results[0]["data"]["ok"])
+        self.assertFalse(results[-1]["data"]["ok"])

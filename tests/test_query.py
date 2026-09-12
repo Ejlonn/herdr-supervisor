@@ -4,16 +4,11 @@ no workflow-agent interruption, at-most-once delivery, no mutation, restart idem
 from __future__ import annotations
 
 import json
-import os
 import re
-import stat
-import subprocess
-import sys
 from pathlib import Path
 
-from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, NOW, QUERY_SESSION, FakeHerdr, V2Case, hs
-
 import herdr_query as hq  # noqa: E402
+from v2_fixtures import CODEX_SESSION, NOW, QUERY_SESSION, FakeHerdr, V2Case, hs
 
 
 class ClassifierTests(V2Case):

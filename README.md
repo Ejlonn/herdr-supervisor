@@ -25,8 +25,8 @@ It is not another AI agent, an API-model router, a provider-quota bypass, or a t
 ## Requirements
 
 - Linux with Python 3.11 or newer; release validation is performed on Python 3.13
-- Herdr installed user-scoped with its executable at `~/.local/bin/herdr`; the installer checks this before writing anything, and the headless server unit runs that path
-- The Herdr plugin `herdr-agent-quota`: it writes the five-hour, weekly, and context quota snapshots the supervisor reads, and provides the non-LLM `refresh` action used to recheck Codex quota without waking a model
+- Herdr 0.9.0 or newer installed user-scoped with its executable at `~/.local/bin/herdr`; the installer checks this before writing anything, and the headless server unit runs that path. 0.9.0 is the minimum tested CLI contract; `herdr-supervisor doctor` reports the detected version and probes the required commands/options read-only, so a newer version passes only while that contract holds
+- The Herdr plugin [`herdr-agent-quota`](https://github.com/levi-qiao/herdr-agent-quota): it writes the five-hour, weekly, and context quota snapshots the supervisor reads, and provides the non-LLM `refresh` action used to recheck model quota without waking a model
 - Codex and Claude CLIs with persistent sessions managed through Herdr; the optional Codex banked-reset feature additionally uses Codex's supported app-server reset-credit interface, which is separate from the quota plugin
 - User systemd for detached workers and optional services
 - Per feature, optional: outbound HTTPS to `api.telegram.org:443` (Telegram control), `git` (Git recovery assessment), `ssh` and `rsync` (SSH snapshot backups)
@@ -36,7 +36,7 @@ Routine installation does not require root. Keeping user services alive after lo
 ## Install
 
 ```sh
-git clone YOUR_REPOSITORY_URL herdr-supervisor
+git clone https://github.com/Ejlonn/herdr-supervisor.git
 cd herdr-supervisor
 ./install.sh --dry-run
 ./install.sh
@@ -63,12 +63,20 @@ herdr-supervisor run --policy gated_v2 --codex-reset-budget 1 task.md
 herdr-supervisor pause
 herdr-supervisor resume
 herdr-supervisor cancel
+herdr-supervisor done --run-id CURRENT_RUN_UUID --operator-handoff
+herdr-supervisor ask-agent --run-id CURRENT_RUN_UUID "why is a rebuild required?"
 herdr-supervisor logs
 herdr-supervisor doctor
 herdr-supervisor refresh-quota --run-id CURRENT_RUN_UUID
 ```
 
-Telegram supports `/status`, `/task`, `.md`/`.txt` uploads with Start/Cancel confirmation, `/plan`, `/pending`, `/pause`, `/resume`, `/cancel`, `/logs`, `/doctor`, and read-only `/ask`.
+Telegram supports `/status`, `/task`, `.md`/`.txt` uploads with Start/Cancel confirmation, `/plan`, `/pending`, `/pause`, `/resume`, `/cancel`, `/logs`, `/doctor`, read-only `/ask`, and `/ask-agent`.
+
+**Ask agent** and **Request revision** are different actions at every human decision. `Ask agent` (`/ask-agent <question>`, the `Ask agent` button, or `herdr-supervisor ask-agent`) sends one read-only question to the same active native session while the pending plan, question, runtime, or push gate — or an unread-result wait — stays exactly as it is; the verified answer comes back as a short summary plus a Markdown document, and the same decision returns with its own controls. Asking never approves, revises, advances, replays the task, or applies a fix; a change the agent recommends starts only with an explicit revision or a new task. `Request revision` (`/revise`) still voids the current gate or result and requires the agent to produce a replacement routing result. If no verified answer comes back, the supervisor stops in a follow-up wait that offers `Retry reading answer` (once, no prompt), `Return to decision`, and `Request revision`; `herdr-supervisor retry-answer` and `return-to-decision` are the CLI forms.
+
+`herdr-supervisor status` and Telegram `/status` show supervisor submission metrics — how many prompts the supervisor has submitted per provider and how many characters — next to the provider quota and context percentages that come from `herdr-agent-quota`. The metrics are controller counts, not provider tokens. Automatic same-provider routing chains are bounded by `max_consecutive_auto_turns` (default 8): the supervisor stops in an action-required wait before preparing turn limit+1; a cross-provider handoff ends the streak and only an authenticated human continuation (`/revise`, an answer, an approval, a recorded runtime result) resets it. Continuation prompts never repeat the task body.
+
+Two completions exist. **Verified completion** is reached only by the agent route after every required runtime and push gate is satisfied. **Operator handoff** (`/done`, its one-time Done button, or the CLI command with the explicit `--operator-handoff` flag) closes a run whose agent reported completion while only human-owned runtime validation or push approval was missing: you perform those actions yourself. The record and every status message say the remaining actions were handed to the operator and were not verified by Supervisor; `/done` grants no push approval, records no runtime evidence, and never claims a push-ready or published state. It is refused while any gate is pending, an agent is working, delivery is uncertain, quota or reset recovery is active, or the request belongs to another run, user, or chat.
 
 ## Backups
 
@@ -84,6 +92,10 @@ herdr-backup verify
 ```
 
 Enabling the timer is a separate operator action after configuration is confirmed. See [Backup and restore](docs/BACKUP.md).
+
+## Development and CI
+
+`pip install -e ".[dev]"` installs the pinned tools. The CI workflow (`.github/workflows/ci.yml`) runs on Python 3.11 and 3.13: full `unittest` discovery with branch-aware coverage (threshold 80%), Ruff, mypy over every source module, compilation, shell syntax, sdist/wheel build with inventory reconciliation, the extracted sdist's own suite, wheel entry points, an installer dry run, fixture privacy, version consistency, and secret-marker checks. It has read-only permissions and never contacts Herdr, Telegram, or a model provider.
 
 ## Development and release safety
 

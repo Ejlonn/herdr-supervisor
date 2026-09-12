@@ -1,13 +1,21 @@
 """Banked reset authorization, exactly-once state and supported protocol tests. No live redemption."""
 from __future__ import annotations
-import json, tempfile, unittest, sys, os
+
+import json
+import os
+import sys
+import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
+
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 import herdr_codex_reset as hcr
 import herdr_supervisor as hs
-from v2_fixtures import V2Case, NOW
-from test_telegram import TelegramCase, message, callback, OWNER, CHAT
+import herdr_telegram as ht
+from test_telegram import TelegramCase, callback, message
+from v2_fixtures import NOW, V2Case
 
 FP="a"*64
 
@@ -228,6 +236,7 @@ class HelperJournalTests(unittest.TestCase):
             hcr.atomic_json(root/"pending/r1.json",hcr.make_request("inventory",{},"r1"))
             self.assertEqual(hcr.process_once(root,client),0)
             result=json.loads((root/"results/r1.json").read_text()); self.assertTrue(result["ok"]); self.assertEqual(result["inventory"]["availableCount"],2)
+            self.assertEqual(hcr.JournalGateway(root,timeout=.01,sleeper=lambda _:None).inventory("r1").available_count,2)
             hcr.atomic_json(root/"pending/c1.json",hcr.make_request("consume",{"idempotency_key":"stable-key-123456"},"c1"))
             hcr.process_once(root,client); hcr.atomic_json(root/"pending/c1.json",hcr.make_request("consume",{"idempotency_key":"different-key-123"},"c1")); hcr.process_once(root,client)
             self.assertEqual(client.consume_keys,["stable-key-123456"])
@@ -251,6 +260,26 @@ class HelperJournalTests(unittest.TestCase):
             with self.assertRaises(hcr.ResetError):
                 gateway.consume("different-key-123","same")
 
+    def test_telegram_inventory_uses_journal_worker_with_unique_read_requests(self):
+        calls=[]
+        class Gateway:
+            def __init__(self,root,*,timeout,sleeper=None): calls.append(("init",root,timeout))
+            def inventory(self,request_id):
+                calls.append(("inventory",request_id))
+                return hcr.ResetInventory(3,True,FP,NOW)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(ht.hcr,"JournalGateway",Gateway):
+            root=Path(tmp)
+            paths=hs.Paths(config_file=root/"config.json",state_dir=root/"state")
+            config={"codex_reset":{"helper_timeout_seconds":17}}
+            reader=ht.journal_reset_inventory_reader(paths,config)
+            self.assertEqual(reader().available_count,3)
+            self.assertEqual(reader().available_count,3)
+        self.assertEqual(calls[0],("init",paths.codex_reset_dir,17.0))
+        request_ids=[item[1] for item in calls[1:]]
+        self.assertEqual(len(request_ids),2)
+        self.assertNotEqual(request_ids[0],request_ids[1])
+        self.assertTrue(all(item.startswith("telegram-inventory-") for item in request_ids))
+
 class TelegramAuthorizationTests(TelegramCase):
     def enabled_bridge(self,count=3,account=FP):
         self.bridge.reset_inventory_reader=lambda:hcr.ResetInventory(count,True,account,self.clock.current)
@@ -261,7 +290,7 @@ class TelegramAuthorizationTests(TelegramCase):
         bridge=self.enabled_bridge(3)
         result=bridge.handle_update(message(501,"/task important task")); self.assertEqual(result["result"],"reset_budget_required")
         self.assertEqual(self.pending_inbox(),[]); self.assertIn("Banked resets available: 3",self.texts()[-1]); self.assertIn("weekly",self.texts()[-1])
-        self.assertIn("Start task · 0 resets",{b["text"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row})
+        self.assertIn("Start · 0",{b["text"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row})
         token=self.budget_tokens()[2]
         started=bridge.handle_update(callback(502,token)); self.assertEqual(started["result"],"enqueued")
         command=self.pending_inbox()[0]; self.assertEqual(command["codex_reset_authorization"]["budget"],2)
@@ -288,8 +317,8 @@ class TelegramAuthorizationTests(TelegramCase):
         card=self.api.sent[-1]
         self.assertIn("Banked resets available: unavailable",card["text"])
         buttons={b["text"]:b["callback_data"] for row in card["reply_markup"]["inline_keyboard"] for b in row}
-        self.assertEqual(set(buttons),{"Start task · 0 resets","Cancel"})
-        started=self.bridge.handle_update(callback(523,buttons["Start task · 0 resets"]))
+        self.assertEqual(set(buttons),{"Start · 0","Cancel"})
+        started=self.bridge.handle_update(callback(523,buttons["Start · 0"]))
         self.assertEqual(started["result"],"enqueued")
         self.assertEqual(self.pending_inbox()[0]["codex_reset_authorization"],{"budget":0,"available_count":0,"account_fingerprint":None})
 
@@ -335,5 +364,47 @@ class TelegramAuthorizationTests(TelegramCase):
         result=self.sup._apply_command_file(command_path)
         self.assertTrue(result["replayed"])
         self.assertEqual(json.loads(pending_path.read_text())["status"],"started")
+
+    def test_reset_card_is_explicitly_a_task_start_action(self):
+        bridge=self.enabled_bridge(2); bridge.handle_update(message(530,"/task start wording"))
+        card=self.api.sent[-1]; text=card["text"]
+        self.assertTrue(text.startswith("Start this task?"), text)
+        self.assertIn("Task to start:\nstart wording\n", text, "the typed task is in the message body")
+        self.assertLess(text.index("Task to start:"), text.index("Banked resets available"), "task before reset policy")
+        self.assertIn("starts this task now as ONE gated Codex run", text)
+        self.assertIn("(0 = none, the default)", text)
+        self.assertIn("Full Reset", text)
+        self.assertLess(text.count("\n"), 14, "warning stays concise")
+        rows=card["reply_markup"]["inline_keyboard"]
+        self.assertEqual([[b["text"] for b in row] for row in rows], [["Start · 0","Start · 1"],["Start · 2"],["Cancel"]], "two choices per row, then a full-width Cancel")
+        buttons={b["text"]:b["callback_data"] for row in rows for b in row}
+        # binding checks are unchanged: another actor and a stale inventory are refused, zero starts once
+        self.assertIn("rejected",bridge.handle_update(callback(531,buttons["Start · 0"],user=999)))
+        self.assertEqual(bridge.handle_update(callback(532,buttons["Start · 0"]))["result"],"enqueued")
+        self.assertEqual(self.pending_inbox()[0]["codex_reset_authorization"]["budget"],0)
+        self.assertIn("rejected",bridge.handle_update(callback(533,buttons["Start · 2"]))); self.assertEqual(len(self.pending_inbox()),1)
+
+    def test_start_card_layout_across_inventory_sizes_and_long_text(self):
+        for count, expected_rows in ((0,[["Start · 0"],["Cancel"]]),(1,[["Start · 0","Start · 1"],["Cancel"]]),(3,[["Start · 0","Start · 1"],["Start · 2","Start · 3"],["Cancel"]]),
+                                     (8,[["Start · 0","Start · 1"],["Start · 2","Start · 3"],["Start · 4","Start · 5"],["Start · 6","Start · 7"],["Start · 8"],["Cancel"]]),
+                                     (11,[["Start · 0","Start · 1"],["Start · 2","Start · 3"],["Start · 4","Start · 5"],["Start · 6","Start · 7"],["Start · 8"],["Cancel"]])):
+            with self.subTest(count=count):
+                bridge=self.enabled_bridge(count); bridge.handle_update(message(600+count,f"/task size {count}"))
+                card=self.api.sent[-1]
+                self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], expected_rows)
+                self.assertTrue(all(len(row)<=2 for row in card["reply_markup"]["inline_keyboard"][:-1]))
+                self.assertIn(f"Banked resets available: {count}", card["text"])
+                self.assertEqual("/reset-budget N" in card["text"], count>8)
+                self.assertEqual(json.loads((self.tg_paths.interactions_dir/f"{card['reply_markup']['inline_keyboard'][0][0]['callback_data']}.json").read_text())["budget"],0)
+        # a long typed task is chunked by the normal sender; the keyboard rides only on the final chunk and the
+        # callback records never carry the task text
+        long_task = "L" * 3900  # within max_task_chars; the card body exceeds one Telegram message
+        self.api.sent.clear()
+        bridge=self.enabled_bridge(1); bridge.handle_update(message(700,"/task "+long_task))
+        cards=[m for m in self.api.sent if "Start this task?" in m["text"] or long_task[:100] in m["text"]]
+        self.assertGreaterEqual(len(cards),2)
+        self.assertIsNone(cards[0]["reply_markup"]); self.assertIsNotNone(cards[-1]["reply_markup"])
+        for record_path in self.tg_paths.interactions_dir.glob("*.json"):
+            self.assertNotIn(long_task[:64], record_path.read_text())
 
 if __name__=="__main__": unittest.main()
