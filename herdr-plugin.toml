@@ -1,0 +1,30 @@
+id = "ejlonn.herdr-supervisor"
+name = "Herdr Supervisor"
+version = "0.3.0-beta.1"
+min_herdr_version = "0.9.0"
+description = "Human-in-the-loop workflow supervision and Telegram control for Codex and Claude sessions"
+platforms = ["linux"]
+
+[[actions]]
+id = "setup"
+title = "Install or update Supervisor files"
+contexts = ["workspace"]
+command = ["sh", "install.sh"]
+
+[[actions]]
+id = "status"
+title = "Show Supervisor status"
+contexts = ["workspace"]
+command = ["herdr-supervisor", "status"]
+
+[[actions]]
+id = "doctor"
+title = "Check Supervisor installation"
+contexts = ["workspace"]
+command = ["herdr-supervisor", "doctor"]
+
+[[actions]]
+id = "uninstall"
+title = "Uninstall Supervisor program files"
+contexts = ["workspace"]
+command = ["sh", "uninstall.sh"]

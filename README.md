@@ -39,6 +39,21 @@ This beta has so far been developed and tested with Codex and Claude in one Herd
 
 ## Install
 
+From the Herdr marketplace:
+
+```sh
+herdr plugin install Ejlonn/herdr-supervisor
+herdr plugin action invoke ejlonn.herdr-supervisor.setup
+herdr plugin log list --plugin ejlonn.herdr-supervisor
+herdr-supervisor doctor
+```
+
+The first command registers the plugin and its actions. The explicit, asynchronous `setup` action then runs the same reviewed, user-scoped installer described below; check its command log before running `doctor`. It copies files and installs disabled unit definitions, but does not enable, start, reload, or restart services. After a marketplace update, invoke `setup` again to update the installed Supervisor files.
+
+To remove a marketplace installation, first invoke `ejlonn.herdr-supervisor.uninstall` so the guarded uninstaller can verify that services are inactive and preserve configuration and state; then run `herdr plugin uninstall ejlonn.herdr-supervisor` to unregister the plugin checkout.
+
+From a source checkout:
+
 ```sh
 git clone https://github.com/Ejlonn/herdr-supervisor.git
 cd herdr-supervisor

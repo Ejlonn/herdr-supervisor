@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -49,7 +50,7 @@ class DistributionTests(unittest.TestCase):
 
     def test_source_layout_and_release_metadata(self) -> None:
         for path in (
-            "README.md", "LICENSE", "VERSION", "MANIFEST.txt", "pyproject.toml", "install.sh", "uninstall.sh",
+            "README.md", "LICENSE", "VERSION", "MANIFEST.txt", "herdr-plugin.toml", "pyproject.toml", "install.sh", "uninstall.sh",
             "config/supervisor.example.json", "config/telegram.example.json", "config/backup.example.json",
             "docs/ARCHITECTURE.md", "docs/INSTALL.md", "docs/TELEGRAM.md", "docs/BACKUP.md",
             "docs/SECURITY.md", "docs/RECOVERY.md", "docs/RELEASE.md",
@@ -65,6 +66,26 @@ class DistributionTests(unittest.TestCase):
         self.assertNotIn("commercial license", metadata.lower())
         for phrase in ("human-in-the-loop", "not an official Herdr", "native session", "Telegram", "Backups", "Uninstall"):
             self.assertIn(phrase, readme)
+
+    def test_herdr_plugin_manifest_is_safe_and_release_consistent(self) -> None:
+        manifest = tomllib.loads((ROOT / "herdr-plugin.toml").read_text())
+        self.assertEqual(manifest["id"], "ejlonn.herdr-supervisor")
+        self.assertEqual(manifest["name"], "Herdr Supervisor")
+        self.assertEqual(manifest["version"], (ROOT / "VERSION").read_text().strip())
+        self.assertEqual(manifest["min_herdr_version"], "0.9.0")
+        self.assertEqual(manifest["platforms"], ["linux"])
+        self.assertNotIn("build", manifest, "marketplace install must not mutate the user's home")
+        self.assertNotIn("startup", manifest, "installing the plugin must not start Supervisor")
+        self.assertIn("herdr-plugin.toml", (ROOT / "MANIFEST.in").read_text())
+        actions = {action["id"]: action for action in manifest["actions"]}
+        self.assertEqual(actions["setup"]["command"], ["sh", "install.sh"])
+        self.assertEqual(actions["status"]["command"], ["herdr-supervisor", "status"])
+        self.assertEqual(actions["doctor"]["command"], ["herdr-supervisor", "doctor"])
+        self.assertEqual(actions["uninstall"]["command"], ["sh", "uninstall.sh"])
+        self.assertTrue(all(action["contexts"] == ["workspace"] for action in actions.values()))
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("herdr plugin install Ejlonn/herdr-supervisor", readme)
+        self.assertIn("herdr plugin action invoke ejlonn.herdr-supervisor.setup", readme)
 
     def test_examples_are_unconfigured_and_contain_no_credentials(self) -> None:
         supervisor = json.loads((ROOT / "config/supervisor.example.json").read_text())
