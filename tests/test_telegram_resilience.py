@@ -111,7 +111,7 @@ class ResilienceTests(TelegramCase):
     def test_get_me_startup_retries_without_new_process(self):
         api = FakeApi()
         api.fail['getMe'] = [tg.TelegramError('DNS_FAILURE', 'private'), None]
-        with patch.object(ht, 'load_telegram_config', return_value=self.tg_config), patch.object(ht.hs, 'load_config', return_value=self.config), patch.object(ht.time, 'sleep') as sleep, redirect_stderr(io.StringIO()) as err:
+        with patch.object(ht, 'load_telegram_config', return_value=self.tg_config), patch.object(ht.hs, 'load_config', return_value=self.config), patch.object(ht.hs, 'resolve_herdr_bin', return_value='fixture-herdr'), patch.object(ht.time, 'sleep') as sleep, redirect_stderr(io.StringIO()) as err:
             bridge = ht.build_bridge(self.tg_paths, api=api)
         self.assertIs(bridge.api, api)
         sleep.assert_called_once_with(1.0)
