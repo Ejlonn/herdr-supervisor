@@ -27,6 +27,7 @@ from herdr_core import (
     resolve_herdr_bin,
     valid_pane_id,
 )
+from herdr_helpers import HelperManager
 from herdr_runtime import Supervisor
 from herdr_validation import StateStore, load_task_file, register_query_provider
 
@@ -218,7 +219,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="start a new supervised task (foreground worker)")
     run.add_argument("--start", choices=PROVIDERS, default="codex", help="entry agent (default: codex)")
-    run.add_argument("--policy", choices=WORKFLOW_POLICIES, default="v1", help="v1 (default) or gated_v2 human-gate workflow")
+    run.add_argument("--policy", choices=WORKFLOW_POLICIES, default=None,
+                     help="supervised_v2 (default): general workflow, planning optional; gated_v2: strict Codex-plan/Claude-implementation workflow; v1: legacy (not recommended for new tasks)")
     run.add_argument("--codex-reset-budget", type=int, default=0, help="explicit per-run automatic Codex banked-reset budget (default: 0)")
     run.add_argument("--session-policy", choices=("preserve", "fresh-codex", "fresh-claude", "fresh-all"), default="preserve", help="new-task session policy (default: preserve)")
     run.add_argument("--codex-model-profile", default="default", help="configured Codex launch profile (fresh Codex only)")
@@ -226,6 +228,29 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task", help="task text or path to a task file")
     status = sub.add_parser("status", help="show task, agents, quota, and context state")
     status.add_argument("--json", action="store_true")
+    catalog = sub.add_parser("sessions", help="read-only live session and native-child catalog")
+    catalog.add_argument("--json", action="store_true")
+    catalog.add_argument("--refresh-native", action="store_true", help="bounded opt-in refresh of registered native files")
+    helpers = sub.add_parser("helper", help="explicit bounded read-only helper pane jobs")
+    commands = helpers.add_subparsers(dest="helper_command", required=True)
+    commands.add_parser("list")
+    commands.add_parser("status")
+    register = commands.add_parser("register")
+    register.add_argument("name")
+    register.add_argument("--pane", required=True)
+    register.add_argument("--model", required=True)
+    register.add_argument("--cwd", required=True)
+    register.add_argument("--apply", action="store_true")
+    register.add_argument("--session-id", help="exact native identity from preview, required with --apply")
+    dispatch = commands.add_parser("dispatch")
+    dispatch.add_argument("name")
+    dispatch.add_argument("--instructions", required=True)
+    dispatch.add_argument("--deadline-seconds", type=int, default=300)
+    for action in ("collect", "cancel"):
+        helper_action = commands.add_parser(action)
+        helper_action.add_argument("job_id")
+        if action == "cancel":
+            helper_action.add_argument("--abandon", action="store_true", help="release the slot and quarantine the worker without sending input")
     sub.add_parser("pause", help="pause the supervisor at its next safe checkpoint")
     sub.add_parser("resume", help="resume the persisted task in the same native sessions (foreground worker)")
     sub.add_parser("cancel", help="stop supervising; native agent sessions and history are preserved")
@@ -248,7 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("runtime-pass", "runtime-fail"):
         cmd = sub.add_parser(name, help=f"submit runtime validation {name.split('-')[1].upper()} evidence for the exact candidate SHA: a PROPOSAL awaiting operator confirmation (default), or the canonical record only under an approved automatic_agent plan")
         cmd.add_argument("--run-id", required=True)
-        cmd.add_argument("--candidate-sha", required=True)
+        candidate_args = cmd.add_mutually_exclusive_group(required=True)
+        candidate_args.add_argument("--candidate-sha")
+        candidate_args.add_argument("--candidate-digest", help="SHA-256 for a manifest runtime candidate")
         cmd.add_argument("--environment", required=True)
         cmd.add_argument("--evidence-file", required=True)
         cmd.add_argument("--actor", default="cli")
@@ -274,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     done.add_argument("--note", default=None, help=f"optional bounded note (max {MAX_HANDOFF_NOTE_CHARS} chars)")
     done.add_argument("--actor", default="cli")
     sub.add_parser("worker", help="detached worker entry point: consume the command inbox, reconcile, continue safe states")
+    preflight = sub.add_parser("gate-preflight", help="validate an approval request against current state without creating a gate or writing state")
+    preflight.add_argument("--gate-type", required=True, choices=("plan_approval", "generic_question", "runtime_validation", "push_approval"))
+    preflight.add_argument("--payload", required=True)
     refresh = sub.add_parser("refresh-quota", help="run-bound, rate-limited request for the waiting worker to recheck quota (non-LLM; never resends)")
     refresh.add_argument("--run-id", required=True)
     register_query = sub.add_parser("register-query", help="bind an existing idle read-only query agent to its exact native session")
@@ -306,6 +336,30 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(paths.config_file)
         herdr = HerdrCli(resolve_herdr_bin(config.get("herdr_bin")))
         supervisor = Supervisor(paths, config, herdr)
+        if args.command == "sessions":
+            print(json.dumps(supervisor.sessions_report(refresh=args.refresh_native), indent=2, sort_keys=True))
+            return 0
+        if args.command == "helper":
+            manager = HelperManager(supervisor)
+            if args.helper_command in ("list", "status"):
+                result = manager.view()
+            elif args.helper_command == "register":
+                result = manager.register(args.name, args.pane, args.model, args.cwd, apply=args.apply, expected_session=args.session_id)
+            elif args.helper_command == "dispatch":
+                result = manager.dispatch(args.name, Path(args.instructions), deadline_seconds=args.deadline_seconds)
+            elif args.helper_command == "collect":
+                result = manager.collect(args.job_id)
+            else:
+                result = manager.cancel(args.job_id, abandon=args.abandon)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if args.command == "gate-preflight":
+            state = supervisor.store.read_state()
+            if state is None:
+                raise SupervisorError("no task exists for gate preflight")
+            result = supervisor.gate_preflight(state, args.gate_type, args.payload)
+            print(json.dumps(result, indent=2))
+            return 0 if result["ok"] else 2
         if args.command == "run":
             task, reference, char_limit = args.task, None, None
             if Path(task).is_file():
@@ -320,7 +374,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise SupervisorError("requested Codex reset budget exceeds current available inventory")
                 authorization = {"budget": args.codex_reset_budget, "available_count": inventory.available_count,
                                  "account_fingerprint": inventory.account_fingerprint}
-            kwargs = {"task_reference": reference, "workflow_policy": args.policy, "char_limit": char_limit}
+            policy: str = args.policy or str(config.get("default_workflow_policy") or "supervised_v2")
+            kwargs: dict[str, Any] = {"task_reference": reference, "workflow_policy": policy, "char_limit": char_limit}
             if args.session_policy != "preserve" or args.codex_model_profile != "default" or args.claude_model_profile != "default":
                 kwargs["session_selection"] = {"policy": args.session_policy, "profiles": {"codex": args.codex_model_profile, "claude": args.claude_model_profile}}
             if authorization is not None:
@@ -399,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in ("runtime-pass", "runtime-fail"):
             with supervisor.store.transaction():
                 state = supervisor.store.read_state()
-                result = supervisor.record_runtime_evidence(state, run_id=args.run_id, candidate_sha=args.candidate_sha, environment=args.environment, evidence_file=args.evidence_file, result="PASS" if args.command == "runtime-pass" else "FAIL", actor=args.actor)
+                result = supervisor.record_runtime_evidence(state, run_id=args.run_id, candidate_sha=args.candidate_sha or args.candidate_digest, environment=args.environment, evidence_file=args.evidence_file, result="PASS" if args.command == "runtime-pass" else "FAIL", actor=args.actor)
             print(result["message"])
             if result.get("proposed"):
                 print(f"next: herdr-supervisor runtime-confirm --run-id {args.run_id} --gate-id {result['gate_id']} --evidence-sha256 {result.get('evidence_sha256')} --decision {'PASS' if args.command == 'runtime-pass' else 'FAIL'}   (operator only)")

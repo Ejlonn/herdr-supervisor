@@ -55,7 +55,45 @@ GATE_STATE_FOR = {
     "push_approval": "WAIT_PUSH_APPROVAL",
 }
 
-WORKFLOW_POLICIES = ("v1", "gated_v2")
+WORKFLOW_POLICIES = ("v1", "gated_v2", "supervised_v2")
+
+# Policies that use the V2 typed-gate protocol and carry a resolved workflow_contract. `v1` predates the
+# V2 protocol entirely and is retained only for already-migrated historical state; it is deliberately
+# excluded here and untouched by the contract machinery below.
+V2_WORKFLOW_POLICIES = ("gated_v2", "supervised_v2")
+
+# Immutable, resolved per-policy contract: what a run may and must do, decided once at task start and
+# never reinterpreted from mutable configuration afterward (see herdr_validation.resolve_workflow_contract).
+# `gated_v2` is Prospera's strict Codex-plans/Claude-implements procedure; every field below matches its
+# current hardcoded behavior exactly. `supervised_v2` is the general policy: planning is optional, either
+# provider may start or receive a handoff, and a voluntary plan gate accepts any safe Markdown artifact
+# below the review root instead of the literal CODEX_PLAN.md filename. Both share the same protocol-safety
+# machinery (typed gates, loop/auto-turn limits, delivery-certainty handling); only workflow procedure
+# differs. A typed gate is mandatory for every HERDR_NEXT=human route under every V2 policy without
+# exception — this is universal protocol safety, not a contract field: an untyped human wait is never
+# permitted, so no policy may opt out of it (see route_v2 in herdr_workflow.py).
+WORKFLOW_CONTRACTS: dict[str, dict[str, Any]] = {
+    "gated_v2": {
+        "workflow_contract_version": 1,
+        "policy": "gated_v2",
+        "protocol_version": 2,
+        "plan_approval_required_for_handoff": True,
+        "plan_approval_required_for_done": True,
+        "allowed_start_agents": ["codex"],
+        "plan_gate_restricted_to_agent": "codex",
+        "plan_artifact_name": "CODEX_PLAN.md",
+    },
+    "supervised_v2": {
+        "workflow_contract_version": 1,
+        "policy": "supervised_v2",
+        "protocol_version": 2,
+        "plan_approval_required_for_handoff": False,
+        "plan_approval_required_for_done": False,
+        "allowed_start_agents": ["codex", "claude"],
+        "plan_gate_restricted_to_agent": None,
+        "plan_artifact_name": None,
+    },
+}
 
 EVENT_TYPES = (
     "TASK_STARTED", "PLAN_APPROVAL_REQUIRED", "PLAN_APPROVED", "PLAN_REJECTED", "REVISION_REQUESTED",
@@ -137,6 +175,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Reset only by an authenticated human continuation or a cross-provider handoff; never by
     # polling, restart, or resume. A supervisor safety limit, not a provider quota estimate.
     "max_consecutive_auto_turns": 8,
+    # Default workflow policy for new tasks that do not name one explicitly (CLI `--policy`, Telegram task
+    # start). Must be a V2_WORKFLOW_POLICIES member; `v1` cannot be the default going forward. A workspace
+    # (e.g. Prospera's local config) may set this to `gated_v2` to keep its strict procedure as the default
+    # without changing the marketplace plugin's own default.
+    "default_workflow_policy": "supervised_v2",
     "wait_timeout_ms": 10000,
     "read_lines": 400,
     "agents": {
@@ -171,6 +214,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "verification_attempts": 4, "verification_interval_seconds": 2},
     # New-task-only native-session policy. Model profile values are identifiers, never raw argv;
     # the fixed --model argv is constructed only after a read-only local capability probe.
+    "helpers": {"enabled": False},
+    "native_tracking": {"enabled": False, "roots": [], "files": []},
     "session_start": {
         "enabled": True, "direction": "right", "ratio": 0.5,
         "provider_commands": {"codex": "codex", "claude": "claude"},
@@ -474,6 +519,8 @@ def load_config(path: Path) -> dict[str, Any]:
     limit = config.get("max_consecutive_auto_turns")
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise SupervisorError("max_consecutive_auto_turns must be an integer between 1 and 1000")
+    if config.get("default_workflow_policy") not in V2_WORKFLOW_POLICIES:
+        raise SupervisorError(f"default_workflow_policy must be one of {V2_WORKFLOW_POLICIES}")
     if not isinstance(config.get("quota_block_dismiss_keys"), list):
         raise SupervisorError("quota_block_dismiss_keys must be a list")
     patterns = config.get("quota_screen_patterns")
@@ -493,6 +540,16 @@ def load_config(path: Path) -> dict[str, Any]:
         if value is None or value <= 0:
             raise SupervisorError(f"codex_reset.{key} must be positive")
     validate_session_start_config(config)
+    for section in ("helpers", "native_tracking"):
+        value = config.get(section)
+        if not isinstance(value, dict) or type(value.get("enabled")) is not bool:
+            raise SupervisorError(f"{section}.enabled must be boolean")
+    tracking = config["native_tracking"]
+    if not isinstance(tracking.get("roots"), list) or len(tracking["roots"]) > 8 or any(not isinstance(p, str) or not Path(p).is_absolute() for p in tracking["roots"]):
+        raise SupervisorError("native_tracking.roots must be at most eight absolute paths")
+    if not isinstance(tracking.get("files"), list) or len(tracking["files"]) > 32:
+        raise SupervisorError("native_tracking.files must be at most 32 explicit registrations")
+
     return config
 
 def validate_session_start_config(config: dict[str, Any]) -> None:

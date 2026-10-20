@@ -516,7 +516,10 @@ class StateMigrationAndEventsTests(V2Case):
 
 
 class InboxWorkerRecoveryTests(V2Case):
-    def test_task_command_starts_gated_run_idempotently_and_hostile_text_is_data(self) -> None:
+    def test_task_command_starts_run_idempotently_and_hostile_text_is_data(self) -> None:
+        """No explicit workflow_policy on the inbox command resolves to config's default_workflow_policy
+        (supervised_v2 unless a workspace sets it otherwise, e.g. Prospera's gated_v2); a command that
+        does name a policy gets exactly that policy (see the case below)."""
         hostile = "Fix it; $(rm -rf /) `echo pwned` \n--start claude\x00"
         command = {"request_id": "req-0000000001", "action": "task", "task_text": hostile, "actor": "telegram:1", "chat_id": 5}
         path = self.sup.enqueue_command(command)
@@ -525,7 +528,8 @@ class InboxWorkerRecoveryTests(V2Case):
         results = self.sup.process_inbox()
         self.assertTrue(results[0]["ok"], results)
         state = self.state()
-        self.assertEqual(state["workflow_policy"], "gated_v2")
+        self.assertEqual(state["workflow_policy"], "supervised_v2")
+        self.assertEqual(state["workflow_contract"], hs.resolve_workflow_contract("supervised_v2"))
         self.assertEqual(state["active_agent"], "codex")
         self.assertEqual(state["task_text"], hostile)
         self.assertEqual(self.herdr.prompts, [], "enqueue/process never prompts; the worker does")
@@ -543,6 +547,24 @@ class InboxWorkerRecoveryTests(V2Case):
         self.assertFalse(result["ok"])
         self.assertIn("the supervisor has no task queue", result["message"])
         self.assertEqual(self.event_types()[-1], "COMMAND_RESULT")
+
+    def test_task_command_with_explicit_policy_gets_exactly_that_policy(self) -> None:
+        for policy in ("gated_v2", "supervised_v2"):
+            self.reset_fixture()
+            command = {"request_id": "req-explicit", "action": "task", "task_text": "Add the widget",
+                       "actor": "telegram:1", "chat_id": 5, "workflow_policy": policy}
+            self.sup.enqueue_command(command)
+            results = self.sup.process_inbox()
+            self.assertTrue(results[0]["ok"], results)
+            state = self.state()
+            self.assertEqual(state["workflow_policy"], policy)
+            self.assertEqual(state["workflow_contract"], hs.resolve_workflow_contract(policy))
+        self.reset_fixture()
+        bad = {"request_id": "req-bad-policy", "action": "task", "task_text": "x", "actor": "telegram:1", "chat_id": 5, "workflow_policy": "v1"}
+        self.sup.enqueue_command(bad)
+        result = self.sup.process_inbox()[0]
+        self.assertFalse(result["ok"])
+        self.assertIn("invalid workflow policy", result["message"])
 
     def test_worker_runs_gated_task_from_inbox_and_stops_at_gate(self) -> None:
         self.write_plan()

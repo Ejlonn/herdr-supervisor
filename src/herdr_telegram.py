@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -40,8 +42,16 @@ CONFIG_SCHEMA = 1
 MODES = ("unconfigured", "shadow", "actionable")
 CHUNK = 3800
 DEFAULT_TIMEZONE = "UTC"
-COMMANDS = ("status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "done", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
+COMMANDS = ("sessions", "status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "done", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
 UPLOAD_STATUSES = ("pending_confirmation", "reset_authorization", "start_enqueued", "started", "cancelled", "expired", "failed", "superseded")
+# Compact task-start workflow choice (plan item 4): shown before Start, bound into the pending-task
+# identity, and validated by the same staleness checks as session_selection.
+WORKFLOW_POLICY_CHOICES = (("Supervised", "supervised_v2"), ("Plan approval", "gated_v2"))
+WORKFLOW_POLICY_LABELS = {policy: label for label, policy in WORKFLOW_POLICY_CHOICES}
+# Starting-agent choice: offered only under supervised_v2 (either provider may start); gated_v2 always
+# normalizes to codex, the only agent it permits to start (F4).
+START_AGENT_CHOICES = (("Codex", "codex"), ("Claude", "claude"))
+START_AGENT_LABELS = {agent: label for label, agent in START_AGENT_CHOICES}
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9._ ()\-]")
 INFO_CONTROLS = (("Status", "status"), ("Pause", "pause"), ("Cancel", "cancel"))
 
@@ -246,6 +256,7 @@ class Bridge:
         self.enqueuer = hs.Supervisor(sup_paths, sup_config, herdr=None, clock=clock)
         self.backoff = 0.0
         self.stopped_reason: str | None = None
+        self.health: dict[str, Any] = {"health_version": 1, "phase": "starting", "last_poll_success": None, "last_failure": None, "last_failure_at": None}
         tg_paths.ensure()
 
     def fresh_session_supported(self) -> bool:
@@ -421,9 +432,17 @@ class Bridge:
         hs.atomic_write_json(delivery_path, delivery)
         return True
 
-    def deliver_document_queue(self) -> dict[str, int]:
+    def deliver_document_queue(self, *, limit: int | None = None) -> dict[str, int]:
         counts = {"sent": 0, "pending": 0, "manual_review": 0, "failed": 0}
-        for path in sorted(self.tg_paths.document_deliveries_dir.glob("*.json")):
+        paths = sorted(self.tg_paths.document_deliveries_dir.glob("*.json"))
+        if limit is not None:
+            eligible = []
+            for path in paths:
+                record = hs.load_json(path, label="document delivery")
+                if isinstance(record, dict) and record.get("status") in ("pending", "delivery_uncertain", "sending"):
+                    eligible.append(path)
+            paths = self._fair_batch(eligible, [p.name for p in eligible], limit, "documents")
+        for path in paths:
             delivery = hs.load_json(path, label="document delivery")
             if not isinstance(delivery, dict):
                 counts["failed"] += 1
@@ -548,11 +567,17 @@ class Bridge:
             "/logs – recent events; /doctor – health; /backup – backup health (/backup now requests a run)\n"
             "/ask <question> – read-only. State questions are answered without a model; repository questions use the\n"
             "  an eligible configured read-only query session and may consume that provider's quota. /ask never starts or changes a task.\n"
+            "/sessions – observed sessions, identity problems and native/helper children (read-only)\n"
             "/ask-agent <question> – one read-only question to the active agent while the pending gate or unread-result wait stays exactly as it is;\n"
             "  the answer comes back here and the same decision returns. It never approves, revises, or implements anything.\n"
             "/revise <note> – revision for the pending gate (voids it; the agent must produce a replacement); /answer <text> – answer a pending question\n"
             f"mode: {self.config.get('mode')}"
         )
+
+    def cmd_sessions(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        report = self.status_reader()
+        self.send_rendered(chat_id, hp.render_sessions(report.get("session_catalog") or {"error": "Session catalog unavailable in the installed worker; update both components."}))
+        return {"result": "sessions"}
 
     def cmd_status(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         status = self.status_reader()
@@ -631,24 +656,41 @@ class Bridge:
             # human task-start decision. Stage an explicit zero-budget card and preserve the task.
             inventory_count, available, fingerprint = None, 0, None
             inventory_error = type(error).__name__
+        default_policy = self.sup_config.get("default_workflow_policy") or "supervised_v2"
+        if default_policy not in WORKFLOW_POLICY_LABELS:
+            default_policy = "supervised_v2"
         record = {"schema_version": 2, "pending_id": pending_id, "owner_user_id": user_id, "chat_id": chat_id,
                   "created_at_unix": self.clock(), "expires_at_unix": self.clock() + float(self.config["callback_ttl_seconds"]),
                   "available_count": available, "inventory_available_count": inventory_count, "account_fingerprint": fingerprint, "task": task,
                   "inventory_status": "unavailable" if inventory_error else "verified", "inventory_error": inventory_error,
                   "task_sha256": hashlib.sha256(json.dumps(task, sort_keys=True).encode()).hexdigest(), "status": "pending",
-                  "view_revision": 1, "session_selection": {"policy":"preserve","profiles":{"codex":"default","claude":"default"}}}
+                  "view_revision": 1, "session_selection": {"policy":"preserve","profiles":{"codex":"default","claude":"default"}},
+                  "workflow_policy": default_policy, "starting_agent": "codex"}
         path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
         if path.exists():
             raise hs.SupervisorError("pending task identity collision")
         hs.atomic_write_json(path, record)
         pseudo = {"event_id": f"reset-auth:{pending_id}", "run_id": pending_id, "supervisor_state": "PENDING_START"}
+        rows: list[list[dict[str, Any]]] = []
+        for label, policy in WORKFLOW_POLICY_CHOICES:
+            mark = "✓ " if policy == default_policy else ""
+            token = self.new_interaction(action="workflow_policy", event=pseudo, gate=None, chat_id=chat_id,
+                                         extra={"pending_id": pending_id, "policy": policy, "task_sha256": record["task_sha256"], "view_revision": 1})
+            rows.append([{"text": f"{mark}Workflow: {label}", "callback_data": token}])
+        if default_policy == "supervised_v2":
+            for label, agent in START_AGENT_CHOICES:
+                mark = "✓ " if agent == "codex" else ""
+                token = self.new_interaction(action="starting_agent", event=pseudo, gate=None, chat_id=chat_id,
+                                             extra={"pending_id": pending_id, "agent": agent, "task_sha256": record["task_sha256"], "view_revision": 1})
+                rows.append([{"text": f"{mark}Start with: {label}", "callback_data": token}])
         buttons=[]
         for budget in range(min(available,8)+1):
             token=self.new_interaction(action="reset_budget",event=pseudo,gate=None,chat_id=chat_id,
                 extra={"pending_id":pending_id,"budget":budget,"available_count":available,"account_fingerprint":fingerprint,
-                       "task_sha256":record["task_sha256"],"view_revision":1,"session_selection":record["session_selection"]})
+                       "task_sha256":record["task_sha256"],"view_revision":1,"session_selection":record["session_selection"],
+                       "workflow_policy":default_policy,"starting_agent":"codex"})
             buttons.append({"text":f"Start · {budget}","callback_data":token})
-        rows=[buttons[i:i+2] for i in range(0,len(buttons),2)]
+        rows.extend(buttons[i:i+2] for i in range(0,len(buttons),2))
         choices=[("Preserve sessions (default)","preserve")]
         for label,policy in (("Fresh Codex","fresh-codex"),("Fresh Claude + Codex","fresh-all")):
             if self.fresh_policy_available(policy):
@@ -665,14 +707,29 @@ class Bridge:
         identity_note="" if fingerprint else "\nAutomatic redemption is unavailable because the account identity could not be verified; choose 0."
         mode_note="\n\nSHADOW: selecting a budget will not start a task." if self.config.get("mode") != "actionable" else ""
         shown_count=str(inventory_count) if inventory_count is not None else "unavailable"
-        self.safe_send(chat_id,f"Start this task?\n\nTask to start:\n{self._task_preview(task)}\n\nTapping Start · N starts this task now as ONE gated Codex run using the current sessions; N is the maximum automatic banked-reset budget (0 = none, the default). Or choose a fresh-session option below, then review a final Start task card. Existing sessions are preserved.\nBanked resets available: {shown_count}\n{consequence}{identity_note}{suffix}{mode_note}",reply_markup={"inline_keyboard":rows})
+        workflow_note=f"Workflow: {WORKFLOW_POLICY_LABELS[default_policy]} (tap Workflow above to change before Start)."
+        start_note=" Start agent: Codex (tap Start with above to change before Start)." if default_policy=="supervised_v2" else " Start agent: Codex (gated_v2 always starts with Codex)."
+        self.safe_send(chat_id,f"Start this task?\n\nTask to start:\n{self._task_preview(task)}\n\n{workflow_note}{start_note}\n\nTapping Start · N starts this task now as ONE run using the current sessions; N is the maximum automatic banked-reset budget (0 = none, the default). Or choose a fresh-session option below, then review a final Start task card. Existing sessions are preserved.\nBanked resets available: {shown_count}\n{consequence}{identity_note}{suffix}{mode_note}",reply_markup={"inline_keyboard":rows})
         return {"result":"reset_budget_required","pending_id":pending_id,"available":inventory_count,"authorizable":available}
 
     def _send_start_confirmation(self, chat_id: int, record: dict[str, Any]) -> None:
         pending_id, revision = record["pending_id"], record["view_revision"]
         selection = record["session_selection"]
+        workflow_policy = record.get("workflow_policy") or "supervised_v2"
+        starting_agent = record.get("starting_agent") or "codex"
         pseudo = {"event_id":f"reset-auth:{pending_id}","run_id":pending_id,"supervisor_state":"PENDING_START"}
-        rows=[]
+        rows: list[list[dict[str, Any]]] = []
+        for label, policy in WORKFLOW_POLICY_CHOICES:
+            mark = "✓ " if policy == workflow_policy else ""
+            token = self.new_interaction(action="workflow_policy", event=pseudo, gate=None, chat_id=chat_id,
+                                         extra={"pending_id": pending_id, "policy": policy, "task_sha256": record["task_sha256"], "view_revision": revision})
+            rows.append([{"text": f"{mark}Workflow: {label}", "callback_data": token}])
+        if workflow_policy == "supervised_v2":
+            for label, agent in START_AGENT_CHOICES:
+                mark = "✓ " if agent == starting_agent else ""
+                token = self.new_interaction(action="starting_agent", event=pseudo, gate=None, chat_id=chat_id,
+                                             extra={"pending_id": pending_id, "agent": agent, "task_sha256": record["task_sha256"], "view_revision": revision})
+                rows.append([{"text": f"{mark}Start with: {label}", "callback_data": token}])
         fresh = {"fresh-codex":{"codex"},"fresh-claude":{"claude"},"fresh-all":{"codex","claude"}}.get(selection["policy"],set())
         for provider in sorted(fresh):
             for profile_id, profile in self.sup_config["session_start"]["model_profiles"][provider].items():
@@ -686,7 +743,8 @@ class Bridge:
         for budget in range(min(int(record["available_count"]),8)+1):
             token=self.new_interaction(action="reset_budget",event=pseudo,gate=None,chat_id=chat_id,
                 extra={"pending_id":pending_id,"budget":budget,"available_count":record["available_count"],"account_fingerprint":record.get("account_fingerprint"),
-                       "task_sha256":record["task_sha256"],"view_revision":revision,"session_selection":selection})
+                       "task_sha256":record["task_sha256"],"view_revision":revision,"session_selection":selection,"workflow_policy":workflow_policy,
+                       "starting_agent":starting_agent})
             buttons.append({"text":f"Start task · reset budget {budget}","callback_data":token})
         rows.extend(buttons[i:i+1] for i in range(0,len(buttons),1))
         cancel=self.new_interaction(action="reset_budget_cancel",event=pseudo,gate=None,chat_id=chat_id,
@@ -696,7 +754,9 @@ class Bridge:
         identity_note="" if record.get("account_fingerprint") else "\nAutomatic reset redemption is unavailable; reset budget must remain 0."
         suffix="\nUse /reset-budget N for a larger authorized value." if int(record["available_count"])>8 else ""
         profiles=", ".join(f"{p}: {selection['profiles'][p]}" for p in sorted(fresh)) or "current models"
-        self.safe_send(chat_id,f"Ready to start this task\n\nTask:\n{self._task_preview(record['task'])}\n\nSessions: {selection['policy']}\nModels: {profiles}\nExisting sessions stay preserved; each fresh session uses provider quota only when first prompted.\nBanked Codex resets available: {shown if shown is not None else 'unavailable'}\nA Full Reset can refresh both 5-hour and weekly windows and may change the weekly reset date.{identity_note}{suffix}\n\nTap one Start task button to create the run.",reply_markup={"inline_keyboard":rows})
+        workflow_label = WORKFLOW_POLICY_LABELS.get(workflow_policy, workflow_policy)
+        start_label = START_AGENT_LABELS.get(starting_agent, starting_agent)
+        self.safe_send(chat_id,f"Ready to start this task\n\nTask:\n{self._task_preview(record['task'])}\n\nWorkflow: {workflow_label}\nStart agent: {start_label}\nSessions: {selection['policy']}\nModels: {profiles}\nExisting sessions stay preserved; each fresh session uses provider quota only when first prompted.\nBanked Codex resets available: {shown if shown is not None else 'unavailable'}\nA Full Reset can refresh both 5-hour and weekly windows and may change the weekly reset date.{identity_note}{suffix}\n\nTap one Start task button to create the run.",reply_markup={"inline_keyboard":rows})
 
     def _task_preview(self, task: dict[str, Any]) -> str:
         """Body text for the start card: the typed task itself, or the already-validated upload name and
@@ -726,8 +786,15 @@ class Bridge:
         if record.get("status")!="pending" or record.get("owner_user_id")!=user_id or record.get("chat_id")!=chat_id or self.clock()>float(record.get("expires_at_unix",0)):
             if callback_id:self._ack(callback_id,"This reset authorization is no longer valid.")
             return {"rejected":"stale_pending_start"}
+        resolved_policy = record.get("workflow_policy") or (self.sup_config.get("default_workflow_policy") or "supervised_v2")
+        # F4: gated_v2 always normalizes to codex here too, independent of whatever the record's
+        # starting_agent field says (defense in depth beyond the callback-time normalization).
+        resolved_starting_agent = record.get("starting_agent") or "codex"
+        if resolved_policy != "supervised_v2":
+            resolved_starting_agent = "codex"
         if interaction and (interaction[1].get("task_sha256")!=record.get("task_sha256") or interaction[1].get("pending_id")!=record.get("pending_id")
-                            or interaction[1].get("view_revision")!=record.get("view_revision") or interaction[1].get("session_selection")!=record.get("session_selection")):
+                            or interaction[1].get("view_revision")!=record.get("view_revision") or interaction[1].get("session_selection")!=record.get("session_selection")
+                            or interaction[1].get("workflow_policy")!=record.get("workflow_policy") or interaction[1].get("starting_agent")!=resolved_starting_agent):
             if callback_id:self._ack(callback_id,"Task authorization binding changed.")
             return {"rejected":"task_binding_changed"}
         if isinstance(budget,bool) or not isinstance(budget,int) or budget<0 or budget>int(record.get("available_count",0)):
@@ -752,6 +819,7 @@ class Bridge:
                  "pending_start_id":record["pending_id"],"pending_task_sha256":record["task_sha256"],
                  "codex_reset_authorization":{"budget":budget,"available_count":record["available_count"],"account_fingerprint":fingerprint},
                  "session_selection":record["session_selection"],
+                 "workflow_policy":resolved_policy,"starting_agent":resolved_starting_agent,
                  "actor":f"telegram:{user_id}","chat_id":chat_id,"created_at":hs.iso_utc(self.clock())}
         if self.config.get("mode")!="actionable":
             if callback_id:self._ack(callback_id,"SHADOW: task not started.")
@@ -1092,7 +1160,7 @@ class Bridge:
             self._ack(callback_id, problem)
             return {"rejected": problem}
         action = record["action"]
-        if action in ("session_policy", "session_profile"):
+        if action in ("session_policy", "session_profile", "workflow_policy", "starting_agent"):
             pending_id = record.get("pending_id")
             path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
             if not isinstance(pending_id, str) or not path.exists():
@@ -1101,6 +1169,31 @@ class Bridge:
             if (pending.get("status")!="pending" or pending.get("task_sha256")!=record.get("task_sha256")
                     or pending.get("view_revision")!=record.get("view_revision")):
                 self._ack(callback_id,"This task choice is stale; use the newest card."); return {"rejected":"stale_pending_start"}
+            if action == "workflow_policy":
+                policy = record.get("policy")
+                if policy not in WORKFLOW_POLICY_LABELS:
+                    self._ack(callback_id,"Unsupported workflow choice."); return {"rejected":"invalid_workflow_policy"}
+                update = {"workflow_policy":policy,"view_revision":int(pending["view_revision"])+1}
+                if policy != "supervised_v2":
+                    # F4: gated_v2 always normalizes to codex; a Claude start choice cannot survive a
+                    # switch away from supervised_v2, so no card can silently offer a Claude start under it.
+                    update["starting_agent"] = "codex"
+                pending.update(update)
+                hs.atomic_write_json(path,pending); self._consume(record_path,record)
+                self._ack(callback_id,"Choice recorded; review the final Start task card.")
+                self._send_start_confirmation(chat_id,pending)
+                return {"callback":action,"result":"selection_updated"}
+            if action == "starting_agent":
+                agent = record.get("agent")
+                if pending.get("workflow_policy") != "supervised_v2":
+                    self._ack(callback_id,"gated_v2 always starts with Codex."); return {"rejected":"starting_agent_not_selectable"}
+                if agent not in ("codex","claude"):
+                    self._ack(callback_id,"Unsupported starting agent."); return {"rejected":"invalid_starting_agent"}
+                pending.update({"starting_agent":agent,"view_revision":int(pending["view_revision"])+1})
+                hs.atomic_write_json(path,pending); self._consume(record_path,record)
+                self._ack(callback_id,"Choice recorded; review the final Start task card.")
+                self._send_start_confirmation(chat_id,pending)
+                return {"callback":action,"result":"selection_updated"}
             selection=dict(pending["session_selection"]); selection["profiles"]=dict(selection["profiles"])
             if action=="session_policy":
                 policy=record.get("policy")
@@ -1218,13 +1311,13 @@ class Bridge:
             command["run_id"] = record.get("run_id")
         if action == "done":
             command.update(run_id=record.get("run_id"), expected_state=record.get("expected_state"), ready_turn_id=record.get("ready_turn_id"), operator_handoff=True)
-        if action == "retry_routing_result":
+        if action in ("retry_routing_result", "repair_gate"):
             command.update(run_id=record.get("run_id"), turn_id=record.get("turn_id"))
         if action in ("retry_followup_response", "return_to_decision"):
             command.update(run_id=record.get("run_id"), followup_turn_id=record.get("followup_turn_id"))
         if action == "runtime_confirm":
             command.update(run_id=record.get("run_id"), gate_id=record.get("gate_id"), evidence_sha256=record.get("evidence_sha256"), decision=record.get("decision"),
-                           candidate_sha=record.get("candidate_sha"), environment=record.get("environment"))
+                           candidate_sha=record.get("candidate_sha"), candidate_digest=record.get("candidate_digest"), environment=record.get("environment"))
         if action in ("owner_recovery_preview", "owner_recovery_apply"):
             command.update(run_id=record.get("run_id"), recovery_id=record.get("recovery_id"))
             if action == "owner_recovery_apply":
@@ -1278,7 +1371,7 @@ class Bridge:
             if record.get("action") == "retry_followup_response" and (followup.get("reread_attempts") or not followup.get("delivery_uncertain")):
                 return "The one-time reread is not available; return to the decision or request a revision."
             return None
-        if followup is not None and record.get("action") in ("approve", "reject", "answer", "revise", "done", "retry_routing_result", "ask_agent"):
+        if followup is not None and record.get("action") in ("approve", "reject", "answer", "revise", "done", "retry_routing_result", "repair_gate", "ask_agent"):
             return "A question to the agent is in flight; wait for the answer or return to the decision."
         if record.get("action") in ("owner_recovery_preview", "owner_recovery_apply"):
             recovery = state.get("owner_recovery")
@@ -1323,6 +1416,11 @@ class Bridge:
                 return "This retry belongs to an earlier turn; use the newest card."
             if missing.get("attempts"):
                 return "The one-time routing retry was already used; ask the agent, request a revision, or cancel."
+            return None
+        if record.get("action") == "repair_gate":
+            invalid = state.get("invalid_gate") or {}
+            if state.get("supervisor_state") != "WAIT_USER" or invalid.get("turn_id") != record.get("turn_id"):
+                return "This repair request is stale; use the newest card."
             return None
         if record.get("action") in ("pause", "cancel", "status", "keep_waiting", "resume", "refresh_quota", "view_report"):
             if state.get("supervisor_state") in hs.TERMINAL_STATES and record.get("action") not in ("status", "view_report"):
@@ -1530,7 +1628,7 @@ class Bridge:
             "Excerpt:",
             redact(meta.get("excerpt"), limit=420),
             "",
-            "No task has started. Start Task submits this file as ONE gated task: Codex plans first, then the plan needs your approval before any implementation.",
+            "No task has started. Start Task opens the workflow, session and reset-budget choices for this file; confirm Start on that card to begin one task.",
         ])
 
     def _supersede_upload_interactions(self, upload_id: str, *, keep: set[str] | None = None) -> None:
@@ -1693,16 +1791,16 @@ class Bridge:
         elif kind == "runtime_validation":
             lines += [
                 "RUNTIME VALIDATION NOT RUN — push is blocked until the operator records exact-SHA evidence (the agent proposes; Record button or runtime-confirm records).",
-                f"Candidate: {str(fields.get('candidate_sha'))[:12]}  Local gate: {fields.get('local_gate_result')}  Review: {fields.get('codex_review_status')}",
+                f"Candidate: {str(fields.get('candidate_sha') or fields.get('candidate_digest'))[:12]}  Local gate: {fields.get('local_gate_result')}  Review: {fields.get('codex_review_status')}",
                 "Prepared commits: " + redact("; ".join(fields.get("prepared_commits") or []) or "n/a", limit=300),
                 "Services: " + redact(", ".join(fields.get("affected_services") or []) or "none", limit=200),
                 f"Rebuild: {fields.get('rebuild_required')} ({redact(fields.get('rebuild_reason'), limit=120)})",
                 f"Local evidence: {redact(fields.get('local_evidence_summary'), limit=400)}",
-                f"Propose with: herdr-supervisor runtime-pass|runtime-fail --run-id {gate.get('run_id')} --candidate-sha {fields.get('candidate_sha')} --environment TEST --evidence-file <json under the review dir>; the operator records it with the Telegram Record button or runtime-confirm.",
+                f"Propose with: herdr-supervisor runtime-pass|runtime-fail --run-id {gate.get('run_id')} --candidate-{'digest' if fields.get('candidate_digest') else 'sha'} {fields.get('candidate_digest') or fields.get('candidate_sha')} --environment TEST --evidence-file <json under the review dir>; the operator records it with the Telegram Record button or runtime-confirm.",
             ]
         elif kind == "push_approval":
             lines += [
-                f"Candidate: {str(fields.get('candidate_sha'))[:12]}  Local gate: {fields.get('local_gate_result')}  Runtime: {fields.get('runtime_evidence_status') or 'n/a'}",
+                f"Candidate: {str(fields.get('candidate_sha') or fields.get('candidate_digest'))[:12]}  Local gate: {fields.get('local_gate_result')}  Runtime: {fields.get('runtime_evidence_status') or 'n/a'}",
                 "Prepared commits: " + redact("; ".join(fields.get("prepared_commits") or []) or "n/a", limit=300),
                 "Services: " + redact(", ".join(fields.get("affected_services") or []) or "none", limit=200),
                 "Approval authorizes the push stage only; the human performs the push/PR.",
@@ -1743,7 +1841,26 @@ class Bridge:
 
     # ----- outbox delivery
 
-    def deliver_outbox(self) -> dict[str, int]:
+    def _fair_batch(self, items: list[Any], keys: list[str], limit: int, queue: str) -> list[Any]:
+        """Persist scheduling progress before attempts; delivery evidence remains in its own journal.
+
+        A failed or suspended head cannot starve later entries, including after process restart.
+        Cursor loss reverts to the existing ordering; it never acknowledges a delivery.
+        """
+        if not items or limit <= 0:
+            return []
+        path = self.tg_paths.state_dir / f"{queue}-cursor.json"
+        try:
+            cursor = hs.load_json(path, label="delivery cursor") if path.exists() else None
+        except hs.SupervisorError:
+            cursor = None  # advisory ordering only; delivery journal remains authoritative
+        last = cursor.get("last") if isinstance(cursor, dict) else None
+        start = (keys.index(last) + 1) % len(keys) if isinstance(last, str) and last in keys else 0
+        indices = [(start + offset) % len(items) for offset in range(min(limit, len(items)))]
+        hs.atomic_write_json(path, {"last": keys[indices[-1]]})
+        return [items[index] for index in indices]
+
+    def deliver_outbox(self, *, limit: int | None = None) -> dict[str, int]:
         counts = {"sent": 0, "superseded": 0, "uncertain": 0, "collapsed": 0, "skipped": 0}
         chat_id = self.owner_chat()
         events_dir = self.sup_paths.outbox_dir / "events"
@@ -1772,7 +1889,8 @@ class Bridge:
         summarize_paths: list[Path] = []
         informational = [item for item in pending if not item[0].get("actionable") and item[0].get("type") not in ("COMMAND_RESULT", "QUERY_RESULT", "AGENT_FOLLOWUP_READY", "RUNTIME_EVIDENCE_PROPOSED")]
         collapse = len(informational) > int(self.config["informational_collapse_after"])
-        for event, sidecar, sidecar_path in pending:
+        batch = pending if limit is None else self._fair_batch(pending, [item[2].name for item in pending], limit, "outbox")
+        for event, sidecar, sidecar_path in batch:
             summarize_paths = []
             target_chat = chat_id
             if event.get("type") in ("COMMAND_RESULT", "QUERY_RESULT") and isinstance((event.get("data") or {}).get("chat_id"), int):
@@ -1910,13 +2028,29 @@ class Bridge:
                 expected_source_bytes=descriptor.get("source_bytes"),
             )
             return record
+        records = ha.list_records(self.sup_paths, event.get("run_id"))
+        summary_prefix = f"task-{hp.abbrev(event.get('run_id'))}-summary-v2-"
+        for record in reversed(records):
+            if (record.get("category") == "final_report" and record.get("event_id") == event.get("event_id")
+                    and Path(str(record.get("source_path") or "")).name.startswith(summary_prefix)):
+                return record
         existing = self._latest_artifact("final_report", event.get("run_id"))
         if existing:
-            return existing
+            source = Path(str(existing.get("source_path") or ""))
+            generated_legacy = source.parent == ha.generated_dir(self.sup_paths) and source.name.startswith(f"task-{hp.abbrev(event.get('run_id'))}-final-report-")
+            if not generated_legacy:
+                return existing  # never rewrite an agent-authored report
+            _, body = ha.verify_for_send(self.sup_paths, self.sup_config, existing["artifact_id"])
+            if b"## 4. WAIT_USER/WAIT_QUOTA bug root cause" not in body or b"## 20. Commit/push/publication" not in body:
+                return existing
         state = self._state() or {}
-        fields = build_final_report_fields(state, event, self.enqueuer.list_events())
+        if state.get("run_id") != event.get("run_id"):
+            state = {}
+        fields = build_final_report_fields(state, event, [], artifacts=records)
         markdown = hp.render_final_report_markdown(fields)
-        return ha.register_text(self.sup_paths, self.sup_config, category="final_report", text=markdown, name=f"task-{hp.abbrev(event.get('run_id'))}-final-report", run_id=event.get("run_id"), task_id=state.get("task_id"), event_id=event.get("event_id"), title="Final task report")
+        plan_path = (state.get("approved_plan") or {}).get("plan_path")
+        report_title = Path(plan_path).parent.name if isinstance(plan_path, str) and plan_path.startswith("/") else str(state.get("task_text") or "Completed task")
+        return ha.register_text(self.sup_paths, self.sup_config, category="final_report", text=markdown, name=f"task-{hp.abbrev(event.get('run_id'))}-summary-v2", run_id=event.get("run_id"), task_id=state.get("task_id"), event_id=event.get("event_id"), title=report_title)
 
     def _deliver_document_part(self, sidecar_path: Path, sidecar: dict[str, Any], chat_id: int, artifact_id: str, counts: dict[str, int]) -> None:
         """Part-level durable delivery. A failed send stays pending for backoff/retry; an ambiguous send is
@@ -2043,7 +2177,37 @@ class Bridge:
     # ----- daemon loop
 
     def heartbeat(self, note: str) -> None:
-        hs.atomic_write_json(self.tg_paths.heartbeat_file, {"pid": os.getpid(), "at_unix": self.clock(), "note": note})
+        hs.atomic_write_json(self.tg_paths.heartbeat_file, {"pid": os.getpid(), "at_unix": self.clock(), "note": note, **self.health})
+
+    def _failure(self, category: str) -> None:
+        self.health.update(phase="backoff", last_failure=category, last_failure_at=self.clock())
+        # Classification only: exception text can contain credentials and disk failure prevents diagnostics on disk.
+        print(f"telegram bridge backoff: {category}", file=sys.stderr)
+        try:
+            self.heartbeat("backoff")
+        except OSError as error:
+            storage_failure(error)  # re-raise unclassified OS errors
+
+    def _terminal_error(self, error: tg.TelegramError) -> bool:
+        if error.category not in ("AUTH_FAILURE", "POLLER_CONFLICT"):
+            return False
+        self._stop(error.category)
+        return True
+
+    def _stop(self, category: str) -> None:
+        """Terminal refusal is authoritative even if optional diagnostics cannot be persisted."""
+        self.stopped_reason = category
+        self.health.update(phase="stopped", last_failure=category, last_failure_at=self.clock())
+        print(f"telegram bridge stopped: {category}", file=sys.stderr)
+        try:
+            self.heartbeat("stopped")
+        except OSError as error:
+            print(f"telegram stop diagnostics: {storage_failure(error)}", file=sys.stderr)
+        if category in ("POLLER_CONFLICT", "WEBHOOK_CONFLICT"):
+            try:
+                hs.atomic_write_json(self.tg_paths.conflict_file, {"kind": category, "at": hs.iso_utc(self.clock())})
+            except OSError as error:
+                print(f"telegram stop diagnostics: {storage_failure(error)}", file=sys.stderr)
 
     def run(self, *, max_rounds: int | None = None) -> int:
         """Long-poll loop: outbound only, single consumer, bounded backoff. Telegram failures never touch
@@ -2055,38 +2219,40 @@ class Bridge:
             except (BlockingIOError, PermissionError):
                 self.stopped_reason = "POLLER_CONFLICT_LOCAL"
                 return 3
-            try:
-                info = self.api.get_webhook_info()
-            except tg.TelegramError as error:
-                self.stopped_reason = error.category
-                return 2
-            if info.get("url"):
-                self.stopped_reason = "WEBHOOK_CONFLICT"
-                hs.atomic_write_json(self.tg_paths.conflict_file, {"kind": "WEBHOOK_CONFLICT", "at": hs.iso_utc(self.clock())})
-                return 2
+            webhook_checked = False
             rounds = 0
             while max_rounds is None or rounds < max_rounds:
                 rounds += 1
-                self.heartbeat("poll")
                 try:
-                    self.reap_uploads()
-                    self.deliver_outbox()
-                    self.deliver_document_queue()
+                    self.health["phase"] = "polling" if webhook_checked else "starting"
+                    self.heartbeat("poll")
+                    if not webhook_checked:
+                        info = self.api.get_webhook_info()
+                        if info.get("url"):
+                            self._stop("WEBHOOK_CONFLICT")
+                            return 2
+                        webhook_checked = True
+                    # Inbound always gets a turn before a bounded outbound batch.
                     self.poll_once()
+                    self.health.update(phase="healthy", last_poll_success=self.clock())
+                    self.heartbeat("healthy")
+                    self.reap_uploads()
+                    self.deliver_outbox(limit=4)
+                    self.deliver_document_queue(limit=2)
                     self.backoff = 0.0
                     with contextlib.suppress(FileNotFoundError):
                         if self.tg_paths.conflict_file.exists():
                             self.tg_paths.conflict_file.unlink()
                 except tg.TelegramError as error:
-                    if error.category == "POLLER_CONFLICT":
-                        hs.atomic_write_json(self.tg_paths.conflict_file, {"kind": "POLLER_CONFLICT", "http_status": 409, "at": hs.iso_utc(self.clock())})
-                        self.stopped_reason = "POLLER_CONFLICT"
+                    if self._terminal_error(error):
                         return 2
-                    if error.category == "AUTH_FAILURE":
-                        self.stopped_reason = "AUTH_FAILURE"
-                        return 2
+                    self._failure(error.category)
                     self._sleep_backoff()
                 except hs.SupervisorError:
+                    self._failure("SUPERVISOR_ERROR")
+                    self._sleep_backoff()
+                except OSError as error:
+                    self._failure(storage_failure(error))
                     self._sleep_backoff()
             return 0
 
@@ -2097,42 +2263,119 @@ class Bridge:
         self.sleeper(self.backoff + self.rng() * min(1.0, self.backoff))
 
 
-def build_final_report_fields(state: dict[str, Any], event: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
-    """Assemble the twenty report fields from durable supervisor state (agents may extend items through a
-    registered `final_report` artifact of their own; this generator never invents evidence)."""
+def build_final_report_fields(state: dict[str, Any], event: dict[str, Any], events: list[dict[str, Any]], *, artifacts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Describe this task from durable facts; command history is never execution/test evidence."""
+    run_id = event.get("run_id")
+    if state.get("run_id") != run_id:
+        state = {}  # delayed delivery must not borrow the current task's title or evidence
     data = event.get("data") or {}
-    policy = state.get("runtime_policy") or {}
+    completion = state.get("completion") or {}
+    handed_off = event.get("type") == "TASK_HANDED_OFF" or completion.get("mode") == "operator_handoff"
     evidence = state.get("runtime_evidence") or {}
-    approvals = state.get("approvals") or []
-    handoffs = [e for e in events if e.get("type") == "COMMAND_RESULT"]
+    policy = state.get("runtime_policy") or {}
+    unmet = data.get("unmet", completion.get("unmet", []))
+    actions = {
+        "runtime_validation_pass": "Run and record the remaining TEST validation for the reviewed candidate.",
+        "push_approval": "Obtain push approval before pushing.",
+    }
+    remaining = [actions.get(item, "Confirm the remaining requirement: " + str(item).replace("_", " ") + ".")
+                 for item in unmet if isinstance(item, str)] if isinstance(unmet, list) else []
+    verification = []
+    if evidence.get("result") in ("PASS", "FAIL"):
+        candidate = evidence.get("candidate_sha") or evidence.get("candidate_digest") or "unspecified"
+        verification.append(f"Recorded runtime result: {evidence['result']} on {evidence.get('environment') or 'unspecified environment'} (candidate {candidate}).")
+    elif policy.get("runtime_validation_required") is False:
+        verification.append("Runtime validation was not required by the approved task profile.")
+    else:
+        verification.append("Supervisor has not recorded a runtime validation result for this task.")
+    if handed_off:
+        verification.append("Closing the task by handoff does not verify the remaining external actions.")
+    note = data.get("handoff") or (state.get("last_successful_handoff") or {}).get("summary") or ""
+    # Friendly prose here only; the stored routing value and its exact-display APIs stay untouched.
+    summary = str(note).replace("_", " ") if " " not in str(note) else str(note)
+    if not remaining:
+        remaining = ["No further action is recorded in this workflow."] if state else ["Task details are unavailable; check the original agent report before acting."]
+    reports = []
+    for record in artifacts or []:
+        if record.get("run_id") == run_id and record.get("category") in ("report", "handoff", "review", "validation"):
+            name = record.get("display_name")
+            if isinstance(name, str) and name not in reports:
+                reports.append(name)
+    if not reports:
+        verification.append("No detailed agent report is attached to this summary. File changes and local test results are not independently verified here.")
     return {
-        "title": f"Task report: {str(state.get('task_text') or '').strip().splitlines()[0][:80] if state.get('task_text') else 'supervised task'}",
-        "run_id": state.get("run_id"), "generated_at": hs.iso_utc(float(event.get("at_unix") or 0)),
-        "changed": data.get("handoff") or "see the implementation handoff",
-        "files": "see the implementation handoff registered for this run",
-        "tests": "see the implementation handoff",
-        "root_cause": "not applicable to this task" if not state.get("deferred_anomaly") else f"deferred anomaly {state['deferred_anomaly'].get('kind')} reconciled: {state['deferred_anomaly'].get('continuation')}",
-        "precedence": "typed human gates > valid routing > (missing protocol: quota refresh -> WAIT_QUOTA if blocking, else WAIT_USER)",
-        "reconciliation": "one reconciliation turn per deferred anomaly; original prompt never replayed",
-        "early_wake": f"quota rechecked every {state.get('quota_recheck_seconds', 'configured')} seconds via non-LLM refresh",
-        "no_llm_polling": "quota waits issue no prompts/reads (asserted by tests)",
-        "ask_failover": "read-only query sessions only; provider chosen by quota/lifecycle; failover shown to the human",
-        "ux": "typed renderers with state-aware keyboards",
-        "long_input": "uploaded task artifact accepted through the confirmed task-file workflow" if state.get("task_reference") else "short text task",
-        "long_output": "this report was delivered as a registered Markdown document",
-        "live_tests": [f"{e.get('data', {}).get('action')}: {'ok' if e.get('data', {}).get('ok') else 'rejected'}" for e in handoffs][-10:],
-        "live_not_performed": "see the implementation handoff",
-        "secret_scan": "see the implementation handoff",
-        "repo_readiness": "see the implementation handoff",
-        "limitations": "see the implementation handoff",
-        "release": "recommendation is made by the reviewer, not by this generator",
-        "human_actions": [f"{a.get('gate_type')}: {a.get('action')} by {a.get('actor')}" for a in approvals][-10:] or ["none recorded"],
-        "approval_actions": "commit, push, tag, publication and service activation always require separate human authorization",
-        "policy": policy, "runtime_evidence": {k: evidence.get(k) for k in ("result", "candidate_sha", "environment")} if evidence else None,
+        "task": state.get("task_text") or "Task details were not retained for this completed run.",
+        "run_id": run_id, "generated_at": hs.iso_utc(float(event.get("at_unix") or 0)),
+        "outcome": "Closed by you; remaining work was handed over to you." if handed_off else "The agent workflow completed.",
+        "summary": summary, "verification": verification, "next_actions": remaining, "reports": reports,
     }
 
 
 # --------------------------------------------------------------------------- doctor / setup / main
+
+
+def storage_failure(error: OSError) -> str:
+    """Only retry known storage availability failures, never hide arbitrary OS/programming failures."""
+    categories = {errno.ENOSPC: "STORAGE_FULL", errno.EDQUOT: "STORAGE_QUOTA", errno.EACCES: "STORAGE_PERMISSION", errno.EROFS: "STORAGE_READ_ONLY", errno.EIO: "STORAGE_IO"}
+    if error.errno not in categories:
+        raise error
+    return categories[error.errno]
+
+
+def bridge_health(paths: TelegramPaths, *, now: float | None = None) -> dict[str, Any]:
+    """Read-only, conservative health projection; never echo arbitrary persisted fields."""
+    now = time.time() if now is None else now
+    try:
+        record = hs.load_json(paths.heartbeat_file, label="heartbeat") if paths.heartbeat_file.exists() else None
+    except (OSError, hs.SupervisorError):
+        return {"status": "UNKNOWN"}
+    if not isinstance(record, dict):
+        return {"status": "UNKNOWN"}
+    stamp = health_timestamp(record.get("at_unix"))
+    if stamp is None:
+        return {"status": "UNKNOWN"}
+    if not 0 <= now - stamp <= 120:
+        return {"status": "STALE"}
+    if type(record.get("health_version")) is not int or record.get("health_version") != 1:
+        return {"status": "UNKNOWN"}  # legacy process heartbeat is not polling evidence
+    phase = record.get("phase")
+    if not isinstance(phase, str):
+        return {"status": "UNKNOWN"}
+    poll = health_timestamp(record.get("last_poll_success"))
+    failure = health_timestamp(record.get("last_failure_at"))
+    if (record.get("last_poll_success") is not None and poll is None) or (record.get("last_failure_at") is not None and failure is None):
+        return {"status": "UNKNOWN"}
+    recovered = failure is None or (poll is not None and poll >= failure)
+    if phase in ("healthy", "polling") and recovered and poll is not None and 0 <= now - poll <= 120:
+        return {"status": "HEALTHY"}
+    return {"status": {"starting": "STARTING", "backoff": "BACKOFF", "stopped": "STOPPED", "polling": "BACKOFF"}.get(phase, "UNKNOWN")}
+
+
+def health_timestamp(value: Any) -> float | None:
+    if type(value) not in (int, float):
+        return None
+    try:
+        stamp = float(value)
+    except OverflowError:
+        return None
+    return stamp if math.isfinite(stamp) and stamp >= 0 else None
+
+
+def boot_readiness(*, home: Path | None = None, server_probe: Callable[[], bool] | None = None) -> dict[str, str]:
+    home = home or Path.home()
+    wants = home / ".config/systemd/user/default.target.wants"
+    live = "unknown; verify with herdr agent list"
+    if server_probe is not None:
+        try:
+            live = "available" if server_probe() is True else "unavailable"
+        except (OSError, hs.SupervisorError):
+            pass
+    return {
+        "telegram_autostart": "enabled" if (wants / "herdr-telegram.service").is_symlink() else "not_verified",
+        "headless_autostart": "enabled" if (wants / "herdr-server.service").is_symlink() else "not_verified",
+        "live_server": live,
+        "guidance": "Telegram online does not prove Herdr is running. Open Herdr after reboot or explicitly configure headless startup; never start headless alongside an interactive server.",
+    }
 
 
 def doctor_summary(*, network: bool, tg_paths: TelegramPaths | None = None, api_factory: Callable[[str], Any] | None = None) -> dict[str, Any]:
@@ -2166,6 +2409,13 @@ def doctor_summary(*, network: bool, tg_paths: TelegramPaths | None = None, api_
             except (BlockingIOError, PermissionError):
                 lock_held = True
     report["checks"]["local_daemon"] = "running" if lock_held else "not running"
+    report["checks"]["bridge_health"] = bridge_health(tg_paths)
+    report["checks"]["boot_readiness"] = boot_readiness()
+    try:
+        disk = os.statvfs(tg_paths.state_dir)
+        report["checks"]["storage"] = "available" if disk.f_bavail > 0 and disk.f_favail > 0 and os.access(tg_paths.state_dir, os.W_OK) else "unavailable"
+    except OSError:
+        report["checks"]["storage"] = "unknown"
     if tg_paths.conflict_file.exists():
         conflict = hs.load_json(tg_paths.conflict_file, label="conflict")
         report["checks"]["conflict"] = conflict.get("kind") if isinstance(conflict, dict) else "unknown"
@@ -2188,7 +2438,8 @@ def doctor_summary(*, network: bool, tg_paths: TelegramPaths | None = None, api_
         report["status"] = error.category if error.category in ("DNS_FAILURE", "HTTPS_FAILURE", "AUTH_FAILURE", "POLLER_CONFLICT") else "HTTPS_FAILURE"
         report["detail"] = tg.sanitize(error.message, token)
         return report
-    report["status"] = "HEALTHY"
+    report["checks"]["network_api"] = "healthy"
+    report["status"] = "HEALTHY" if lock_held and report["checks"]["bridge_health"]["status"] == "HEALTHY" and report["checks"]["storage"] == "available" else "BRIDGE_NOT_HEALTHY"
     return report
 
 
@@ -2247,7 +2498,21 @@ def build_bridge(tg_paths: TelegramPaths | None = None, *, api: Any = None) -> B
     check_private_file(tg_paths.config_file, "telegram config")
     token = read_token(Path(tg_config["token_file"]))
     api = api or tg.BotApi(token, http_timeout=float(tg_config["http_timeout_seconds"]))
-    me = api.get_me()
+    delay = float(tg_config["backoff_base_seconds"])
+    while True:
+        try:
+            me = api.get_me()
+            break
+        except tg.TelegramError as error:
+            if error.category not in ("DNS_FAILURE", "HTTPS_FAILURE"):
+                raise
+            print(f"telegram startup backoff: {error.category}", file=sys.stderr)
+            try:
+                hs.atomic_write_json(tg_paths.heartbeat_file, {"pid": os.getpid(), "at_unix": time.time(), "note": "backoff", "health_version": 1, "phase": "backoff", "last_failure": error.category, "last_failure_at": time.time()})
+            except OSError as storage:
+                print(f"telegram startup: {storage_failure(storage)}", file=sys.stderr)
+            time.sleep(delay)
+            delay = min(float(tg_config["backoff_cap_seconds"]), delay * 2)
     herdr = hs.HerdrCli(hs.resolve_herdr_bin(sup_config.get("herdr_bin")))
     supervisor = hs.Supervisor(sup_paths, sup_config, herdr)
     return Bridge(sup_paths=sup_paths, sup_config=sup_config, tg_paths=tg_paths, tg_config=tg_config, api=api,

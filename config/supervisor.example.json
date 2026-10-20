@@ -3,6 +3,7 @@
   "project_root": null,
   "herdr_bin": null,
   "timezone": "UTC",
+  "default_workflow_policy": "supervised_v2",
   "quota_recheck_seconds": 600,
   "codex_reset": {
     "enabled": true,

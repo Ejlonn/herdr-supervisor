@@ -136,9 +136,10 @@ def render_task_started(event: dict[str, Any], tz: str) -> Rendered:
     return Rendered("\n".join([
         title_line("Task started"),
         f"Task: {esc(data.get('task'), limit=90)}",
-        f"Planner: {esc((data.get('start') or 'codex').title())}",
+        f"Starting agent: {esc((data.get('start') or 'codex').title())}",
         "",
-        "Codex will plan first. Nothing is implemented before you approve the plan.",
+        ("Codex will plan first. Nothing is implemented before you approve the plan." if data.get("policy") == "gated_v2"
+         else "The selected agent starts under this task’s workflow. Any required approval will be shown separately."),
         f"Run {code(abbrev(event.get('run_id')))}",
     ]), keyboard=[[("Status", "status", {})]])
 
@@ -197,6 +198,8 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
     gate = status.get("pending_gate")
     if gate and gate.get("status") == "pending":
         lines.append(f"Pending gate: {esc(gate.get('gate_type', '').replace('_', ' '))}")
+    if status.get("candidate_digest"):
+        lines.append(f"Manifest {code(abbrev(status['candidate_digest'], 12))}: runtime {esc(_runtime_words(status.get('runtime_validation')))}; no Git push authorization")
     if status.get("candidate_sha"):
         push = status.get("push_approval") or {}
         lines.append(f"Candidate {code(abbrev(status['candidate_sha'], 7))}: runtime {esc(_runtime_words(status.get('runtime_validation')))}, push {'approved' if push.get('candidate_sha') == status['candidate_sha'] else 'not approved'}")
@@ -213,12 +216,43 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
         lines.append(f"{provider.title()}: {esc(lifecycle)} · session {code(session)}")
         for line in _quota_windows_lines(quota, tz):
             lines.append("  " + esc(line, limit=120))
+    catalog = status.get("session_catalog")
+    if isinstance(catalog, dict):
+        rows = catalog.get("sessions", [])
+        children = (catalog.get("native") or {}).get("children", [])
+        jobs = (catalog.get("helpers") or {}).get("jobs", [])
+        lines.append(f"Sessions: {len(rows)} observed · native children {len(children)} · helper jobs {len(jobs)}")
+        for row in rows[:4]:
+            if row.get("reason"):
+                lines.append(f"  {esc(row.get('pane_id'), limit=30)}: {esc(row['reason'], limit=120)}")
+        if catalog.get("error"):
+            lines.append(esc(catalog['error'], limit=180))
     backup = status.get("backup")
     if isinstance(backup, dict) and backup.get("status") and backup["status"] != "disabled":
         lines.append(f"Backup: {esc(backup['status'])}" + (f" (last verified {fmt_iso_local(backup.get('last_verified'), tz)})" if backup.get("last_verified") else ""))
     lines.append(f"As of {fmt_local(status.get('checked_at_unix'), tz) if status.get('checked_at_unix') else esc(status.get('checked_at_local', ''))}")
     keyboard = keyboard_for_status(status)
     return Rendered("\n".join(lines), keyboard=keyboard)
+
+
+def render_sessions(catalog: dict[str, Any]) -> Rendered:
+    lines = [title_line("Sessions and helpers")]
+    if catalog.get("error"):
+        lines.append(esc(catalog["error"], limit=180))
+    for row in catalog.get("sessions", [])[:12]:
+        lines.append(f"{esc(row.get('pane_id'), limit=24)} · {esc(row.get('provider'), limit=16)} · {code(abbrev(row.get('session_id')))} · {esc(row.get('role'), limit=24)} · {esc(row.get('lifecycle'), limit=16)}")
+        if row.get('reason'):
+            lines.append(esc(row['reason'], limit=140))
+    native = catalog.get('native') or {}
+    children = native.get('children') or []
+    lines.append(f"Native children: {len(children)} observed (not independent pane targets)")
+    if native.get('reason'):
+        lines.append(esc(native['reason'], limit=160))
+    for child in children[:8]:
+        lines.append(f"{code(abbrev(child.get('session_id')))} ← {code(abbrev(child.get('parent_session_id')))} · {esc(child.get('model') or 'model unavailable', limit=50)} · {'parent verified' if child.get('parent_live') else 'parent unavailable'}")
+    helpers = catalog.get('helpers') or {}
+    lines.append(f"Helper panes: {'enabled' if helpers.get('enabled') else 'disabled'} · {len(helpers.get('jobs') or [])} jobs. Dispatch is explicit through the helper CLI.")
+    return Rendered("\n".join(lines), keyboard=[[('Status', 'status', {})]])
 
 
 def render_status_raw(status: dict[str, Any]) -> Rendered:
@@ -349,6 +383,9 @@ def keyboard_for_status(status: dict[str, Any]) -> Keyboard:
         return _followup_wait_keyboard(followup)
     if isinstance(followup, dict) and followup.get("status") in FOLLOWUP_OPEN and state not in ("DONE", "CANCELLED"):
         return [[("Status", "status", {}), ("Pause", "pause", {})]]
+    invalid = status.get("invalid_gate")
+    if state == "WAIT_USER" and isinstance(invalid, dict):
+        return [[("Repair approval request", "repair_gate", {"turn_id": invalid.get("turn_id")})], [("Status", "status", {}), ("Cancel task", "cancel", {})]]
     if state in (None, "NO_TASK", "DONE", "CANCELLED"):
         return [[("Status", "status", {})]] if state in ("DONE", "CANCELLED") else []
     if state == "WAIT_PLAN_APPROVAL":
@@ -356,6 +393,9 @@ def keyboard_for_status(status: dict[str, Any]) -> Keyboard:
     if state == "WAIT_QUOTA":
         return [[("Status", "status", {}), ("Pause", "pause", {})], [("Refresh quota", "refresh_quota", {})]]
     if state == "WAIT_RUNTIME_VALIDATION":
+        fields = _gate_fields(status.get("pending_gate") or {})
+        if fields.get("decision_question") and not fields.get("runtime_authorized"):
+            return _with_ask([[("Approve runtime test", "approve", {}), ("Decline", "reject", {})], [("View Report", "view_details", {})]], status)
         return _with_ask([[("View Report", "view_details", {}), ("Status", "status", {})]], status)
     if state == "WAIT_PUSH_APPROVAL":
         return _with_ask([[("Approve Push Stage", "approve", {})], [("Keep Waiting", "keep_waiting", {}), ("Cancel", "cancel", {})]], status)
@@ -480,6 +520,12 @@ def render_wait_user(reason: str, status: dict[str, Any] | None, tz: str, *, req
     open_followup = followup if isinstance(followup, dict) else status.get("agent_followup")
     if isinstance(open_followup, dict) and open_followup.get("status") == "FAILED" and requires_action:
         return render_followup_wait(reason, open_followup, tz)
+    if isinstance(status.get("invalid_gate"), dict):
+        return Rendered("\n".join([title_line("Approval request could not be prepared"),
+            "The agent submitted an invalid approval request. There is no decision for you to approve, and no live action was authorized.",
+            "Tap Repair approval request to ask the same agent to correct its submission. You do not need to write a revision note; task scope stays unchanged.",
+            f"Diagnostic: {esc(status['invalid_gate'].get('error'), limit=500)}"]),
+            keyboard=keyboard_for_status({**status, "supervisor_state": "WAIT_USER"}))
     missing = status.get("missing_result") if requires_action else None
     if isinstance(missing, dict) and missing.get("turn_id"):
         lines = [title_line("Agent finished without a workflow result"), *_missing_result_lines(missing)]
@@ -591,7 +637,7 @@ def render_runtime_proposed(event: dict[str, Any], status: dict[str, Any] | None
     result = str(data.get("result") or "?")
     lines = [
         title_line(f"Runtime {result} proposed — your confirmation is needed"),
-        f"Candidate {code(abbrev(data.get('candidate_sha'), 7))} on {esc(data.get('environment'))}, proposed by {esc(data.get('proposed_by'), limit=60)}.",
+        f"Candidate {code(abbrev((data.get('candidate_sha') or data.get('candidate_digest')), 7))} on {esc(data.get('environment'))}, proposed by {esc(data.get('proposed_by'), limit=60)}.",
         "Nothing is recorded yet. Push stays blocked and the workflow does not move until you record this result.",
         "",
     ]
@@ -602,12 +648,22 @@ def render_runtime_proposed(event: dict[str, Any], status: dict[str, Any] | None
         lines += ["", f"Summary: {esc(data.get('summary'), limit=240)}"]
     lines += ["", f"Record {result}: records exactly this evidence as the {result} result (a different result needs new evidence).",
               "Ask agent: a read-only question; the proposal stays pending.", "Request revision: send the run back to the agent instead."]
-    extra = {"gate_id": data.get("gate_id"), "evidence_sha256": data.get("evidence_sha256"), "decision": result, "candidate_sha": data.get("candidate_sha"), "environment": data.get("environment")}
+    extra = {"gate_id": data.get("gate_id"), "evidence_sha256": data.get("evidence_sha256"), "decision": result, "candidate_sha": data.get("candidate_sha"), "candidate_digest": data.get("candidate_digest"), "environment": data.get("environment")}
     return Rendered("\n".join(lines), keyboard=[[(f"Record {result}", "runtime_confirm", extra)], [("Request Revision", "revise", {}), ("Ask agent", "ask_agent", {"decision_id": data.get("gate_id")})], [("Status", "status", {})]])
 
 
 def render_runtime_required(gate: dict[str, Any], tz: str) -> Rendered:
     f = _gate_fields(gate)
+    if f.get("decision_question"):
+        authorized = bool(f.get("runtime_authorized"))
+        return Rendered("\n".join([title_line("Runtime test authorized" if authorized else "Approve runtime test"),
+            esc(f["decision_question"], limit=600),
+            f"Approval permits: {esc(f.get('approval_consequence'), limit=600)}",
+            f"Expected result: {esc(f.get('expected_output'), limit=600)}",
+            f"Declining: {esc(f.get('decline_consequence'), limit=600)}",
+            "Execution is authorized; run the reviewed checks and submit evidence. PASS/FAIL remains unrecorded." if authorized else "Approve runtime test authorizes these checks. It does not record PASS or authorize publishing."]),
+            keyboard=([[("View Report", "view_details", {}), ("Status", "status", {})]] if authorized else
+                      [[("Approve runtime test", "approve", {}), ("Decline", "reject", {})], [("View Report", "view_details", {}), ("Ask agent", "ask_agent", {"decision_id": gate.get("gate_id")})]]))
     lines = [
         title_line("Runtime validation required"),
         "Local implementation and review are complete.",
@@ -629,7 +685,7 @@ def render_runtime_failed(event: dict[str, Any], tz: str) -> Rendered:
     recorded = f" (recorded by {esc(data.get('actor'), limit=60)})" if data.get("actor") else ""
     return Rendered("\n".join([
         title_line("Runtime validation failed"),
-        f"Candidate {code(abbrev(data.get('candidate_sha'), 7))} on {esc(data.get('environment'))} did not pass{recorded}.",
+        f"Candidate {code(abbrev((data.get('candidate_sha') or data.get('candidate_digest')), 7))} on {esc(data.get('environment'))} did not pass{recorded}.",
         "Push stays blocked. Send a revision note so the agent can fix and re-run, or cancel.",
     ]), keyboard=[[("Request Revision", "revise", {}), ("Status", "status", {})]])
 
@@ -798,7 +854,7 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
     if kind in ("PLAN_APPROVED", "PUSH_APPROVED", "QUESTION_ANSWERED", "TASK_RESUMED", "RUNTIME_VALIDATION_PASSED"):
         data = event.get("data") or {}
         titles = {"PLAN_APPROVED": "Plan approved", "PUSH_APPROVED": "Push stage approved", "QUESTION_ANSWERED": "Answer recorded", "TASK_RESUMED": "Task resumed", "RUNTIME_VALIDATION_PASSED": "Runtime validation passed"}
-        follow = {"PLAN_APPROVED": "Codex writes the brief; implementation follows in the same sessions.", "PUSH_APPROVED": "The workflow continues; you perform the push/PR yourself.", "QUESTION_ANSWERED": "The agent continues with your answer.", "TASK_RESUMED": "Continuing where it stopped; nothing replayed.", "RUNTIME_VALIDATION_PASSED": f"Candidate {abbrev(data.get('candidate_sha'), 7)} validated on {data.get('environment')}" + (f", recorded by {data.get('actor')}." if data.get("actor") else ".")}
+        follow = {"PLAN_APPROVED": "The agent continues under the approved plan in the same session. Required runtime and push decisions remain separate.", "PUSH_APPROVED": "The workflow continues; you perform the push/PR yourself.", "QUESTION_ANSWERED": "The agent continues with your answer.", "TASK_RESUMED": "Continuing where it stopped; nothing replayed.", "RUNTIME_VALIDATION_PASSED": f"Candidate {abbrev((data.get('candidate_sha') or data.get('candidate_digest')), 7)} validated on {data.get('environment')}" + (f", recorded by {data.get('actor')}." if data.get("actor") else ".")}
         return Rendered("\n".join([title_line(titles[kind]), esc(follow[kind], limit=200)]))
     if kind == "BACKUP_HEALTH":
         return render_backup_health(event.get("data") or {}, tz)
@@ -809,30 +865,20 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
 
 
 def render_final_report_markdown(fields: dict[str, Any]) -> str:
-    """The twenty-item final report as a Markdown document. `fields` holds one entry per item; missing
-    items are rendered as 'not available' rather than omitted."""
-    items = [
-        ("What was changed", "changed"), ("Files created/changed", "files"), ("Test counts/results", "tests"),
-        ("WAIT_USER/WAIT_QUOTA bug root cause", "root_cause"), ("Exact implemented precedence behavior", "precedence"),
-        ("Post-quota reconciliation behavior", "reconciliation"), ("Early-wake quota behavior and polling cadence", "early_wake"),
-        ("Proof polling does not wake LLM agents", "no_llm_polling"), ("/ask failover behavior", "ask_failover"),
-        ("Telegram UX improvements", "ux"), ("Long input-file test result", "long_input"), ("Long output-file test result", "long_output"),
-        ("Real Telegram tests performed", "live_tests"), ("Live tests intentionally NOT performed", "live_not_performed"),
-        ("Security/secret-scrub findings", "secret_scan"), ("Generic GitHub repository readiness", "repo_readiness"),
-        ("Known limitations", "limitations"), ("Release recommendation (stable, beta, or not ready)", "release"),
-        ("Exact remaining human actions", "human_actions"), ("Commit/push/publication actions still requiring approval", "approval_actions"),
-    ]
-    out = [f"# {redact(fields.get('title') or 'Final task report', limit=120)}", ""]
-    if fields.get("run_id"):
-        out.append(f"Run `{abbrev(fields.get('run_id'))}` · generated {redact(fields.get('generated_at') or '', limit=40)}")
-        out.append("")
-    for index, (label, key) in enumerate(items, start=1):
+    """Task-specific workflow summary; omit absent details rather than invent test evidence."""
+    out = ["# Task report", "", redact(fields.get("task") or "Task details unavailable", limit=1200), ""]
+    sections = [("Outcome", "outcome"), ("Agent's closing note", "summary"),
+                ("Verification", "verification"), ("What you need to do", "next_actions"),
+                ("Available reports", "reports")]
+    for label, key in sections:
         value = fields.get(key)
-        out.append(f"## {index}. {label}")
-        out.append("")
+        if not value:
+            continue
+        out.extend([f"## {label}", ""])
         if isinstance(value, list):
-            out.extend(f"- {redact(v, limit=500)}" for v in value) if value else out.append("not available")
+            out.extend(f"- {redact(item, limit=1000)}" for item in value[:12])
         else:
-            out.append(redact(value, limit=4000) if value else "not available")
+            out.append(redact(value, limit=1600))
         out.append("")
+    out.extend(["---", f"Run `{abbrev(fields.get('run_id'))}` · generated {redact(fields.get('generated_at') or '', limit=40)}", ""])
     return "\n".join(out)

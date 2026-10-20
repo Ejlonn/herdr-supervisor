@@ -187,6 +187,19 @@ def register_text(paths: Paths, config: dict[str, Any], *, category: str, text: 
     return _register(paths, config, category=category, source=source, raw=raw, run_id=run_id, task_id=task_id, event_id=event_id, title=title or safe_name)
 
 
+def report_filename(title: str, source: Path) -> str:
+    """Human filename only; immutable storage and integrity identifiers remain separate."""
+    label = title
+    if source.name == "FINAL_REPORT.md":
+        label = source.parent.name
+    label = hr.redact(label, limit=200)
+    label = re.sub(r"\b(?:19|20)\d{6}\b", "", label)
+    words = re.findall(r"[^\W_]+", label.lower(), flags=re.UNICODE)
+    words = [w for w in words if w not in ("final", "report", "task", "summary", "md", "redacted")]
+    slug = "-".join(words[:7])[:80].strip("-") or "completed-task"
+    return slug + "-report.md"
+
+
 def _register(paths: Paths, config: dict[str, Any], *, category: str, source: Path, raw: bytes, run_id: str | None, task_id: str | None, event_id: str | None, title: str) -> dict[str, Any]:
     _ensure_dirs(paths)
     max_bytes = int(config.get("max_artifact_bytes", 2 * 1024 * 1024))
@@ -204,7 +217,7 @@ def _register(paths: Paths, config: dict[str, Any], *, category: str, source: Pa
         "run_id": run_id, "task_id": task_id, "event_id": event_id,
         "source_path": str(source), "source_sha256": sha256_bytes(raw), "source_bytes": len(raw),
         "derivative_path": str(derivative), "derivative_sha256": sha256_bytes(derivative_bytes), "derivative_bytes": len(derivative_bytes),
-        "mime": "text/markdown", "display_name": f"{stem}.md", "exposure": "telegram_owner", "status": "registered",
+        "mime": "text/markdown", "display_name": report_filename(title, source) if category == "final_report" else f"{stem}.md", "exposure": "telegram_owner", "status": "registered",
         "created_at": iso_utc(_now()), "created_at_unix": _now(), "redactions": derivative_text.count("[redacted]"),
     }
     atomic_write_json(registry_dir(paths) / f"{artifact_id}.json", record)

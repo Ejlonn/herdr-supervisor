@@ -362,7 +362,7 @@ class V2Case(unittest.TestCase):
         # Fresh Codex fixtures: the thread journal is shared across supervisors of one case (restart tests)
         # and the read-only Codex thread contract is verified unless a test says otherwise.
         sup.reset_gateway = self.thread_journal
-        sup._codex_thread_contract = dict(getattr(self, "codex_contract", {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True}))
+        sup._codex_thread_contract = dict(getattr(self, "codex_contract", {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True, "codex_pane_local_server": True}))
         return sup
 
     def tearDown(self) -> None:
@@ -456,6 +456,10 @@ class V2Case(unittest.TestCase):
     def start_gated(self, responses: list[dict]) -> int:
         self.herdr.responses = responses
         return self.sup.run_new("Add the widget", "codex", workflow_policy="gated_v2")
+
+    def start_supervised(self, responses: list[dict], *, start: str = "codex", task: str = "Investigate the reboot") -> int:
+        self.herdr.responses = responses
+        return self.sup.run_new(task, start, workflow_policy="supervised_v2")
 
     def approve_pending(self, **kwargs) -> dict:
         with self.sup.store.transaction():

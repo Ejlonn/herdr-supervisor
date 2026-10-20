@@ -316,7 +316,7 @@ class RuntimeEvidenceTelegramTests(TelegramCase):
         self.assertEqual((report["runtime_validation"]["state"], report["runtime_validation"]["result"], report["runtime_validation"]["next_actor"]), ("proposed", "FAIL", "operator"))
         self.assertEqual((report["product_repo"]["valid"], report["product_repo"]["head"]), (True, SHA_A))
         self.assertTrue(report["session_start"]["fresh_codex_available"])
-        self.assertEqual(set(report["session_start"]["fresh_codex_components"]), {"herdr_pane_split", "herdr_agent_start", "herdr_identity_observation", "codex_app_server", "codex_thread_start", "codex_resume_session_id"})
+        self.assertEqual(set(report["session_start"]["fresh_codex_components"]), {"herdr_pane_split", "herdr_agent_start", "herdr_identity_observation", "codex_app_server", "codex_thread_start", "codex_resume_session_id", "codex_pane_local_server"})
         def broken(repo):
             raise hs.SupervisorError("cannot read repository HEAD")
         self.sup.head_resolver = broken

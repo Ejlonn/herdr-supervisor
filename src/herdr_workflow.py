@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ from herdr_core import (
     RUNTIME_VALIDATION_MODES,
     SHA_RE,
     TERMINAL_STATES,
+    V2_WORKFLOW_POLICIES,
     HerdrError,
     OwnerRecoveryNeeded,
     Paths,
@@ -60,6 +62,7 @@ from herdr_validation import (
     validate_gate_payload,
     validate_runtime_evidence,
     validate_upload_record,
+    verify_runtime_manifest,
 )
 
 
@@ -99,7 +102,7 @@ class SupervisorV2Mixin:
 
         def report_live_agent(self, provider: str, live_agents: list[dict[str, Any]], owners: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool, bool]: ...
 
-        def verify_or_seed_owners(self) -> dict[str, dict[str, str]]: ...
+        def verify_or_seed_owners(self, required_providers: tuple[str, ...] = PROVIDERS) -> dict[str, dict[str, str]]: ...
 
         def verify_persisted_sessions(self, state: dict[str, Any]) -> None: ...
 
@@ -108,7 +111,7 @@ class SupervisorV2Mixin:
         def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None) -> dict[str, Any]: ...
         def prepare_task_sessions(self, selection: Any, *, preparation_id: str, journal_path: Path | None = None,
                                   origin: str = "supervisor", request_binding: str | None = None,
-                                  request_envelope: dict[str, Any] | None = None) -> dict[str, Any]: ...
+                                  request_envelope: dict[str, Any] | None = None, start_provider: str = "codex") -> dict[str, Any]: ...
         def _mark_session_preparation_started(self, preparation_id: str) -> dict[str, Any] | None: ...
         def validate_session_selection(self, selection: Any) -> dict[str, Any]: ...
         def read_session_preparation(self, preparation_id: str) -> dict[str, Any] | None: ...
@@ -200,7 +203,16 @@ class SupervisorV2Mixin:
 
     def protocol_instructions(self, state: dict[str, Any], turn_id: str) -> str:
         """The eight-line routing contract. Placeholders keep angle brackets so an echoed template can
-        never parse as a response; the controller enforces every rule stated here."""
+        never parse as a response; the controller enforces every rule stated here. The closing prose
+        describes only the resolved workflow_contract: gated_v2's exact rules text is preserved
+        byte-for-byte; supervised_v2 states that planning is optional and never claims Codex must plan
+        or Claude must implement."""
+        contract = state.get("workflow_contract") or {}
+        if contract.get("plan_approval_required_for_handoff"):
+            rule = "Claude implements only after the human approves the exact CODEX_PLAN.md; runtime and push gates are separate; "
+        else:
+            rule = ("a plan gate is optional; if you raise and the human approves one, its exact plan and payload govern the "
+                    "continuation, and runtime/push gates stay separate; ")
         return (
             "End your response with exactly one contiguous eight-line block, each line KEY=value, no markdown:\n"
             "HERDR_PROTOCOL=2\n"
@@ -212,8 +224,7 @@ class SupervisorV2Mixin:
             f"HERDR_PAYLOAD=<gate payload JSON path below {self.config['review_root']}, or - when HERDR_GATE=none>\n"
             "HERDR_HANDOFF=<one line under 300 characters, words_joined_with_underscores, no spaces or angle brackets>\n"
             "Rules: human needs a typed gate and payload; codex/claude/done need HERDR_GATE=none and HERDR_PAYLOAD=-; "
-            "Claude implements only after the human approves the exact CODEX_PLAN.md; runtime and push gates are separate; "
-            "never reuse an earlier block."
+            f"{rule}never reuse an earlier block."
         )
 
     def build_prompt_v2(self, state: dict[str, Any], turn_id: str, kind: str) -> str:
@@ -224,15 +235,24 @@ class SupervisorV2Mixin:
             ckind = cont.get("kind")
             note = cont.get("note") or ""
             if ckind == "plan_approved":
-                body = (f"Run {run}: the human APPROVED the plan (SHA-256 {cont.get('plan_sha256')}, payload {cont.get('payload_sha256')}). "
-                        "Write or update CODEX_BRIEF.md from exactly that plan per AGENTS.md, then route to the implementation agent. Do not change the plan.")
+                if (state.get("workflow_contract") or {}).get("plan_approval_required_for_handoff"):
+                    body = (f"Run {run}: the human APPROVED the plan (SHA-256 {cont.get('plan_sha256')}, payload {cont.get('payload_sha256')}). "
+                            "Write or update CODEX_BRIEF.md from exactly that plan per AGENTS.md, then route to the implementation agent. Do not change the plan.")
+                else:
+                    body = (f"Run {run}: the human APPROVED the plan (SHA-256 {cont.get('plan_sha256')}, payload {cont.get('payload_sha256')}). "
+                            "Continue under that exact plan and the persisted workflow contract; do not change the plan.")
             elif ckind == "revision":
                 body = (f"Run {run}: the human requested a REVISION of the pending {cont.get('gate_type')}. Note:\n{note}\n\n"
                         "Update the artifact and payload and emit a new gate block; the prior gate and approval are void.")
             elif ckind == "answer":
                 body = f"Run {run}: the human ANSWERED your question ({cont.get('gate_id')}).\nAnswer:\n{note}\n\nContinue the same stage with this answer."
+            elif ckind == "gate_repair":
+                body = (f"Run {run}: Supervisor rejected your approval request. No human decision or approval exists for this request. "
+                        f"Repair only the workflow result at {cont.get('payload')}. Validation error: {note}\n"
+                        "Use gate-preflight before returning the corrected routing result. Preserve task scope and all approvals; "
+                        "do not run the proposed live action. If the schema cannot represent the action, explain the required design decision in a valid generic_question gate.")
             elif ckind == "runtime_passed":
-                body = f"Run {run}: runtime validation PASS recorded for candidate {cont.get('candidate_sha')} on {cont.get('environment')}. Continue with the next stage."
+                body = f"Run {run}: runtime validation PASS recorded for candidate {cont.get('candidate_sha') or cont.get('candidate_digest')} on {cont.get('environment')}. Continue with the next stage."
             elif ckind == "push_approved":
                 body = f"Run {run}: the human AUTHORIZED the push stage for candidate {cont.get('candidate_sha')} and performs the push/PR themselves; do not run git push. Continue the workflow."
             elif ckind == "reconcile":
@@ -249,7 +269,8 @@ class SupervisorV2Mixin:
             previous = state.get("interrupted_delivery") or {}
             return (f"Run {run}: a provider usage-limit wait has ended. Your turn HERDR_TURN={previous.get('turn_id')} in this session was interrupted; "
                     "continue that stage from where it stopped without redoing completed work.\n\n" + protocol)
-        preamble = (f"You are the active agent for supervised run {run} (gated workflow). Follow CLAUDE.md / AGENTS.md and their context under "
+        label = "gated workflow" if (state.get("workflow_contract") or {}).get("plan_approval_required_for_handoff") else "supervised workflow"
+        preamble = (f"You are the active agent for supervised run {run} ({label}). Follow CLAUDE.md / AGENTS.md and their context under "
                     f"{self.config['project_root']}; the supervisor only routes turns and enforces human gates. Do only the workflow stage that is correct now.")
         handoff = state.get("last_successful_handoff")
         handoff_text = ""
@@ -268,14 +289,14 @@ class SupervisorV2Mixin:
     def route_v2(self, state: dict[str, Any], block: ProtocolBlock) -> str:
         source = state["active_agent"]
         policy = state.get("workflow_policy")
-        if policy == "gated_v2" and block.version != 2:
-            return self.set_wait_user(state, "gated_v2 task received a protocol-1 block; a V2 block is required", requires_action=True)
-        if policy != "gated_v2" and block.gate != "none":
-            return self.set_wait_user(state, "typed gates require a gated_v2 task; nothing was inferred", requires_action=True)
+        if policy in V2_WORKFLOW_POLICIES and block.version != 2:
+            return self.set_wait_user(state, f"{policy} task received a protocol-1 block; a V2 block is required", requires_action=True)
+        if policy not in V2_WORKFLOW_POLICIES and block.gate != "none":
+            return self.set_wait_user(state, "typed gates require a gated_v2 or supervised_v2 task; nothing was inferred", requires_action=True)
         if block.next_agent != "human":
             if block.gate != "none" or block.payload != "-":
                 return self.set_wait_user(state, f"routing to {block.next_agent} must use HERDR_GATE=none and HERDR_PAYLOAD=-", requires_action=True)
-            if policy == "gated_v2":
+            if policy in V2_WORKFLOW_POLICIES:
                 unmet: list[str] = []
                 if block.next_agent == "done":
                     problem = self._approved_plan_problem(state)
@@ -306,6 +327,7 @@ class SupervisorV2Mixin:
                     problem = self._auto_turn_limit_problem(state, source, block.next_agent)
                     if problem:
                         return self.set_wait_user(state, problem, requires_action=True)
+            state["invalid_gate"] = None
             state["last_successful_handoff"] = {"from_agent": source, "to": block.next_agent, "stage": block.stage, "summary": block.handoff, "turn_id": block.turn_id, "at": iso_utc(self.clock())}
             state["phase"] = block.stage
             state["turns_completed"] = int(state.get("turns_completed") or 0) + 1
@@ -323,22 +345,36 @@ class SupervisorV2Mixin:
                 self.emit_event(state, "TASK_DONE", event_data)
                 self.store.write_state(state)
                 return "stop"
-            if policy == "gated_v2" and block.next_agent in PROVIDERS:
+            if policy in V2_WORKFLOW_POLICIES and block.next_agent in PROVIDERS:
                 self._count_auto_turn(state, source, block.next_agent)
             state["active_agent"] = block.next_agent
             state["delivery"] = None
             state["supervisor_state"] = "RUNNING"
             self.store.write_state(state)
             return "continue"
-        # human route: a typed gate is mandatory
+        # human route: a typed gate is mandatory for every V2 policy without exception (F2: an untyped
+        # human wait is never permitted; only legacy v1 keeps the historical free-text human route).
         if block.gate == "none" or block.payload == "-":
-            if block.version == 1 or policy != "gated_v2":
+            if block.version == 1 or policy not in V2_WORKFLOW_POLICIES:
                 return self.set_wait_user(state, f"{source} routed to human: {block.handoff}")
             return self.set_wait_user(state, "HERDR_NEXT=human requires a typed HERDR_GATE and HERDR_PAYLOAD; nothing was inferred", requires_action=True)
         try:
             gate = self.create_gate(state, block)
         except SupervisorError as error:
+            if not getattr(error, "repairable_gate", False):
+                state["invalid_gate"] = None
+                return self.set_wait_user(state, f"gate rejected: {error}", requires_action=True)
+            previous = state.get("invalid_gate") or {}
+            delivery = state.get("delivery") or {}
+            attempts = int(previous.get("attempts", 0)) if previous.get("run_id") == state["run_id"] else 0
+            state["invalid_gate"] = {"run_id": state["run_id"], "turn_id": block.turn_id,
+                                     "agent": source, "session": (state.get("native_sessions") or {}).get(source),
+                                     "gate_type": block.gate, "payload": block.payload,
+                                     "error": str(error)[:500], "attempts": attempts}
+            if attempts == 0 and delivery.get("status") == "accepted" and delivery.get("turn_id") == block.turn_id:
+                return self._queue_gate_repair(state)
             return self.set_wait_user(state, f"gate rejected: {error}", requires_action=True)
+        state["invalid_gate"] = None
         state["phase"] = block.stage
         state["turns_completed"] = int(state.get("turns_completed") or 0) + 1
         if isinstance(state.get("delivery"), dict):
@@ -431,6 +467,8 @@ class SupervisorV2Mixin:
         state["approved_plan"] = None
         state["runtime_policy"] = None
         state["candidate_sha"] = None
+        state["runtime_candidate"] = None
+        state["runtime_proposal"] = None
         state["runtime_evidence"] = None
         state["push_approval"] = None
         state["continuation"] = None
@@ -443,6 +481,14 @@ class SupervisorV2Mixin:
 
     def _candidate_head_problem(self, state: dict[str, Any]) -> str | None:
         """F4: exact-SHA evidence/approval is only meaningful while repository HEAD equals the candidate."""
+        manifest = state.get("runtime_candidate")
+        if isinstance(manifest, dict):
+            try:
+                verify_runtime_manifest(manifest, approved_root=(state.get("runtime_policy") or {}).get("runtime_manifest_root"), config=self.config)
+            except (SupervisorError, OSError) as error:
+                self._invalidate_candidate(state, reason=str(error))
+                return str(error)
+            return None
         candidate = state.get("candidate_sha")
         if not candidate:
             return None
@@ -457,6 +503,8 @@ class SupervisorV2Mixin:
 
     def _invalidate_candidate(self, state: dict[str, Any], *, reason: str) -> None:
         state["runtime_evidence"] = None
+        state["runtime_proposal"] = None
+        state["runtime_candidate"] = None
         state["push_approval"] = None
         state["candidate_sha"] = None
         gate = state.get("pending_gate")
@@ -466,11 +514,14 @@ class SupervisorV2Mixin:
         self._log(state, "candidate_invalidated", reason=reason)
 
     def _routing_policy_problem(self, state: dict[str, Any], target: str) -> str | None:
+        # A stale approved plan always supersedes itself, regardless of whether the contract requires one:
+        # this is data-integrity, not procedure.
         problem = self._approved_plan_problem(state)
         if problem and target in ("claude", "done"):
             return problem
+        contract = state.get("workflow_contract") or {}
         approved = state.get("approved_plan")
-        if target == "claude" and not approved:
+        if target == "claude" and not approved and contract.get("plan_approval_required_for_handoff"):
             return "claude cannot receive an implementation turn before the human approves an unchanged Codex plan"
         if target == "done":
             return self._done_problem(state)[0]
@@ -480,8 +531,11 @@ class SupervisorV2Mixin:
         """(problem, evidence_unmet) for a `done` route. `evidence_unmet` is non-empty only when the
         approval is intact, the candidate still equals HEAD, and the sole blockers are human-owned
         runtime/push evidence — the one situation an operator may close by handoff."""
+        contract = state.get("workflow_contract") or {}
         if not isinstance(state.get("approved_plan"), dict):
-            return "done is not allowed before a plan approval exists", []
+            if contract.get("plan_approval_required_for_done"):
+                return "done is not allowed before a plan approval exists", []
+            return None, []  # supervised_v2: no plan was ever raised, so no plan-related obligation blocks completion
         policy = state.get("runtime_policy") or {}
         if policy.get("runtime_validation_required") or policy.get("push_approval_required"):
             head_problem = self._candidate_head_problem(state)
@@ -653,6 +707,10 @@ class SupervisorV2Mixin:
 
     def _runtime_pass_current(self, state: dict[str, Any]) -> bool:
         evidence = state.get("runtime_evidence")
+        if isinstance(state.get("runtime_candidate"), dict):
+            return (isinstance(evidence, dict) and evidence.get("result") == "PASS"
+                    and evidence.get("candidate_digest") == state["runtime_candidate"]["candidate_digest"]
+                    and self.evidence_accepted(state, evidence) and self._candidate_head_problem(state) is None)
         return (isinstance(evidence, dict) and evidence.get("result") == "PASS" and evidence.get("candidate_sha") == state.get("candidate_sha")
                 and bool(state.get("candidate_sha")) and self.evidence_accepted(state, evidence))
 
@@ -688,7 +746,9 @@ class SupervisorV2Mixin:
         evidence = state.get("runtime_evidence") if isinstance(state.get("runtime_evidence"), dict) else None
         view: dict[str, Any] = {"mode": mode, "gate_pending": pending, "candidate_sha": state.get("candidate_sha"), "state": "none",
                                 "result": None, "at_utc": None, "reason": None, "next_actor": None, "waiting": None, "actor": None, "legacy": False}
-        if evidence is not None and self.evidence_accepted(state, evidence) and evidence.get("candidate_sha") == state.get("candidate_sha"):
+        candidate_matches = bool(evidence and ((evidence.get("candidate_digest") == (state.get("runtime_candidate") or {}).get("candidate_digest"))
+                                 if state.get("runtime_candidate") else evidence.get("candidate_sha") == state.get("candidate_sha")))
+        if evidence is not None and self.evidence_accepted(state, evidence) and candidate_matches:
             provenance = evidence.get("provenance") or {}
             view.update(state="accepted", result=evidence.get("result"), at_utc=evidence.get("received_at"), actor=provenance.get("actor") or evidence.get("actor"),
                         reason=self._evidence_reason(evidence), legacy=provenance == {})
@@ -731,20 +791,28 @@ class SupervisorV2Mixin:
 
     def create_gate(self, state: dict[str, Any], block: ProtocolBlock) -> dict[str, Any]:
         gate_type = block.gate
-        review_root = Path(self.config["review_root"])
-        payload_path = check_safe_file(block.payload, root=review_root, max_bytes=int(self.config["max_payload_bytes"]), label="gate payload")
-        raw_payload = load_json(payload_path, label="gate payload")
-        payload = validate_gate_payload(raw_payload, gate_type, config=self.config)
-        if payload_path.resolve().parent != Path(payload["review_directory"]).resolve() and Path(payload["review_directory"]).resolve() not in payload_path.resolve().parents:
-            raise SupervisorError("gate payload must live inside its review_directory")
-        payload_sha = sha256_bytes(canonical_json(payload))
-        if gate_type == "plan_approval":
-            artifact = check_safe_file(payload["plan_path"], root=review_root, max_bytes=int(self.config["max_artifact_bytes"]), label="plan artifact")
-            if artifact.name != "CODEX_PLAN.md":
-                raise SupervisorError("plan_approval artifact must be CODEX_PLAN.md")
-            artifact_path, artifact_sha = str(artifact), sha256_file(artifact)
-        else:
-            artifact_path, artifact_sha = str(payload_path), sha256_file(payload_path)
+        try:
+            review_root = Path(self.config["review_root"])
+            payload_path = check_safe_file(block.payload, root=review_root, max_bytes=int(self.config["max_payload_bytes"]), label="gate payload")
+            raw_payload = load_json(payload_path, label="gate payload")
+            payload = validate_gate_payload(raw_payload, gate_type, config=self.config)
+            if payload_path.resolve().parent != Path(payload["review_directory"]).resolve() and Path(payload["review_directory"]).resolve() not in payload_path.resolve().parents:
+                raise SupervisorError("gate payload must live inside its review_directory")
+            payload_sha = sha256_bytes(canonical_json(payload))
+            if gate_type == "plan_approval":
+                artifact = check_safe_file(payload["plan_path"], root=review_root, max_bytes=int(self.config["max_artifact_bytes"]), label="plan artifact")
+                required_name = (state.get("workflow_contract") or {}).get("plan_artifact_name")
+                if required_name is not None:
+                    if artifact.name != required_name:
+                        raise SupervisorError(f"plan_approval artifact must be {required_name}")
+                elif artifact.suffix.lower() != ".md":
+                    raise SupervisorError("plan_approval artifact must be a Markdown (.md) file below the review root")
+                artifact_path, artifact_sha = str(artifact), sha256_file(artifact)
+            else:
+                artifact_path, artifact_sha = str(payload_path), sha256_file(payload_path)
+        except SupervisorError as error:
+            setattr(error, "repairable_gate", not (gate_type in ("runtime_validation", "push_approval") and isinstance(locals().get("raw_payload"), dict) and (raw_payload.get("local_gate_result") != "PASS" or raw_payload.get("codex_review_status") != "APPROVED")))
+            raise
         candidate = None
         if gate_type in ("runtime_validation", "push_approval"):
             plan_problem = self._approved_plan_problem(state)
@@ -762,6 +830,18 @@ class SupervisorV2Mixin:
                 raise SupervisorError("payload weakens the approved rebuild requirement; a new plan approval is required")
             if not approved_policy.get("runtime_validation_required"):
                 raise SupervisorError("approved plan does not require runtime validation; nothing to validate")
+            if payload.get("candidate_kind") == "manifest":
+                if approved_policy.get("push_approval_required"):
+                    raise SupervisorError("manifest runtime cannot satisfy a Git push policy")
+                verify_runtime_manifest(payload, approved_root=approved_policy.get("runtime_manifest_root"), config=self.config)
+                previous_manifest = state.get("runtime_candidate")
+                if previous_manifest != payload:
+                    state["runtime_evidence"] = None
+                    state["runtime_proposal"] = None
+                    state["push_approval"] = None
+                state["runtime_candidate"] = payload
+            else:
+                state["runtime_candidate"] = None
             candidate = payload["candidate_sha"]
             if state.get("candidate_sha") and state["candidate_sha"] != candidate:
                 state["runtime_evidence"] = None
@@ -769,6 +849,8 @@ class SupervisorV2Mixin:
                 self._log(state, "candidate_changed", previous=state["candidate_sha"], current=candidate)
             state["candidate_sha"] = candidate
         elif gate_type == "push_approval":
+            if state.get("runtime_candidate"):
+                raise SupervisorError("manifest candidates never authorize Git push")
             approved_policy = state.get("runtime_policy") or {}
             candidate = payload["candidate_sha"]
             if not approved_policy.get("runtime_validation_required"):
@@ -782,11 +864,13 @@ class SupervisorV2Mixin:
             problem = self._push_prerequisite_problem(state, candidate)
             if problem:
                 raise SupervisorError(problem)
-        elif gate_type == "plan_approval" and state.get("active_agent") != "codex":
-            raise SupervisorError("plan_approval gates may only be raised by codex")
+        elif gate_type == "plan_approval":
+            restricted_to = (state.get("workflow_contract") or {}).get("plan_gate_restricted_to_agent")
+            if restricted_to is not None and state.get("active_agent") != restricted_to:
+                raise SupervisorError(f"plan_approval gates may only be raised by {restricted_to}")
         state["gate_sequence"] = int(state.get("gate_sequence") or 0) + 1
         now = self.clock()
-        summary_keys = ("task_title", "summary", "scope", "risk_summary", "intended_changes", "affected_components", "migration_required", "runtime_validation_required", "rebuild_required", "rebuild_reason", "push_approval_required", "question", "answer_mode", "choices", "max_answer_chars", "candidate_sha", "prepared_commits", "affected_services", "local_evidence_summary", "codex_review_status", "local_gate_result", "review_directory")
+        summary_keys = ("task_title", "summary", "scope", "risk_summary", "intended_changes", "affected_components", "migration_required", "runtime_validation_required", "rebuild_required", "rebuild_reason", "push_approval_required", "question", "answer_mode", "choices", "max_answer_chars", "candidate_sha", "candidate_kind", "candidate_digest", "decision_question", "approval_consequence", "decline_consequence", "expected_output", "prepared_commits", "affected_services", "local_evidence_summary", "codex_review_status", "local_gate_result", "review_directory")
         return {
             "gate_id": str(uuid.uuid4()),
             "gate_type": gate_type,
@@ -804,6 +888,7 @@ class SupervisorV2Mixin:
             "artifact_path": artifact_path,
             "artifact_sha256": artifact_sha,
             "candidate_sha": candidate,
+            "candidate_digest": payload.get("candidate_digest"),
             "payload": payload,
             "summary_fields": {key: payload[key] for key in summary_keys if key in payload},
             "workflow_policy": state.get("workflow_policy"),
@@ -825,6 +910,45 @@ class SupervisorV2Mixin:
         return None
 
     # ----- gate actions (CLI or Telegram-originated, always applied under the transaction lock)
+
+    def _queue_gate_repair(self, state: dict[str, Any]) -> str:
+        """A single durable continuation, sent by the normal quota/identity/delivery machinery."""
+        failure = state["invalid_gate"]
+        if state.get("owner_recovery") or (state.get("agent_followup") or {}).get("status") in ("PREPARED", "DELIVERING", "WAITING", "RESPONSE_READY", "FAILED"):
+            raise SupervisorError("resolve session recovery or the open question before gate repair")
+        self.verify_persisted_sessions(state)
+        if failure["agent"] != state["active_agent"] or failure["session"] != (state.get("native_sessions") or {}).get(state["active_agent"]):
+            raise SupervisorError("gate repair session changed; nothing was sent")
+        failure["attempts"] += 1
+        state["continuation"] = {"kind": "gate_repair", "payload": failure["payload"], "note": failure["error"]}
+        state["delivery"] = None
+        state["supervisor_state"] = "RUNNING"
+        state["wait_user_requires_action"] = False
+        state["wait_user_reason"] = None
+        self.store.write_state(state)
+        return "continue"
+
+    def repair_gate(self, state: dict[str, Any], *, run_id: Any, turn_id: Any) -> dict[str, Any]:
+        failure = state.get("invalid_gate")
+        if state.get("run_id") != run_id or state.get("supervisor_state") != "WAIT_USER" or (state.get("pending_gate") or {}).get("status") == "pending" or not isinstance(failure, dict) or failure.get("turn_id") != turn_id:
+            raise SupervisorError("no matching rejected approval request; use the newest card")
+        delivery = state.get("delivery") or {}
+        if delivery.get("status") not in ("accepted", "completed") or not delivery.get("accepted_at") or delivery.get("turn_id") != turn_id:
+            raise SupervisorError("delivery is uncertain; repair cannot send another prompt")
+        self._queue_gate_repair(state)
+        return {"ok": True, "message": "Repair requested. Scope is unchanged; the agent will prepare a valid approval request."}
+
+    def gate_preflight(self, state: dict[str, Any], gate_type: str, payload: str) -> dict[str, Any]:
+        """Run gate creation on an isolated controller and state; no files/events/state are written."""
+        probe = copy.copy(self)
+        setattr(probe, "_log", lambda *args, **kwargs: None)
+        shadow = copy.deepcopy(state)
+        block = ProtocolBlock(version=2, run_id=state["run_id"], turn_id=str(uuid.uuid4()), stage="review", next_agent="human", gate=gate_type, payload=payload, handoff="preflight")
+        try:
+            probe.create_gate(shadow, block)
+        except (SupervisorError, OSError, ValueError) as error:
+            return {"ok": False, "errors": [{"message": str(error)}], "supported_candidate_kinds": ["git_commit", "manifest"]}
+        return {"ok": True, "errors": [], "supported_candidate_kinds": ["git_commit", "manifest"]}
 
     def _load_pending_gate(self, state: dict[str, Any], run_id: str, gate_id: str, *, expected_state: str | None, gate_types: tuple[str, ...]) -> dict[str, Any]:
         if state.get("run_id") != run_id:
@@ -869,7 +993,7 @@ class SupervisorV2Mixin:
         state["pending_gate"] = gate
 
     def approve_gate(self, state: dict[str, Any], *, run_id: str, gate_id: str, actor: str, chat_id: Any = None, expected_state: str | None = None, artifact_sha256: str | None = None, payload_sha256: str | None = None) -> dict[str, Any]:
-        gate = self._load_pending_gate(state, run_id, gate_id, expected_state=expected_state, gate_types=("plan_approval", "push_approval"))
+        gate = self._load_pending_gate(state, run_id, gate_id, expected_state=expected_state, gate_types=("plan_approval", "push_approval", "runtime_validation"))
         try:
             self._check_gate_hashes(gate, artifact_sha256, payload_sha256)
         except SupervisorError as error:
@@ -880,14 +1004,32 @@ class SupervisorV2Mixin:
                 self.emit_event(state, "WAIT_USER", {"reason": PLAN_CHANGED_MESSAGE, "gate_id": gate_id})
                 self.store.write_state(state)
             raise
+        if gate["gate_type"] == "runtime_validation":
+            if not gate["payload"].get("decision_question"):
+                raise SupervisorError("this legacy runtime gate has no execution approval request")
+            if gate.get("runtime_authorization"):
+                raise SupervisorError("runtime execution was already authorized")
+            if self._approved_plan_problem(state) or self._candidate_head_problem(state):
+                raise SupervisorError("runtime candidate or approved plan changed")
+            gate["runtime_authorization"] = {"actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock()), "payload_sha256": gate["payload_sha256"]}
+            gate["summary_fields"]["runtime_authorized"] = True
+            self.emit_event(state, "RUNTIME_VALIDATION_READY", {"gate": safe_gate_view(gate)})
+            self.store.write_state(state)
+            return {"ok": True, "message": "Runtime test authorized. Execute the reviewed checks; this is not a PASS result. Evidence must still be recorded separately.", "gate_id": gate_id}
         if gate["gate_type"] == "plan_approval":
             payload = gate["payload"]
             state["approved_plan"] = {"plan_path": gate["artifact_path"], "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"], "gate_id": gate_id, "actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock())}
             state["runtime_policy"] = {key: payload[key] for key in ("runtime_validation_required", "rebuild_required", "rebuild_reason", "push_approval_required", "migration_required")}
             state["runtime_policy"]["validation_mode"] = payload.get("runtime_validation_mode", "operator_collaborative")
+            if "runtime_manifest_root" in payload:
+                state["runtime_policy"]["runtime_manifest_root"] = payload["runtime_manifest_root"]
             state["continuation"] = {"kind": "plan_approved", "gate_id": gate_id, "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"]}
             self._reset_auto_turns(state)
-            state["active_agent"] = "codex"
+            # F3: the continuation goes back to the gate's own originating agent — always codex under
+            # gated_v2 (the only agent allowed to raise a plan_approval gate there), but under
+            # supervised_v2 a Claude-started task's approval must return to that same Claude session,
+            # never force a switch to codex.
+            state["active_agent"] = gate["agent"]
             event = "PLAN_APPROVED"
         else:
             problem = self._approved_plan_problem(state) or self._push_prerequisite_problem(state, gate["candidate_sha"])
@@ -1003,19 +1145,29 @@ class SupervisorV2Mixin:
             raise SupervisorError(plan_problem)
         if not state.get("approved_plan"):
             raise SupervisorError("no approved plan")
-        if not SHA_RE.match(candidate_sha or ""):
+        if gate["payload"].get("decision_question"):
+            self._check_gate_hashes(gate, None, None)
+        if gate["payload"].get("decision_question") and not gate.get("runtime_authorization"):
+            raise SupervisorError("approve the runtime test before submitting its result")
+        manifest = gate["payload"].get("candidate_kind") == "manifest"
+        if manifest:
+            if candidate_sha != gate.get("candidate_digest") or state.get("runtime_candidate") != gate["payload"]:
+                raise SupervisorError("manifest candidate does not match pending runtime gate")
+            verify_runtime_manifest(gate["payload"], approved_root=state["runtime_policy"].get("runtime_manifest_root"), config=self.config)
+        elif not SHA_RE.match(candidate_sha or ""):
             raise SupervisorError("candidate SHA must be a full 40-hex commit SHA")
-        if candidate_sha != gate.get("candidate_sha") or candidate_sha != state.get("candidate_sha"):
+        if not manifest and (candidate_sha != gate.get("candidate_sha") or candidate_sha != state.get("candidate_sha")):
             raise SupervisorError("candidate SHA does not match the pending candidate")
         if environment not in self.config["runtime_environments"]:
             raise SupervisorError(f"unknown runtime environment {environment!r}")
-        head = (head_resolver or self.head_resolver)(Path(self.config["product_repo"]))
-        if head != candidate_sha:
-            raise SupervisorError(f"repository HEAD {head[:12]} no longer equals the candidate SHA")
+        if not manifest:
+            head = (head_resolver or self.head_resolver)(Path(self.config["product_repo"]))
+            if head != candidate_sha:
+                raise SupervisorError(f"repository HEAD {head[:12]} no longer equals the candidate SHA")
         review_dir = Path(gate["payload"]["review_directory"])
         path = check_safe_file(evidence_file, root=review_dir, max_bytes=int(self.config["max_payload_bytes"]), label="runtime evidence")
         raw = load_json(path, label="runtime evidence")
-        evidence = validate_runtime_evidence(raw, candidate_sha=candidate_sha, environment=environment, now=self.clock())
+        evidence = validate_runtime_evidence(raw, candidate_sha=candidate_sha, environment=environment, now=self.clock(), candidate_kind="manifest" if manifest else "git_commit")
         if evidence["result"] != result:
             raise SupervisorError(f"evidence result {evidence['result']} does not match the {result} command")
         return gate, path, evidence
@@ -1045,8 +1197,10 @@ class SupervisorV2Mixin:
             "proposed_by": _bounded_str(actor, "actor", max_len=200), "proposed_at_unix": self.clock(), "legacy": False,
             "summary": self._evidence_reason(evidence),
         }
+        if gate["payload"].get("candidate_kind") == "manifest":
+            proposal["candidate_digest"] = proposal.pop("candidate_sha")
         state["runtime_proposal"] = proposal
-        self.emit_event(state, "RUNTIME_EVIDENCE_PROPOSED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "result": result,
+        self.emit_event(state, "RUNTIME_EVIDENCE_PROPOSED", {"gate_id": gate["gate_id"], ("candidate_digest" if "candidate_digest" in proposal else "candidate_sha"): candidate_sha, "environment": environment, "result": result,
                                                               "evidence_sha256": digest, "proposed_by": proposal["proposed_by"], "summary": proposal["summary"],
                                                               "commands": [{"command": c["command"][:200], "result": c["result"][:200]} for c in evidence["commands"][:12]]})
         self.store.write_state(state)
@@ -1070,13 +1224,13 @@ class SupervisorV2Mixin:
             raise SupervisorError("confirmation does not match the pending runtime gate")
         if not isinstance(evidence_sha256, str) or evidence_sha256 != proposal.get("evidence_sha256"):
             raise SupervisorError("confirmation does not match the proposed evidence; use the newest card")
-        if candidate_sha is not None and candidate_sha != proposal.get("candidate_sha"):
+        if candidate_sha is not None and candidate_sha != (proposal.get("candidate_sha") or proposal.get("candidate_digest")):
             raise SupervisorError("confirmation candidate does not match the proposal")
         if environment is not None and environment != proposal.get("environment"):
             raise SupervisorError("confirmation environment does not match the proposal")
         if decision != proposal.get("result"):
             raise SupervisorError(f"the proposed evidence says {proposal.get('result')}; recording {decision} requires new evidence, not a relabel")
-        gate, path, evidence = self._validate_runtime_submission(state, run_id=run_id, candidate_sha=str(proposal["candidate_sha"]), environment=str(proposal["environment"]), evidence_file=str(proposal["evidence_path"]), result=decision, head_resolver=head_resolver)
+        gate, path, evidence = self._validate_runtime_submission(state, run_id=run_id, candidate_sha=str(proposal.get("candidate_sha") or proposal.get("candidate_digest")), environment=str(proposal["environment"]), evidence_file=str(proposal["evidence_path"]), result=decision, head_resolver=head_resolver)
         if gate.get("gate_id") != gate_id or sha256_file(path) != evidence_sha256:
             raise SupervisorError("the evidence file changed since it was proposed; propose it again")
         provenance = {"mode": "operator_collaborative", "actor": _bounded_str(actor, "actor", max_len=200), "chat_id": chat_id, "at_unix": self.clock(), "proposal_sha256": evidence_sha256}
@@ -1088,17 +1242,17 @@ class SupervisorV2Mixin:
 
     def _apply_runtime_evidence(self, state: dict[str, Any], gate: dict[str, Any], path: Path, evidence: dict[str, Any], result: str, *, actor: str, provenance: dict[str, Any]) -> dict[str, Any]:
         """The canonical write: exactly the pre-existing PASS/FAIL semantics plus provenance."""
-        candidate_sha, environment = evidence["candidate_sha"], evidence["environment"]
+        candidate_sha, environment = evidence.get("candidate_sha") or evidence["candidate_digest"], evidence["environment"]
         record = {**evidence, "evidence_path": str(path), "evidence_sha256": sha256_file(path), "received_at": iso_utc(self.clock()), "gate_id": gate["gate_id"], "actor": actor, "provenance": provenance}
         state["runtime_evidence"] = record
         if result == "FAIL":
             gate["last_failure"] = {"at": record["received_at"], "evidence_sha256": record["evidence_sha256"]}
             state["pending_gate"] = gate
-            self.emit_event(state, "RUNTIME_VALIDATION_FAILED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "provenance_mode": provenance["mode"], "actor": provenance["actor"]})
+            self.emit_event(state, "RUNTIME_VALIDATION_FAILED", {"gate_id": gate["gate_id"], ("candidate_digest" if "candidate_digest" in evidence else "candidate_sha"): candidate_sha, "environment": environment, "provenance_mode": provenance["mode"], "actor": provenance["actor"]})
             self.store.write_state(state)
             return {"ok": True, "message": "runtime validation FAIL recorded; task remains blocked at WAIT_RUNTIME_VALIDATION", "gate_id": gate["gate_id"]}
         self._finish_gate(state, gate, "approved", actor=actor, chat_id=provenance.get("chat_id"), note="runtime PASS recorded")
-        self.emit_event(state, "RUNTIME_VALIDATION_PASSED", {"gate_id": gate["gate_id"], "candidate_sha": candidate_sha, "environment": environment, "evidence_sha256": record["evidence_sha256"], "provenance_mode": provenance["mode"], "actor": provenance["actor"]})
+        self.emit_event(state, "RUNTIME_VALIDATION_PASSED", {"gate_id": gate["gate_id"], ("candidate_digest" if "candidate_digest" in evidence else "candidate_sha"): candidate_sha, "environment": environment, "evidence_sha256": record["evidence_sha256"], "provenance_mode": provenance["mode"], "actor": provenance["actor"]})
         policy = state.get("runtime_policy") or {}
         if policy.get("push_approval_required"):
             push_gate = self._synthesize_push_gate(state, gate)
@@ -1108,7 +1262,7 @@ class SupervisorV2Mixin:
             self.emit_event(state, "PUSH_APPROVAL_REQUIRED", {"gate": safe_gate_view(push_gate)})
             self.store.write_state(state)
             return {"ok": True, "message": "runtime PASS recorded; push approval is now pending", "gate_id": push_gate["gate_id"]}
-        state["continuation"] = {"kind": "runtime_passed", "candidate_sha": candidate_sha, "environment": environment}
+        state["continuation"] = {"kind": "runtime_passed", ("candidate_digest" if "candidate_digest" in evidence else "candidate_sha"): candidate_sha, "environment": environment}
         self._reset_auto_turns(state)
         state["supervisor_state"] = "RUNNING"
         state["wait_user_reason"] = None
@@ -1681,7 +1835,7 @@ class SupervisorV2Mixin:
         request_id = command.get("request_id")
         if not isinstance(request_id, str) or not re.match(r"^[A-Za-z0-9_-]{8,128}$", request_id):
             raise SupervisorError("command request_id must be 8-128 URL-safe characters")
-        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "retry_routing_result", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply"):
+        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "repair_gate", "retry_routing_result", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply"):
             raise SupervisorError(f"unsupported command action {command.get('action')!r}")
         dirs = self.inbox_paths()
         for path in dirs.values():
@@ -1797,6 +1951,8 @@ class SupervisorV2Mixin:
             record.get("available_count") == authorization.get("available_count"),
             record.get("account_fingerprint") == authorization.get("account_fingerprint"),
             record.get("session_selection") == command.get("session_selection"),
+            (record.get("workflow_policy") or "supervised_v2") == command.get("workflow_policy"),
+            (record.get("starting_agent") or "codex") == command.get("starting_agent"),
             authorization_status == "supervisor_consuming" or self.clock() <= float(record.get("expires_at_unix") or 0),
         )
         if not all(checks):
@@ -1861,8 +2017,17 @@ class SupervisorV2Mixin:
                 char_limit = int(self.config["max_task_file_bytes"])
             if not isinstance(text, str) or not text.strip():
                 raise SupervisorError("task_text is required")
+            requested_policy = command.get("workflow_policy") or self.config.get("default_workflow_policy") or "supervised_v2"
+            if requested_policy not in V2_WORKFLOW_POLICIES:
+                raise SupervisorError(f"invalid workflow policy: {requested_policy}")
+            # F4: the requested starting agent, exact-typed and bound through the same recovery/replay path
+            # as the policy; initialize()/_validate_new_run_request() enforce it against the resolved
+            # contract's allowed_start_agents (codex-only under gated_v2, either provider under supervised_v2).
+            requested_start = command.get("starting_agent") or "codex"
+            if requested_start not in PROVIDERS:
+                raise SupervisorError(f"invalid starting agent: {requested_start}")
             authorization = command.get("codex_reset_authorization")
-            task_binding = {key: command[key] for key in ("task_text", "task_file", "task_reference", "task_file_sha256", "upload_id", "source") if key in command}
+            task_binding: dict[str, Any] = {key: command[key] for key in ("task_text", "task_file", "task_reference", "task_file_sha256", "upload_id", "source") if key in command}
             selection = command.get("session_selection")
             if state is not None and state.get("supervisor_state") not in TERMINAL_STATES:
                 preallocated = command.get("preallocated_run_id")
@@ -1874,8 +2039,8 @@ class SupervisorV2Mixin:
                     and state.get("task_id") == preallocated
                     and state.get("task_text") == text
                     and state.get("task_reference") == reference
-                    and state.get("workflow_policy") == "gated_v2"
-                    and state.get("start_agent") == "codex"
+                    and state.get("workflow_policy") == requested_policy
+                    and state.get("start_agent") == requested_start
                     and state.get("session_selection") == expected_selection
                     and isinstance(authorization, dict)
                     and reset.get("authorized_reset_budget") == authorization.get("budget")
@@ -1902,7 +2067,7 @@ class SupervisorV2Mixin:
                 started_preparation = self._mark_session_preparation_started(preallocated)
                 if started_preparation is not None:
                     state["session_preparation"] = self.session_preparation_view(started_preparation)
-                result = {"ok": True, "message": f"task started with codex (run {preallocated[:8]})", "run_id": preallocated}
+                result = {"ok": True, "message": f"task started with {requested_start} (run {preallocated[:8]})", "run_id": preallocated}
                 request_id = command.get("request_id")
                 if not isinstance(request_id, str) or not request_id:
                     raise SupervisorError("task request identity is invalid")
@@ -1918,19 +2083,19 @@ class SupervisorV2Mixin:
                 return result
             pending_authorization = self._validate_pending_reset_authorization(command, task_binding)
             try:
-                preparation = self.prepare_task_sessions(selection, preparation_id=str(command.get("preallocated_run_id")))
+                preparation = self.prepare_task_sessions(selection, preparation_id=str(command.get("preallocated_run_id")), start_provider=requested_start)
             except SupervisorError as error:
                 # The operator-facing outcome: nothing was delivered, the old sessions are intact, and the
                 # concrete recovery choices (retry adopts a settled result; abandon frees a new sequence).
                 raise SupervisorError(self._session_preparation_failure_message(str(command.get("preallocated_run_id")), error)) from error
-            new_state = self.initialize(text, "codex", task_reference=reference, workflow_policy="gated_v2", char_limit=char_limit,
+            new_state = self.initialize(text, requested_start, task_reference=reference, workflow_policy=requested_policy, char_limit=char_limit,
                                         codex_reset_authorization=authorization if isinstance(authorization, dict) else None,
                                         run_id=command.get("preallocated_run_id"), session_selection=selection, session_preparation=preparation)
             started_preparation=self._mark_session_preparation_started(new_state["run_id"])
             if started_preparation is not None:
                 new_state["session_preparation"]=self.session_preparation_view(started_preparation)
                 self.store.write_state(new_state)
-            result = {"ok": True, "message": f"task started with codex (run {new_state['run_id'][:8]})", "run_id": new_state["run_id"]}
+            result = {"ok": True, "message": f"task started with {requested_start} (run {new_state['run_id'][:8]})", "run_id": new_state["run_id"]}
             request_id = command.get("request_id")
             if isinstance(request_id, str) and request_id:
                 # F3: bind the accepted request to the new run durably BEFORE any fallible bookkeeping, so a
@@ -1962,6 +2127,8 @@ class SupervisorV2Mixin:
             return {"ok": True, "message": f"quota recheck requested for {wait.get('provider')}; the worker refreshes without waking any agent" + ("" if wait.get("early_refresh_available") else " (no independent refresh for this provider; cached deadline applies)")}
         if action == "retry_routing_result":
             return self.retry_routing_result(state, run_id=command.get("run_id"), turn_id=command.get("turn_id"), actor=actor)
+        if action == "repair_gate":
+            return self.repair_gate(state, run_id=command.get("run_id"), turn_id=command.get("turn_id"))
         if action == "ask_agent":
             return self.ask_agent(state, run_id=command.get("run_id"), actor=actor, question=command.get("question"), chat_id=chat_id if type(chat_id) is int else None,
                                   decision_id=command.get("decision_id"), expected_state=command.get("expected_state"),
@@ -1978,7 +2145,7 @@ class SupervisorV2Mixin:
         if action == "runtime_confirm":
             return self.confirm_runtime_evidence(state, run_id=command.get("run_id"), gate_id=command.get("gate_id"), evidence_sha256=command.get("evidence_sha256"),
                                                  decision=command.get("decision"), actor=actor, chat_id=chat_id if type(chat_id) is int else None,
-                                                 candidate_sha=command.get("candidate_sha"), environment=command.get("environment"))
+                                                 candidate_sha=command.get("candidate_sha") or command.get("candidate_digest"), environment=command.get("environment"))
         if action == "done":
             bound = command.get("run_id")
             if not isinstance(bound, str) or not bound:
