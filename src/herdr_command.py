@@ -28,6 +28,7 @@ from herdr_core import (
     valid_pane_id,
 )
 from herdr_helpers import HelperManager
+from herdr_onboarding import apply_project, inspect_project
 from herdr_runtime import Supervisor
 from herdr_validation import StateStore, load_task_file, register_query_provider
 
@@ -217,6 +218,20 @@ def show_logs(paths: Paths, lines: int) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdr-supervisor", description="Supervise existing Herdr Claude/Codex sessions without replacing their workflow.")
     sub = parser.add_subparsers(dest="command", required=True)
+    project = sub.add_parser("project", help="offline project discovery and reviewed workflow setup (does not touch live Supervisor)")
+    onboarding = project.add_subparsers(dest="project_command", required=True)
+    inspect = onboarding.add_parser("inspect", help="stage an adaptive proposal outside the repository; no scripts or agents run")
+    inspect.add_argument("root", type=Path)
+    inspect.add_argument("--output", type=Path, required=True)
+    inspect.add_argument("--preset", choices=("preserve", "adaptive", "gated"), default="preserve", help="preserve existing workflow by default; adaptive/gated explicitly adopt the bundled workflow")
+    inspect.add_argument("--write-instructions", action="store_true", help="in preserve mode only: opt in to neutral project-context appendices")
+    inspect.add_argument("--support-skill", action="append", default=[], metavar="NAME=DIR", help="explicit full local skill snapshot (stop-slop, ui-ux-pro-max, skill-creator, task-observer); repeatable")
+    inspect.add_argument("--assessment", type=Path, help="agent-authored findings/rules/checks JSON with relative evidence citations")
+    inspect.add_argument("--policy", choices=("supervised_v2", "gated_v2"), default=None)
+    apply = onboarding.add_parser("apply", help="apply exact reviewed files; does not activate the profile")
+    apply.add_argument("bundle", type=Path)
+    apply.add_argument("--approval-sha256", required=True)
+    apply.add_argument("--acknowledge-existing", action="store_true", help="acknowledge reviewing conflicts with existing instructions before appending")
     run = sub.add_parser("run", help="start a new supervised task (foreground worker)")
     run.add_argument("--start", choices=PROVIDERS, default="codex", help="entry agent (default: codex)")
     run.add_argument("--policy", choices=WORKFLOW_POLICIES, default=None,
@@ -333,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     paths = Paths.from_environment()
     try:
+        if args.command == "project":
+            result = (inspect_project(args.root, args.output, policy=args.policy, assessment_file=args.assessment, support_specs=args.support_skill, preset=args.preset, write_instructions=args.write_instructions) if args.project_command == "inspect"
+                      else apply_project(args.bundle, args.approval_sha256, acknowledge_existing=args.acknowledge_existing))
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         config = load_config(paths.config_file)
         herdr = HerdrCli(resolve_herdr_bin(config.get("herdr_bin")))
         supervisor = Supervisor(paths, config, herdr)
