@@ -26,7 +26,7 @@ from v2_fixtures import V2Case, hs  # noqa: E402
 
 SRC = Path(hs.__file__).resolve().parent
 # One-way layering, lowest first. A module may import only modules that appear before it.
-LAYERS = ["herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_runtime", "herdr_command"]
+LAYERS = ["herdr_core", "herdr_cli", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
 FACADE = "herdr_supervisor"
 # Names companion modules and tests consume through the facade (recorded before the split).
 CONSUMED = sorted({
@@ -102,31 +102,60 @@ class CharacterizationTests(V2Case):
     """Golden values recorded from the accepted pre-split monolith. Changing them is a behavior change."""
 
     def test_configuration_and_state_defaults_are_unchanged(self) -> None:
-        self.assertEqual(hashlib.sha256(json.dumps(hs.DEFAULT_CONFIG, sort_keys=True).encode()).hexdigest(), "b549cbdf5717afa425c224ec33d14c8c6ed76c557e397fe1ce29616029ee6709")
+        # Re-recorded after the general-workflow-profiles change added `default_workflow_policy:
+        # "supervised_v2"` to DEFAULT_CONFIG (previous golden b549cbdf…).
+        self.assertEqual(hashlib.sha256(json.dumps({k:v for k,v in hs.DEFAULT_CONFIG.items() if k not in ("helpers", "native_tracking")}, sort_keys=True).encode()).hexdigest(), "795f4295ca969da752bfa5578f85221a57dfadf4f7dc97023c5e60495faa400f")
+        self.assertEqual(hs.DEFAULT_CONFIG["default_workflow_policy"], "supervised_v2")
+        self.assertEqual(hs.DEFAULT_CONFIG["helpers"], {"enabled": False})
+        self.assertEqual(hs.DEFAULT_CONFIG["native_tracking"], {"enabled": False, "roots": [], "files": []})
         # Recorded after the gate-preserving follow-up added the optional `agent_followup: None` default
         # (pre-follow-up value: a558de0f…). Every other default is byte-identical to the accepted monolith.
         # Re-recorded after the runtime evidence provenance revision added the optional `runtime_proposal: None`
         # default (previous golden b022b202…); the pre-follow-up golden is still asserted for the other fields.
         # (+ `owner_recovery: None` from the pane-ownership recovery correction; previous golden c97194fb…)
-        self.assertEqual(hashlib.sha256(json.dumps({k: v for k, v in hs.new_v2_fields("gated_v2").items() if k != "owner_recovery"}, sort_keys=True).encode()).hexdigest(), "c97194fbd725b8ac90027abc050c89f598e27f3292066fe9aaadc4f11c381040")
+        # (+ `workflow_contract` from the general-workflow-profiles change: a resolved, policy-derived dict,
+        # not an independently-defaulted optional field, so it is excluded here like the others and its
+        # value is asserted separately below.)
+        exclude = ("owner_recovery", "invalid_gate", "runtime_candidate", "workflow_contract")
+        self.assertEqual(hashlib.sha256(json.dumps({k: v for k, v in hs.new_v2_fields("gated_v2").items() if k not in exclude}, sort_keys=True).encode()).hexdigest(), "c97194fbd725b8ac90027abc050c89f598e27f3292066fe9aaadc4f11c381040")
         self.assertIsNone(hs.new_v2_fields("gated_v2")["owner_recovery"])
-        without = {k: v for k, v in hs.new_v2_fields("gated_v2").items() if k not in ("agent_followup", "runtime_proposal", "owner_recovery")}
+        without = {k: v for k, v in hs.new_v2_fields("gated_v2").items() if k not in ("agent_followup", "runtime_proposal", *exclude)}
         self.assertEqual(hashlib.sha256(json.dumps(without, sort_keys=True).encode()).hexdigest(), "a74e13eab152f143d6c987edca655cbb2a484f33ed243ace386df525aee7907e")
+        self.assertEqual(hs.new_v2_fields("gated_v2")["workflow_contract"], hs.resolve_workflow_contract("gated_v2"))
+        self.assertEqual(hs.new_v2_fields("supervised_v2")["workflow_contract"], hs.resolve_workflow_contract("supervised_v2"))
+        self.assertIsNone(hs.new_v2_fields("v1")["workflow_contract"])
         migrated = hs.migrate_state_v1({"schema_version": 1, "supervisor_state": "DONE"})
         self.assertEqual(migrated["workflow_policy"], "v1")
+        self.assertIsNone(migrated["workflow_contract"])
         self.assertEqual(migrated["prompt_metrics"]["prompts"], 0)
 
     def test_prompt_text_is_unchanged(self) -> None:
+        """gated_v2 text is byte-for-byte the original golden (workflow_contract added, wording untouched);
+        supervised_v2 is a new golden pinning its distinct, non-Prospera-specific wording."""
         class Builder(hs.SupervisorV2Mixin):
             config = {"review_root": "/r", "project_root": "/p"}
 
-        expected = {
+        gated_expected = {
             ("initial", "d415e82a6f1fc191aafb4f099b00dcec164728386c243eda4b5da9cdbe7f16c0"): {"run_id": RUN, "task_text": "T"},
             ("handoff", "8a2766aa37e39df333265001526ce9b07d4db7110ed3446e15b2eeeb7d7ba46a"): {"run_id": RUN, "last_successful_handoff": {"stage": "brief", "from_agent": "codex", "summary": "s"}},
             ("continuation:revision", "a3c4250d4b176cc8b432a3f27eb3d9dd5db329c0fd845f09cf0419f6bd5781f5"): {"run_id": RUN, "continuation": {"kind": "revision", "gate_type": "plan_approval", "note": "n"}},
         }
-        for (kind, digest), state in expected.items():
-            self.assertEqual(hashlib.sha256(Builder().build_prompt_v2(dict(state), TURN, kind).encode()).hexdigest(), digest, kind)
+        supervised_expected = {
+            ("initial", "1c58e050c7abc13384137a94c298f109a5afe078e8a4b0e2deac7ef1ea9fe5a6"): {"run_id": RUN, "task_text": "T"},
+            ("handoff", "f17899ccceb83538f38232684091d0da0ebc31c6af5780e421c463545d602174"): {"run_id": RUN, "last_successful_handoff": {"stage": "brief", "from_agent": "codex", "summary": "s"}},
+            ("continuation:revision", "db04cc8ebd9aaaed95a7dc70bd0b2ad17b8f935a03844084cce91cb4628847b7"): {"run_id": RUN, "continuation": {"kind": "revision", "gate_type": "plan_approval", "note": "n"}},
+        }
+        for policy, expected in (("gated_v2", gated_expected), ("supervised_v2", supervised_expected)):
+            contract = hs.resolve_workflow_contract(policy)
+            for (kind, digest), state in expected.items():
+                built = dict(state, workflow_contract=contract)
+                self.assertEqual(hashlib.sha256(Builder().build_prompt_v2(built, TURN, kind).encode()).hexdigest(), digest, (policy, kind))
+        gated_text = Builder().build_prompt_v2({"run_id": RUN, "task_text": "T", "workflow_contract": hs.resolve_workflow_contract("gated_v2")}, TURN, "initial")
+        supervised_text = Builder().build_prompt_v2({"run_id": RUN, "task_text": "T", "workflow_contract": hs.resolve_workflow_contract("supervised_v2")}, TURN, "initial")
+        self.assertIn("Claude implements only after the human approves the exact CODEX_PLAN.md", gated_text)
+        self.assertNotIn("CODEX_PLAN.md", supervised_text)
+        self.assertIn("(gated workflow)", gated_text)
+        self.assertIn("(supervised workflow)", supervised_text)
 
     def test_protocol_parsing_is_unchanged(self) -> None:
         text = (Path(__file__).resolve().parent / "fixtures" / "codex-recent-unwrapped-wrapped-result.txt").read_text()

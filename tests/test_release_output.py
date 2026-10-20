@@ -155,7 +155,7 @@ class LongOutputTests(OutputCase):
         self.assertEqual(recovered["parts"]["document"]["replacements"], 1)
         self.assertEqual(len(self.api.documents), 1)
 
-    def test_final_task_report_summary_plus_document_with_twenty_fields(self) -> None:
+    def test_final_task_report_summary_plus_task_specific_document(self) -> None:
         self.plan_gate()
         self.approve_pending()
         with self.sup.store.transaction():
@@ -170,17 +170,34 @@ class LongOutputTests(OutputCase):
         buttons = {b["text"] for row in summary[0]["reply_markup"]["inline_keyboard"] for b in row}
         self.assertEqual(buttons, {"Open Full Report", "Status"})
         doc = self.api.documents[-1]
-        self.assertTrue(doc["filename"].startswith("final_report-"))
+        self.assertTrue(doc["filename"].endswith("-report.md"))
+        self.assertNotIn("final_report-", doc["filename"])
         body = doc["data"].decode()
-        for index in range(1, 21):
-            self.assertIn(f"## {index}. ", body)
-        self.assertIn("## 20. Commit/push/publication actions still requiring approval", body)
+        self.assertIn("## Outcome", body)
+        self.assertIn("## What you need to do", body)
+        self.assertNotIn("WAIT_USER/WAIT_QUOTA bug root cause", body)
+        self.assertNotIn("see the implementation handoff", body)
         self.assertNotIn(str(self.state().get("task_reference")), body)
         # the button re-sends the same registered report; a duplicate event never registers a second one
         token = next(b["callback_data"] for row in summary[0]["reply_markup"]["inline_keyboard"] for b in row if b["text"] == "Open Full Report")
         self.bridge.handle_update(callback(9, token))
         self.assertEqual(len(ha.list_records(self.paths)), 1)
         self.assertEqual(len(self.api.documents), 2)
+
+    def test_legacy_generated_report_is_replaced_once_without_mutating_the_original(self) -> None:
+        self.plan_gate()
+        state = self.state()
+        event = self.emit("TASK_DONE", {"stage": "review", "handoff": "Task_complete"})
+        old = ha.register_text(self.paths, self.config, category="final_report",
+                               text="# Old report\n## 4. WAIT_USER/WAIT_QUOTA bug root cause\n## 20. Commit/push/publication actions still requiring approval\n",
+                               name=f"task-{hp.abbrev(state['run_id'])}-final-report", run_id=state['run_id'], event_id=event['event_id'])
+        _, old_body = ha.verify_for_send(self.paths, self.config, old['artifact_id'])
+        new = self.bridge._final_report_artifact(event)
+        self.assertNotEqual(new['artifact_id'], old['artifact_id'])
+        self.assertEqual(self.bridge._final_report_artifact(event)['artifact_id'], new['artifact_id'])
+        self.assertEqual(ha.verify_for_send(self.paths, self.config, old['artifact_id'])[1], old_body)
+        self.assertIn(b"## Outcome", ha.verify_for_send(self.paths, self.config, new['artifact_id'])[1])
+        self.assertEqual(len(ha.list_records(self.paths)), 2)
 
     def test_task_done_prefers_trusted_authoritative_final_report_descriptor(self) -> None:
         self.plan_gate()

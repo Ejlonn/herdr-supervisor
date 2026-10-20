@@ -25,6 +25,7 @@ from herdr_core import (
     SCHEMA_VERSION,
     SUPERVISOR_VERSION,
     TERMINAL_STATES,
+    V2_WORKFLOW_POLICIES,
     WORKFLOW_POLICIES,
     HerdrError,
     OwnerRecoveryNeeded,
@@ -37,8 +38,10 @@ from herdr_core import (
     iso_utc,
     load_json,
 )
+from herdr_helpers import HelperManager
 from herdr_protocol import ProtocolBlock, parse_protocol
 from herdr_quota import QuotaSnapshot, QuotaWindow, blocking_windows, parse_quota_snapshot, quota_as_dict, quota_resume_at
+from herdr_session_catalog import native_snapshot, refresh_native, session_catalog
 from herdr_sessions import (
     cli_request_binding,
     cli_request_envelope,
@@ -52,7 +55,7 @@ from herdr_sessions import (
     validate_preparation_record,
     validate_selection,
 )
-from herdr_validation import StateStore, git_head, new_v2_fields, query_owner_summary, safe_gate_view
+from herdr_validation import StateStore, git_head, load_query_registry, new_v2_fields, query_owner_summary, resolve_workflow_contract, safe_gate_view
 from herdr_workflow import SupervisorV2Mixin, _carrier_panes
 
 
@@ -140,9 +143,9 @@ class Supervisor(SupervisorV2Mixin):
 
     def prepare_task_sessions(self, selection: Any, *, preparation_id: str, journal_path: Path | None = None,
                               origin: str = "supervisor", request_binding: str | None = None,
-                              request_envelope: dict[str, Any] | None = None) -> dict[str, Any]:
+                              request_envelope: dict[str, Any] | None = None, start_provider: str = "codex") -> dict[str, Any]:
         return prepare_sessions(self, selection, preparation_id=preparation_id, journal_path=journal_path,
-                                origin=origin, request_binding=request_binding, request_envelope=request_envelope)
+                                origin=origin, request_binding=request_binding, request_envelope=request_envelope, start_provider=start_provider)
 
     @staticmethod
     def session_preparation_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -348,11 +351,30 @@ class Supervisor(SupervisorV2Mixin):
     def quota_path(self, provider: str) -> Path:
         return Path(self.config["quota_dir"]) / self.config["agents"][provider]["quota_file"]
 
-    def quota(self, provider: str, *, session_id: str | None = None) -> QuotaSnapshot:
+    def quota(self, provider: str, *, session_id: str | None = None, allow_empty: bool = False) -> QuotaSnapshot:
         if session_id is None:
             with contextlib.suppress(SupervisorError):
                 session_id = self.owners()[provider]["session_id"]
-        return parse_quota_snapshot(self.quota_path(provider), provider, session_id=session_id)
+        return parse_quota_snapshot(self.quota_path(provider), provider, session_id=session_id, allow_empty=allow_empty)
+
+    def startup_blocking_windows(self, state: dict[str, Any], provider: str) -> tuple[QuotaWindow, ...]:
+        """Claude omits rate_limits until its first response after a process restart.
+
+        Only a valid, correctly scoped empty list is unknown telemetry at ordinary
+        startup. It never clears a usage-limit wait or authorizes interrupted-turn recovery.
+        All quota-recovery and post-settle classification paths keep strict parsing.
+        """
+        snapshot = self.quota(provider, allow_empty=provider == "claude")
+        if not snapshot.windows:
+            now = self.clock()
+            fetched = snapshot.fetched_at
+            if (fetched is None or fetched > now + 60
+                    or snapshot.window_source == "windows"
+                    or state.get("quota_wait") or state.get("interrupted_delivery")):
+                raise QuotaError(f"{provider} empty quota telemetry is not safe for startup or quota recovery")
+            self._log(state, "quota_telemetry_unavailable_at_start", provider=provider,
+                      reason="Claude statusLine has no windows before the first response; quota remains unknown")
+        return blocking_windows(snapshot, self.clock())
 
     def quota_refresh_command(self, provider: str) -> list[str] | None:
         ref = (self.config.get("quota_refresh_commands") or {}).get(provider)
@@ -433,12 +455,20 @@ class Supervisor(SupervisorV2Mixin):
                 raise SupervisorError(f"owners.json is missing a valid {provider} record")
         return value
 
-    def verify_or_seed_owners(self) -> dict[str, dict[str, str]]:
-        """Verify live agents against owners.json; seed the file only when it does not exist."""
+    def verify_or_seed_owners(self, required_providers: tuple[str, ...] = PROVIDERS) -> dict[str, dict[str, str]]:
+        """Verify providers needed now; retain all recorded identities for later exact-session handoffs.
+
+        First-time ownership enrollment still requires both provider records. Startup never invents
+        a missing native identity or silently changes an enrolled conversation.
+        """
+        if not required_providers or any(p not in PROVIDERS for p in required_providers):
+            raise SupervisorError("invalid required startup providers")
         live_agents = self.herdr.list_agents()
         existing = self.owners() if self.paths.owners_file.exists() else None
         resolved: dict[str, dict[str, str]] = {}
         for provider in PROVIDERS:
+            if existing is not None and provider not in required_providers:
+                continue
             name = self.agent_name(provider)
             if existing is not None:
                 expected = existing[provider]["session_id"]
@@ -640,7 +670,7 @@ class Supervisor(SupervisorV2Mixin):
     # ----- prompts
 
     def build_prompt(self, state: dict[str, Any], turn_id: str, kind: str) -> str:
-        if state.get("workflow_policy") == "gated_v2":
+        if state.get("workflow_policy") in V2_WORKFLOW_POLICIES:
             return self.build_prompt_v2(state, turn_id, kind)
         protocol = (
             "When you finish this turn, end your response with exactly one contiguous six-line block, "
@@ -784,7 +814,7 @@ class Supervisor(SupervisorV2Mixin):
         if isinstance(anomaly, dict) and anomaly.get("continuation") == "submitted":
             anomaly["continuation"] = "resolved"
             anomaly["resolved_at"] = iso_utc(self.clock())
-        if state.get("workflow_policy") == "gated_v2" or block.version == 2:
+        if state.get("workflow_policy") in V2_WORKFLOW_POLICIES or block.version == 2:
             return self.route_v2(state, block)
         source = state["active_agent"]
         state["last_successful_handoff"] = {
@@ -881,11 +911,13 @@ class Supervisor(SupervisorV2Mixin):
             # Precedence: refresh/reconcile quota through the non-LLM mechanism, then validate the snapshot
             # with the existing stale/malformed safeguards. A provably blocking future window means the turn
             # was most likely cut by quota: enter deferred WAIT_QUOTA (no screen-string match required).
-            gated_v2 = state.get("workflow_policy") == "gated_v2"
+            # Delivery-certainty and missing-result strictness are protocol-safety, not workflow procedure:
+            # both V2 contract policies (gated_v2, supervised_v2) get the strict treatment; only legacy v1 does not.
+            strict = state.get("workflow_policy") in V2_WORKFLOW_POLICIES
             accepted = delivery.get("status") == "accepted" or (
                 delivery.get("status") == "uncertain" and isinstance(delivery.get("accepted_at"), str)
             )
-            if gated_v2 and not accepted:
+            if strict and not accepted:
                 return self.set_wait_user(
                     state,
                     f"{name} settled ({status}) without a protocol block, but delivery was never confirmed accepted; "
@@ -896,25 +928,25 @@ class Supervisor(SupervisorV2Mixin):
             try:
                 snapshot = self.quota(provider)
             except QuotaError as error:
-                return self.set_wait_user(state, f"{name} settled without a protocol block and quota evidence is unsafe: {error}", requires_action=gated_v2)
+                return self.set_wait_user(state, f"{name} settled without a protocol block and quota evidence is unsafe: {error}", requires_action=strict)
             max_age = float(self.config["quota_snapshot_max_age_seconds"])
             if snapshot.fetched_at is None or snapshot.fetched_at > self.clock() + 60 or self.clock() - snapshot.fetched_at > max_age:
-                return self.set_wait_user(state, f"{name} settled without a protocol block and quota evidence is stale or undated", requires_action=gated_v2)
+                return self.set_wait_user(state, f"{name} settled without a protocol block and quota evidence is stale or undated", requires_action=strict)
             blocking = blocking_windows(snapshot, self.clock())
             inferred = False
             if not blocking:
-                blocking = self.inferred_provider_limit_windows(snapshot, output) if gated_v2 else ()
+                blocking = self.inferred_provider_limit_windows(snapshot, output) if strict else ()
                 inferred = bool(blocking)
             if blocking:
                 return self.wait_for_quota(state, provider, blocking, midturn=True, anomaly="missing_protocol", provider_limit_inferred=inferred)
-            if gated_v2:
+            if strict:
                 state["missing_result"] = {"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"], "agent": provider,
                                            "attempts": 0, "created_at_unix": self.clock()}
             return self.set_wait_user(
                 state,
                 f"{name} settled ({status}) without a protocol block for turn {delivery['turn_id']} "
                 f"(delivery={delivery['status']}) and no blocking quota window exists. The prompt was not resent; inspect the pane and provide guidance.",
-                requires_action=gated_v2,
+                requires_action=strict,
             )
 
     def handle_blocked(self, state: dict[str, Any], provider: str, *, sent: bool, output: str | None = None) -> str:
@@ -950,7 +982,7 @@ class Supervisor(SupervisorV2Mixin):
         """(usable, blocking windows, reason). Usable only with fresh, non-blocking, valid evidence: a snapshot
         fetched before the wait started cannot prove early availability; a failed refresh is never trusted;
         after the safe reset deadline the cached windows are expired by the existing rules."""
-        strict_v2 = state.get("workflow_policy") == "gated_v2"
+        strict_v2 = state.get("workflow_policy") in V2_WORKFLOW_POLICIES
         if strict_v2 and refresh_result == "failed":
             return False, None, "quota refresh failed; cached evidence is not trusted"
         try:
@@ -1182,8 +1214,9 @@ class Supervisor(SupervisorV2Mixin):
             raise SupervisorError(f"invalid starting agent: {start}")
         if workflow_policy not in WORKFLOW_POLICIES:
             raise SupervisorError(f"invalid workflow policy: {workflow_policy}")
-        if workflow_policy == "gated_v2" and start != "codex":
-            raise SupervisorError("gated_v2 tasks must start with codex")
+        contract = resolve_workflow_contract(workflow_policy)
+        if contract is not None and start not in contract["allowed_start_agents"]:
+            raise SupervisorError(f"{workflow_policy} tasks must start with one of {contract['allowed_start_agents']}")
         limit = int(char_limit) if char_limit is not None else int(self.config["max_task_chars"])
         if len(task) > limit:
             raise SupervisorError("task text exceeds max_task_chars" if char_limit is None else "task file exceeds the file character ceiling")
@@ -1204,7 +1237,7 @@ class Supervisor(SupervisorV2Mixin):
                 f"task {existing.get('task_id')} is still {existing.get('supervisor_state')}; "
                 "use `resume` to continue it or `cancel` before starting another task"
             )
-        owners = self.verify_or_seed_owners()
+        owners = self.verify_or_seed_owners((start,))
         if run_id is not None and (not isinstance(run_id, str) or not _UUID_RE.fullmatch(run_id)):
             raise SupervisorError("preallocated run id is invalid")
         run_id = run_id or str(uuid.uuid4())
@@ -1343,7 +1376,7 @@ class Supervisor(SupervisorV2Mixin):
             else:
                 try:
                     agent = self.ensure_agent(provider)
-                    blocking = blocking_windows(self.quota(provider), self.clock())
+                    blocking = self.startup_blocking_windows(state, provider)
                 except (SupervisorError, HerdrError) as error:
                     self._identity_stop(state, error, str(error))
                     return 2
@@ -1511,7 +1544,7 @@ class Supervisor(SupervisorV2Mixin):
             binding=cli_request_binding(self.config,envelope)
             preparation_id = self._cli_preparation_identity(binding,envelope) if selected["fresh_providers"] else str(uuid.uuid4())
             preparation = self.prepare_task_sessions(
-                selected,preparation_id=preparation_id,origin="cli",request_binding=binding,request_envelope=envelope,
+                selected,preparation_id=preparation_id,origin="cli",request_binding=binding,request_envelope=envelope,start_provider=start,
             )
             with self.store.transaction():
                 state = self.initialize(task, start, task_reference=task_reference, workflow_policy=workflow_policy, char_limit=char_limit,
@@ -1560,6 +1593,21 @@ class Supervisor(SupervisorV2Mixin):
                 return pane_matches[0], False, True
         aliases = [agent for agent in live_agents if agent.get("name") == self.agent_name(provider)]
         return (aliases[0], False, False) if len(aliases) == 1 else (None, len(aliases) > 1, False)
+
+    def sessions_report(self, *, live: list[dict[str, Any]] | None = None, refresh: bool = False) -> dict[str, Any]:
+        inventory = self.herdr.list_agents() if live is None else live
+        try:
+            owners = self.owners()
+        except SupervisorError:
+            owners = {}
+        manager = HelperManager(self)
+        rows = session_catalog(inventory, owners, load_query_registry(self.paths), manager.registry())
+        parents = {r["session_id"] for r in rows if r["session_id"] and r["identity_verified"]}
+        native = refresh_native(self.paths.state_dir, self.config, parents) if refresh else (native_snapshot(self.paths.state_dir) if self.config.get("native_tracking", {}).get("enabled") else {"enabled": False, "children": [], "reason": "native tracking is opt-in"})
+        # A cached relationship never provides a current live lifecycle or a prompt target.
+        native = dict(native)
+        native["children"] = [dict(child, parent_live=child.get("parent_session_id") in parents) for child in native.get("children", [])]
+        return {"sessions": rows, "native": native, "helpers": manager.view()}
 
     def agent_report(self, provider: str, live: dict[str, Any] | None, owners: dict[str, Any] | None, *, ambiguous: bool = False, identity_unavailable: bool = False) -> dict[str, Any]:
         name = self.agent_name(provider)
@@ -1732,6 +1780,10 @@ class Supervisor(SupervisorV2Mixin):
         elif self.config["session_start"]["enabled"] and not all(codex_components.values()):
             report["warnings"].append("fresh Codex unavailable: unverified capability " + ", ".join(name for name, ok in codex_components.items() if not ok))
         report["ok"] = not report["errors"]
+        try:
+            report["session_catalog"] = self.sessions_report(live=live_agents)
+        except (SupervisorError, OSError, ValueError):
+            report["session_catalog"] = {"sessions": [], "error": "session/helper registry unavailable"}
         return report
 
     def herdr_contract(self) -> dict[str, Any] | None:
@@ -1770,6 +1822,7 @@ class Supervisor(SupervisorV2Mixin):
             "approved_plan": state.get("approved_plan") if state else None,
             "runtime_policy": state.get("runtime_policy") if state else None,
             "candidate_sha": state.get("candidate_sha") if state else None,
+            "candidate_digest": (state.get("runtime_candidate") or {}).get("candidate_digest") if state else None,
             "runtime_evidence": state.get("runtime_evidence") if state else None,
             "runtime_proposal": self.current_runtime_proposal(state) if state else None,
             "owner_recovery": self.owner_recovery_view(state.get("owner_recovery")) if state else None,
@@ -1782,6 +1835,7 @@ class Supervisor(SupervisorV2Mixin):
             "consecutive_auto_turns": state.get("consecutive_auto_turns") if state else None,
             "auto_turn_limit": int(self.config["max_consecutive_auto_turns"]),
             "missing_result": state.get("missing_result") if state else None,
+            "invalid_gate": state.get("invalid_gate") if state else None,
             "agent_followup": self.followup_view(state.get("agent_followup")) if state else None,
             "followup_decision": self.followup_decision(state) if state else None,
             "operator_handoff": {"available": False, "reason": "no supervised task exists"},
@@ -1835,6 +1889,10 @@ class Supervisor(SupervisorV2Mixin):
             except QuotaError as error:
                 report["quota"][provider] = {"ok": False, "error": str(error)}
                 report["errors"].append(str(error))
+        try:
+            report["session_catalog"] = self.sessions_report(live=live_agents)
+        except (SupervisorError, OSError, ValueError):
+            report["session_catalog"] = {"sessions": [], "error": "session/helper registry unavailable; inspect sessions --json"}
         available, reason = self.operator_handoff_eligibility(state, live_agents=live_agents)
         report["operator_handoff"] = {"available": available, "reason": reason}
         return report

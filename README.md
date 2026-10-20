@@ -73,11 +73,33 @@ herdr-telegram doctor --network
 
 Setup begins in shadow mode. Enable actionable control only after reviewing the doctor result and following [Telegram setup](docs/TELEGRAM.md).
 
+## Workflow policy
+
+Every task resolves an immutable `workflow_contract` at start, persisted for the life of the run so
+editing configuration or restarting never changes an active run's meaning. Two policies are supported
+(`v1` is a legacy pre-V2 protocol, kept only for already-migrated runs and never a default):
+
+- **`supervised_v2`** (default) — the general policy: either Codex or Claude may start or receive a
+  handoff, a plan gate is optional (an agent may raise one for a task that needs approval; a read-only
+  report or direct task is not forced through it), and `done` is accepted once nothing pending — no
+  gate, no uncertain delivery, no quota/reset recovery, no declared runtime/push obligation — blocks it.
+  A voluntary plan gate accepts any safe Markdown artifact below the review root, not only `CODEX_PLAN.md`.
+- **`gated_v2`** — Prospera's strict procedure, unchanged: Codex starts, an unchanged `CODEX_PLAN.md`
+  must be approved before Claude implements or the task completes, and every rule below is exactly as
+  documented for it today.
+
+Both use the same typed-gate protocol, session-identity, delivery-certainty, quota/reset-recovery, and
+one-time-callback safety machinery; only the workflow procedure differs. `--policy` selects it explicitly;
+without it the CLI uses `default_workflow_policy` from configuration (`supervised_v2` unless a workspace
+sets it otherwise — Prospera's local configuration sets `gated_v2`). Telegram's task-start card shows a
+**Workflow: Supervised / Plan approval** choice bound to that pending task before Start; a stale or
+mismatched selection fails closed.
+
 ## Daily commands
 
 ```sh
 herdr-supervisor status
-herdr-supervisor run --policy gated_v2 task.md
+herdr-supervisor run task.md
 herdr-supervisor run --policy gated_v2 --codex-reset-budget 1 task.md
 herdr-supervisor pause
 herdr-supervisor resume
@@ -105,8 +127,9 @@ Two completions exist. **Verified completion** is reached only by the agent rout
 
 ## Telegram walkthrough
 
-1. **Start** — the task-start card shows the task text and the banked-reset budget buttons; tapping `Start`
-   creates the supervised run and Codex begins planning.
+1. **Start** — the task-start card shows the task text, a **Workflow: Supervised / Plan approval** choice,
+   and the banked-reset budget buttons; tapping `Start` creates the supervised run. This walkthrough shows
+   the `gated_v2` (Plan approval) example, where Codex begins planning.
 
    ![Start](docs/images/telegram-01-start.png)
 
@@ -171,3 +194,8 @@ Do not copy a live home-directory installation into a release. Source trees must
 The default preserves all configuration, credentials, and durable state. Purging them requires both `--purge` and `--confirm-purge`, refuses active services, and remains an explicit destructive operator action.
 
 This is fully open-source software under Apache License 2.0 (`SPDX-License-Identifier: Apache-2.0`). There are no dual-license or commercial-use restrictions beyond that license. See [LICENSE](LICENSE).
+
+Optional [sessions and helpers](docs/SESSIONS.md): inspect all live sessions and
+explicit native child relationships, or dispatch bounded read-only jobs to
+separately registered helper panes. Helpers keep their model/session and return
+evidence; the parent's human approval gates remain in control. Disabled by default.

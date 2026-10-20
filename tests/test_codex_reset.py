@@ -363,7 +363,7 @@ class TelegramAuthorizationTests(TelegramCase):
         card=self.api.sent[-1]
         self.assertIn("Banked resets available: unavailable",card["text"])
         buttons={b["text"]:b["callback_data"] for row in card["reply_markup"]["inline_keyboard"] for b in row}
-        self.assertEqual(set(buttons),{"Start · 0","Preserve sessions (default)","Fresh Codex","Fresh Claude + Codex","Cancel"})
+        self.assertEqual(set(buttons),{"✓ Workflow: Supervised","Workflow: Plan approval","✓ Start with: Codex","Start with: Claude","Start · 0","Preserve sessions (default)","Fresh Codex","Fresh Claude + Codex","Cancel"})
         started=self.bridge.handle_update(callback(523,buttons["Start · 0"]))
         self.assertEqual(started["result"],"enqueued")
         self.assertEqual(self.pending_inbox()[0]["codex_reset_authorization"],{"budget":0,"available_count":0,"account_fingerprint":None})
@@ -443,12 +443,13 @@ class TelegramAuthorizationTests(TelegramCase):
         self.assertTrue(text.startswith("Start this task?"), text)
         self.assertIn("Task to start:\nstart wording\n", text, "the typed task is in the message body")
         self.assertLess(text.index("Task to start:"), text.index("Banked resets available"), "task before reset policy")
-        self.assertIn("starts this task now as ONE gated Codex run", text)
+        self.assertIn("Workflow: Supervised", text)
+        self.assertIn("starts this task now as ONE run", text)
         self.assertIn("(0 = none, the default)", text)
         self.assertIn("Full Reset", text)
-        self.assertLess(text.count("\n"), 14, "warning stays concise")
+        self.assertLess(text.count("\n"), 16, "warning stays concise")
         rows=card["reply_markup"]["inline_keyboard"]
-        self.assertEqual([[b["text"] for b in row] for row in rows], [["Start · 0","Start · 1"],["Start · 2"],["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],["Cancel"]])
+        self.assertEqual([[b["text"] for b in row] for row in rows], [["✓ Workflow: Supervised"],["Workflow: Plan approval"],["✓ Start with: Codex"],["Start with: Claude"],["Start · 0","Start · 1"],["Start · 2"],["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],["Cancel"]])
         buttons={b["text"]:b["callback_data"] for row in rows for b in row}
         # binding checks are unchanged: another actor and a stale inventory are refused, zero starts once
         self.assertIn("rejected",bridge.handle_update(callback(531,buttons["Start · 0"],user=999)))
@@ -463,12 +464,12 @@ class TelegramAuthorizationTests(TelegramCase):
             with self.subTest(count=count):
                 bridge=self.enabled_bridge(count); bridge.handle_update(message(600+count,f"/task size {count}"))
                 card=self.api.sent[-1]
-                expected_rows=expected_rows[:-1]+[["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],expected_rows[-1]]
+                expected_rows=[["✓ Workflow: Supervised"],["Workflow: Plan approval"],["✓ Start with: Codex"],["Start with: Claude"]]+expected_rows[:-1]+[["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],expected_rows[-1]]
                 self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], expected_rows)
                 self.assertTrue(all(len(row)<=2 for row in card["reply_markup"]["inline_keyboard"][:-1]))
                 self.assertIn(f"Banked resets available: {count}", card["text"])
                 self.assertEqual("/reset-budget N" in card["text"], count>8)
-                self.assertEqual(json.loads((self.tg_paths.interactions_dir/f"{card['reply_markup']['inline_keyboard'][0][0]['callback_data']}.json").read_text())["budget"],0)
+                self.assertEqual(json.loads((self.tg_paths.interactions_dir/f"{card['reply_markup']['inline_keyboard'][4][0]['callback_data']}.json").read_text())["budget"],0)
         # a long typed task is chunked by the normal sender; the keyboard rides only on the final chunk and the
         # callback records never carry the task text
         long_task = "L" * 3900  # within max_task_chars; the card body exceeds one Telegram message

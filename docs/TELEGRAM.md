@@ -1,5 +1,7 @@
 # Telegram setup and security
 
+After reboot, use the [recovery checks](RECOVERY.md#telegram-after-reboot). Doctor distinguishes Bot API access from actual bridge polling health. Pending outbound failures are processed in bounded batches after inbound polling; queued documents retain their existing uncertainty and replacement limits.
+
 Create a private bot with BotFather and obtain your numeric Telegram user ID and private chat ID. Do not place the token in a command line, source file, environment variable, repository, or Herdr prompt.
 
 Run:
@@ -14,7 +16,13 @@ Setup prompts for the token without echoing it and starts in `shadow` mode. The 
 
 The bridge opens no listener and requires no public URL, SSH path, VPN route, or inbound firewall rule. The server only needs outbound TLS access to `api.telegram.org:443`.
 
-The task-start card shows `Task to start:` with the typed task text (or the validated filename and bounded excerpt of an uploaded file) before the optional reset policy. Its buttons are `Start · N` — N is the maximum automatic banked-reset budget for the run, 0 is the default — at most two per row, then a full-width Cancel; `/reset-budget N` covers larger inventories. Every callback stays bound to the pending task hash, owner, chat, expiry, and fresh inventory; file contents never enter callback records or command journals.
+The task-start card shows `Task to start:` with the typed task text (or the validated filename and bounded excerpt of an uploaded file), a **Workflow: Supervised / Plan approval** choice, before the optional reset policy. Its buttons are `Start · N` — N is the maximum automatic banked-reset budget for the run, 0 is the default — at most two per row, then a full-width Cancel; `/reset-budget N` covers larger inventories. Every callback stays bound to the pending task hash, owner, chat, expiry, fresh inventory, and the selected workflow policy; file contents never enter callback records or command journals.
+
+### Workflow choice
+
+`Workflow: Supervised` (`supervised_v2`, checked by default unless configuration sets `default_workflow_policy` to `gated_v2`) starts the general policy: planning is optional and either provider may work. `Workflow: Plan approval` (`gated_v2`) is Prospera's strict Codex-plans-first procedure, unchanged. Tapping either button updates the pending task's recorded choice, bumps its view revision, and redraws the confirmation card — the same staleness rule as the session-policy and model-profile buttons: a `Start` button minted against an older revision or a different workflow choice is rejected as a stale binding rather than silently starting under the wrong policy. `/status` and `/status raw` show the resolved `workflow_policy` for the active run once it starts, and it never changes for that run afterward.
+
+Under `Workflow: Supervised` only, a second choice — `Start with: Codex` / `Start with: Claude` — appears (Codex checked by default), letting the operator pick either provider for the first turn, exactly as the plan requires. Switching the workflow choice back to `Plan approval` immediately normalizes the recorded starting agent back to Codex and removes the choice from the redrawn card: `gated_v2` never offers or accepts a Claude start. Both choices are bound together into the pending record, the interaction revision, the final `Start` button, the enqueued command, the reset-budget authorization binding, and the initialized run's own `start_agent`; a stale or tampered value at any of those points is rejected before a run is created.
 
 When a settled, accepted turn yields no readable routing result, the card leads with the outcome — the agent finished, Supervisor received no workflow result, no approval or next step was created — and explains each button: `Retry routing result` (one-time, bound to that run and turn; rereads the settled transcript, submits nothing, wakes nothing, cannot duplicate a gate), `Ask agent`, `Request revision`, and `Cancel task`. If the reread finds nothing the retry button is gone and the card says so. Turn ids, delivery states, and transcript terms stay out of the card; `/status raw` and the logs keep them.
 
@@ -54,3 +62,39 @@ reuse a workflow session. It records that exact identity but never creates or re
 acknowledgement confirms that you launched the agent with the displayed read-only contract; inspect the
 agent before acknowledging it. Workflow sessions are never borrowed for `/ask`, and busy or quota-blocked
 query providers are skipped. An action-like question is redirected to `/task`.
+
+### Approval request repair
+
+A malformed agent-authored gate is not a decision for the operator. Supervisor
+asks the same session to repair its request once, using the normal quota and
+confirmed-delivery safeguards. It does not replay the task or grant approval.
+If repair fails again, **Repair approval request** requests another bound repair
+without a revision note. Stale or duplicate clicks cannot send another prompt.
+Failed prerequisites (for example, a review that has not passed) remain blocked.
+
+Agents can check a request without changing state:
+
+```sh
+herdr-supervisor gate-preflight --gate-type runtime_validation --payload /absolute/review/payload.json
+```
+
+Runtime requests may include `decision_question`, `approval_consequence`,
+`decline_consequence`, and `expected_output` together. The card then offers
+**Approve runtime test** and **Decline**. Approval permits the described checks;
+it does not execute commands, record PASS, or authorize publishing. Run the
+reviewed checks separately and submit evidence; collaborative results still
+require operator confirmation.
+
+Git candidates retain the full 40-character `candidate_sha`. Private runtime
+candidates use `candidate_kind: manifest`, a full SHA-256 `candidate_digest`,
+and `candidate_manifest` pointing to a JSON map of canonical relative file
+paths to SHA-256 hashes. `repository` must equal the plan's approved
+`runtime_manifest_root`, outside the product repository. The manifest must
+cover every file; links, path escapes, duplicates, extra files and changed bytes
+are rejected. Keep mutable runtime output outside that root. These requests
+require all four explanation fields and cannot authorize a Git push. Evidence
+uses `candidate_digest`; CLI evidence submission uses `--candidate-digest`.
+
+`/sessions` is a read-only catalog of live panes, exact native identity problems,
+and opt-in native/helper children. It never starts, adopts, renames or prompts an
+agent. Separate helper mutations remain explicit CLI operations; see SESSIONS.md.

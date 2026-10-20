@@ -170,11 +170,12 @@ class CommandTests(TelegramCase):
         path = next((self.paths.inbox_dir / "pending").glob(f"*-{pending[0]['request_id']}.json"))
         self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
         self.assertRegex(pending[0]["request_id"], r"^[0-9a-f]{32}$")
-        # the worker starts it with codex under gated_v2 without any Telegram involvement
+        # the worker starts it with codex under the default supervised_v2 policy without any Telegram
+        # involvement; a voluntary plan gate still works under that policy (plan item 5).
         self.write_plan()
         self.herdr.responses = [{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]
         self.assertEqual(self.sup.worker(), 4)
-        self.assertEqual(self.state()["workflow_policy"], "gated_v2")
+        self.assertEqual(self.state()["workflow_policy"], "supervised_v2")
         self.bridge.handle_update(message(2, "/task second"))
         self.assertIn("the supervisor has no task queue", self.texts()[-1])
         self.assertEqual(len(self.pending_inbox()), 0)
@@ -642,7 +643,8 @@ class ApiAndRedactionTests(TelegramCase):
                     raise tg.TelegramError(_c, "x")
             self.assertEqual(ht.doctor_summary(network=True, tg_paths=self.tg_paths, api_factory=lambda t: FailingApi())["status"], category)
         healthy = ht.doctor_summary(network=True, tg_paths=self.tg_paths, api_factory=lambda t: FakeApi())
-        self.assertEqual(healthy["status"], "HEALTHY")
+        self.assertEqual(healthy["status"], "BRIDGE_NOT_HEALTHY")
+        self.assertEqual(healthy["checks"]["network_api"], "healthy")
         self.assertNotIn(FAKE_TOKEN, json.dumps(healthy))
         # setup: non-echoed token, 0600 files, shadow mode, never echoed
         fresh = ht.TelegramPaths(config_file=Path(self.tmp.name) / "fresh" / "config.json", state_dir=Path(self.tmp.name) / "fresh-state")

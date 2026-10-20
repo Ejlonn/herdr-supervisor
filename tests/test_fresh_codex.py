@@ -132,12 +132,12 @@ class CapabilityChainTests(V2Case):
             raise AssertionError(argv)
 
         contract = herdr_sessions.probe_codex_thread_contract("codex", runner)
-        self.assertEqual(contract, {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True})
-        self.assertEqual(herdr_sessions.probe_codex_thread_contract("codex", lambda argv, **k: subprocess.CompletedProcess(argv, 1, "", "")), {"codex_app_server": False, "codex_thread_start": False, "codex_resume_session_id": False})
+        self.assertEqual(contract, {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True, "codex_pane_local_server": False})
+        self.assertEqual(herdr_sessions.probe_codex_thread_contract("codex", lambda argv, **k: subprocess.CompletedProcess(argv, 1, "", "")), {"codex_app_server": False, "codex_thread_start": False, "codex_resume_session_id": False, "codex_pane_local_server": False})
 
     def test_fresh_codex_requires_every_component_and_fresh_claude_only_the_herdr_contract(self) -> None:
         report = self.herdr.capability_report()
-        good = {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True}
+        good = {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True, "codex_pane_local_server": True}
         self.assertTrue(herdr_sessions.fresh_policy_supported(self.config, "fresh-codex", report, good))
         self.assertTrue(herdr_sessions.fresh_policy_supported(self.config, "fresh-all", report, good))
         self.assertTrue(herdr_sessions.fresh_policy_supported(self.config, "fresh-claude", report, None))
@@ -179,7 +179,7 @@ class FreshCodexPreparationTests(V2Case):
         thread_id = record["providers"]["codex"]["thread_id"]
         self.assertEqual(seen, [("PANE_CREATING", thread_id)], "the thread id is durable before the split")
         self.assertEqual(self.thread_journal.requests, [(f"thread-{prep}-codex", {"cwd": str(self.project_root), "model": None, "ephemeral": False})])
-        self.assertEqual(self.herdr.starts[0][3], ["resume", thread_id])
+        self.assertEqual(self.herdr.starts[0][3], ["resume", thread_id, "--no-daemon"])
         self.assertEqual(self.herdr.starts[0][1], "codex")
         self.assertEqual(record["status"], "OWNERSHIP_BOUND")
         self.assertEqual(self.sup.owners()["codex"], {"pane_id": self.herdr.starts[0][2], "session_id": thread_id})
@@ -274,7 +274,7 @@ class FreshCodexPreparationTests(V2Case):
         self.assertEqual(record["status"], "OWNERSHIP_BOUND")
         self.assertEqual(len(self.thread_journal.requests), 1, "the settled journal result was adopted; nothing was resent")
         self.assertEqual(record["providers"]["codex"]["thread_id"], self.thread_journal.results[f"thread-{prep}-codex"]["thread"]["thread_id"])
-        self.assertEqual(self.herdr.starts[0][3], ["resume", record["providers"]["codex"]["thread_id"]])
+        self.assertEqual(self.herdr.starts[0][3], ["resume", record["providers"]["codex"]["thread_id"], "--no-daemon"])
 
     def test_crash_windows_reuse_the_persisted_thread_and_create_no_second_one(self) -> None:
         """Crash after the thread is persisted (THREAD_CREATED), after the pane split, after resume, and

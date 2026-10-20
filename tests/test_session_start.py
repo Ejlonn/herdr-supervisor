@@ -87,7 +87,7 @@ class SessionSelectionTests(V2Case):
         starts={kind:args for _,kind,_,args in self.herdr.starts}
         # Codex: the configured model is set on the pre-created thread; the launch only resumes that exact thread.
         self.assertEqual(self.thread_journal.requests[0][1],{"cwd":str(self.project_root),"model":"gpt-approved","ephemeral":False})
-        self.assertEqual(starts["codex"],["resume",self.thread_journal.requests[0][0] and self.herdr.starts[0][3][1]])
+        self.assertEqual(starts["codex"],["resume",self.thread_journal.requests[0][0] and self.herdr.starts[0][3][1],"--no-daemon"])
         self.assertEqual(starts["codex"][1],self.thread_journal.results[self.thread_journal.requests[0][0]]["thread"]["thread_id"])
         # Claude: unchanged provider-specific launch with the fixed --model argv only.
         self.assertEqual(starts["claude"],["--model","claude-opus"])
@@ -361,7 +361,8 @@ class SessionSelectionTests(V2Case):
         def changed_task(state: dict, _record: dict) -> None: state["task_text"]="different task"
         def changed_start(state: dict, _record: dict) -> None: state["start_agent"]="claude"
         def changed_reference(state: dict, _record: dict) -> None: state["task_reference"]="other.md"
-        def changed_workflow(state: dict, _record: dict) -> None: state["workflow_policy"]="gated_v2"
+        def changed_workflow(state: dict, _record: dict) -> None:
+            state["workflow_policy"]="gated_v2"; state["workflow_contract"]=hs.resolve_workflow_contract("gated_v2")
         def changed_budget(state: dict, _record: dict) -> None: state["codex_reset"]["authorized_reset_budget"]=0
         def changed_account(state: dict, _record: dict) -> None: state["codex_reset"]["account_fingerprint"]="b"*64
         def changed_selection(state: dict, _record: dict) -> None:
@@ -449,7 +450,7 @@ class SessionSelectionTests(V2Case):
         command={
             "request_id":"exact-initialized-start","action":"task","task_text":"stable Telegram task","source":"telegram",
             "preallocated_run_id":preparation_id,"pending_start_id":preparation_id,
-            "codex_reset_authorization":authorization,"session_selection":selection,
+            "codex_reset_authorization":authorization,"session_selection":selection,"workflow_policy":"gated_v2","starting_agent":"codex",
             "actor":"telegram:1","chat_id":5,
         }
         task_binding={"task_text":command["task_text"],"source":"telegram"}
@@ -459,6 +460,7 @@ class SessionSelectionTests(V2Case):
             "pending_id":preparation_id,"owner_user_id":1,"chat_id":5,"request_id":command["request_id"],
             "task_sha256":task_sha,"status":"supervisor_consuming","budget":0,"available_count":0,
             "inventory_available_count":0,"account_fingerprint":None,"session_selection":selection,
+            "workflow_policy":"gated_v2","starting_agent":"codex",
             "expires_at_unix":self.sup.clock()-1,"supervisor_consuming_at":"1970-01-12T13:46:40Z",
         })
         preparation=self.sup.prepare_task_sessions(selection,preparation_id=preparation_id)

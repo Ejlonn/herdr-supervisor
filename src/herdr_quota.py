@@ -27,7 +27,9 @@ class QuotaSnapshot:
     context_used_percent: float | None
     window_source: str
 
-def _parse_windows(raw_windows: Any, provider: str) -> tuple[QuotaWindow, ...]:
+def _parse_windows(raw_windows: Any, provider: str, *, allow_empty: bool = False) -> tuple[QuotaWindow, ...]:
+    if allow_empty and isinstance(raw_windows, list) and not raw_windows:
+        return ()
     if not isinstance(raw_windows, list) or not raw_windows:
         raise QuotaError(f"{provider} quota snapshot has no windows")
     parsed: dict[str, QuotaWindow] = {}
@@ -76,7 +78,7 @@ def _select_windows(value: dict[str, Any], provider: str, session_id: str | None
         return value.get("windows"), "windows"
     raise QuotaError(f"{provider} quota snapshot has keyed windows but none for session {session_id}")
 
-def parse_quota_snapshot(path: Path, provider: str, *, session_id: str | None = None) -> QuotaSnapshot:
+def parse_quota_snapshot(path: Path, provider: str, *, session_id: str | None = None, allow_empty: bool = False) -> QuotaSnapshot:
     """Parse one plugin snapshot. Fails closed on anything missing or malformed."""
     try:
         with path.open(encoding="utf-8") as handle:
@@ -91,7 +93,7 @@ def parse_quota_snapshot(path: Path, provider: str, *, session_id: str | None = 
     if found_provider not in (None, provider):
         raise QuotaError(f"{provider} quota snapshot belongs to provider {found_provider!r}")
     raw_windows, window_source = _select_windows(value, provider, session_id)
-    windows = _parse_windows(raw_windows, provider)
+    windows = _parse_windows(raw_windows, provider, allow_empty=allow_empty)
     fetched = value.get("fetched_at_unix")
     fetched_at = _epoch(fetched)
     if fetched is not None and fetched_at is None:

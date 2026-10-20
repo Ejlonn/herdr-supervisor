@@ -36,6 +36,7 @@ from herdr_core import (
     STATE_SCHEMA_VERSION,
     SUPERVISOR_STATES,
     TERMINAL_STATES,
+    WORKFLOW_CONTRACTS,
     WORKFLOW_POLICIES,
     Paths,
     SupervisorError,
@@ -45,6 +46,7 @@ from herdr_core import (
     iso_utc,
     load_json,
     sha256_bytes,
+    sha256_file,
     valid_pane_id,
 )
 from herdr_quota import _parse_windows
@@ -81,9 +83,10 @@ class StateStore:
             value["_loaded_schema"] = SCHEMA_VERSION
         else:
             # Additive V2 evolution: old schema-2 records gain zero reset authority, zero submission
-            # metrics, and a fresh (zero) consecutive-turn count in memory; nothing is replayed.
+            # metrics, a fresh (zero) consecutive-turn count, and (F1) the exact resolved contract for
+            # their own already-recorded policy in memory; nothing is replayed and no policy is reinterpreted.
             defaults = new_v2_fields(str(value.get("workflow_policy") or "v1"))
-            for key in ("codex_reset", "prompt_metrics", "consecutive_auto_turns", "agent_followup", "session_selection", "session_preparation", "runtime_proposal", "owner_recovery"):
+            for key in ("codex_reset", "prompt_metrics", "consecutive_auto_turns", "agent_followup", "session_selection", "session_preparation", "runtime_proposal", "owner_recovery", "workflow_contract"):
                 value.setdefault(key, defaults[key])
             validate_state_v2(value)
         return value
@@ -164,9 +167,19 @@ class StateStore:
             handle.flush()
             os.fsync(handle.fileno())
 
+def resolve_workflow_contract(workflow_policy: str) -> dict[str, Any] | None:
+    """The immutable, resolved contract for a policy: a pure function of the policy name, computed once
+    at task start and persisted (`new_v2_fields`). Routing and completion read the persisted copy, never
+    this function again, so an active run's meaning never changes when configuration is edited or the
+    process restarts. `None` for `v1`, which predates the V2 protocol and contract model entirely."""
+    contract = WORKFLOW_CONTRACTS.get(workflow_policy)
+    return dict(contract) if contract is not None else None
+
+
 def new_v2_fields(workflow_policy: str) -> dict[str, Any]:
     return {
         "workflow_policy": workflow_policy,
+        "workflow_contract": resolve_workflow_contract(workflow_policy),
         "gate_sequence": 0,
         "event_sequence": 0,
         "last_event": None,
@@ -176,6 +189,7 @@ def new_v2_fields(workflow_policy: str) -> dict[str, Any]:
         "approved_plan": None,
         "runtime_policy": None,
         "candidate_sha": None,
+        "runtime_candidate": None,
         "runtime_evidence": None,
         # Durable agent proposal awaiting operator confirmation (collaborative runtime validation).
         "runtime_proposal": None,
@@ -198,6 +212,7 @@ def new_v2_fields(workflow_policy: str) -> dict[str, Any]:
         "consecutive_auto_turns": {"provider": None, "count": 0},
         # Bounded descriptor of a settled accepted turn whose routing result could not be read.
         "missing_result": None,
+        "invalid_gate": None,
         # Optional gate-preserving follow-up ("Ask agent"): absent for existing runs; never migrated.
         "agent_followup": None,
         "session_selection": {"policy": "preserve", "profiles": {p: "default" for p in PROVIDERS}, "fresh_providers": []},
@@ -239,8 +254,11 @@ def validate_state_v2(state: dict[str, Any]) -> None:
     preparation=state.get("session_preparation")
     if preparation is not None and (not isinstance(preparation,dict) or preparation.get("status") not in ("OWNERSHIP_BOUND","TASK_STARTED")):
         raise SupervisorError("state session_preparation is invalid")
-    if state.get("workflow_policy") not in WORKFLOW_POLICIES:
-        raise SupervisorError(f"state has an invalid workflow_policy: {state.get('workflow_policy')!r}")
+    policy = state.get("workflow_policy")
+    if policy not in WORKFLOW_POLICIES:
+        raise SupervisorError(f"state has an invalid workflow_policy: {policy!r}")
+    if state.get("workflow_contract") != resolve_workflow_contract(policy):
+        raise SupervisorError("state workflow_contract does not match its resolved policy")
     for key in ("gate_sequence", "event_sequence", "recovery_count"):
         if isinstance(state.get(key), bool) or not isinstance(state.get(key), int) or state[key] < 0:
             raise SupervisorError(f"state field {key} is invalid")
@@ -332,7 +350,33 @@ def validate_state_v2(state: dict[str, Any]) -> None:
     followup = state.get("agent_followup")
     if followup is not None:
         _validate_agent_followup(followup, state)
+    candidate = state.get("runtime_candidate")
+    if candidate is not None:
+        if not isinstance(candidate, dict) or candidate.get("candidate_kind") != "manifest" or state.get("candidate_sha") is not None:
+            raise SupervisorError("invalid manifest candidate state")
+        if not _SHA256_STR_RE.fullmatch(str(candidate.get("candidate_digest") or "")):
+            raise SupervisorError("invalid manifest candidate digest")
+        if candidate.get("repository") != (state.get("runtime_policy") or {}).get("runtime_manifest_root"):
+            raise SupervisorError("manifest root is not approved")
+    pending = state.get("pending_gate") or {}
+    authorization = pending.get("runtime_authorization")
+    if authorization is not None:
+        if not isinstance(authorization, dict) or pending.get("gate_type") != "runtime_validation" or authorization.get("payload_sha256") != pending.get("payload_sha256") or not _exact_str(authorization.get("actor"), max_len=200):
+            raise SupervisorError("invalid runtime execution authorization")
     proposal = state.get("runtime_proposal")
+    invalid = state.get("invalid_gate")
+    if invalid is not None:
+        if not isinstance(invalid, dict) or invalid.get("run_id") != state.get("run_id"):
+            raise SupervisorError("invalid gate recovery belongs to another run")
+        if type(invalid.get("attempts")) is not int or invalid["attempts"] < 0:
+            raise SupervisorError("invalid gate repair count")
+        for key in ("turn_id", "session"):
+            if type(invalid.get(key)) is not str or not invalid[key]:
+                raise SupervisorError("invalid gate recovery identity")
+        if invalid.get("agent") not in PROVIDERS or invalid.get("gate_type") not in GATE_TYPES:
+            raise SupervisorError("invalid gate recovery provider/type")
+        if not _exact_str(invalid.get("payload"), max_len=1024) or not _exact_str(invalid.get("error"), max_len=500):
+            raise SupervisorError("invalid gate recovery diagnostic")
     if proposal is not None:
         _validate_runtime_proposal(proposal, state)
     recovery = state.get("owner_recovery")
@@ -670,7 +714,9 @@ def _validate_runtime_proposal(proposal: Any, state: dict[str, Any]) -> None:
         raise SupervisorError(f"{label} status is invalid")
     if proposal.get("result") not in ("PASS", "FAIL") or type(proposal.get("result")) is not str:
         raise SupervisorError(f"{label} result is invalid")
-    if type(proposal.get("candidate_sha")) is not str or not SHA_RE.match(proposal["candidate_sha"]):
+    manifest = (state.get("runtime_candidate") or {}).get("candidate_kind") == "manifest"
+    identity = proposal.get("candidate_digest") if manifest else proposal.get("candidate_sha")
+    if type(identity) is not str or not (_SHA256_STR_RE if manifest else SHA_RE).fullmatch(identity):
         raise SupervisorError(f"{label} candidate is invalid")
     if not _exact_str(proposal.get("environment"), max_len=40):
         raise SupervisorError(f"{label} environment is invalid")
@@ -751,7 +797,7 @@ def safe_gate_view(gate: Any) -> dict[str, Any] | None:
     if not isinstance(gate, dict):
         return None
     keys = ("gate_id", "gate_type", "status", "run_id", "turn_id", "created_at", "expires_at", "expected_state",
-            "artifact_path", "artifact_sha256", "payload_sha256", "candidate_sha", "summary_fields", "agent")
+            "artifact_path", "artifact_sha256", "payload_sha256", "candidate_sha", "candidate_digest", "summary_fields", "agent")
     return {key: gate.get(key) for key in keys}
 
 def check_safe_file(path_text: str, *, root: Path, max_bytes: int, label: str) -> Path:
@@ -826,6 +872,12 @@ def validate_gate_payload(raw: Any, gate_type: str, *, config: dict[str, Any]) -
         "summary": _bounded_str(raw.get("summary"), "summary"),
         "review_directory": _bounded_str(raw.get("review_directory"), "review_directory", max_len=1024),
     }
+    for key in ("decision_question", "approval_consequence", "decline_consequence", "expected_output"):
+        if key in raw:
+            out[key] = _bounded_str(raw[key], key, max_len=600)
+    explanation = ("decision_question", "approval_consequence", "decline_consequence", "expected_output")
+    if any(key in out for key in explanation) and not all(key in out for key in explanation):
+        raise SupervisorError("decision explanation requires question, approval/decline consequences and expected output")
     review_dir = Path(out["review_directory"])
     if not out["review_directory"].startswith("/") or not review_dir.is_dir() or os.path.islink(review_dir) or review_root.resolve() not in review_dir.resolve().parents:
         raise SupervisorError("review_directory must be an existing directory below the review root")
@@ -847,6 +899,14 @@ def validate_gate_payload(raw: Any, gate_type: str, *, config: dict[str, Any]) -
         if mode not in RUNTIME_VALIDATION_MODES or type(mode) is not str:
             raise SupervisorError("runtime_validation_mode must be operator_collaborative or automatic_agent")
         out["runtime_validation_mode"] = mode
+        if "runtime_manifest_root" in raw:
+            root = Path(_bounded_str(raw["runtime_manifest_root"], "runtime_manifest_root", max_len=1024))
+            workspace = Path(config["project_root"]).resolve()
+            if not root.is_absolute() or root.resolve() != root or workspace not in root.parents or root == Path(config["product_repo"]).resolve() or Path(config["product_repo"]).resolve() in root.parents or root in Path(config["product_repo"]).resolve().parents:
+                raise SupervisorError("runtime_manifest_root must be a canonical private directory under project_root")
+            if out["push_approval_required"]:
+                raise SupervisorError("manifest-only runtime plans cannot authorize Git push")
+            out["runtime_manifest_root"] = str(root)
     elif gate_type == "generic_question":
         mode = raw.get("answer_mode")
         if mode not in ("text", "choice"):
@@ -864,12 +924,27 @@ def validate_gate_payload(raw: Any, gate_type: str, *, config: dict[str, Any]) -
             raise SupervisorError("generic_question max_answer_chars must be 1-2000")
         out["max_answer_chars"] = limit
     elif gate_type == "runtime_validation":
-        sha = _bounded_str(raw.get("candidate_sha"), "candidate_sha", max_len=40)
-        if not SHA_RE.match(sha):
-            raise SupervisorError("candidate_sha must be a full 40-hex commit SHA")
+        kind = raw.get("candidate_kind", "git_commit")
+        if kind not in ("git_commit", "manifest"):
+            raise SupervisorError("candidate_kind must be git_commit or manifest")
         repository = _bounded_str(raw.get("repository"), "repository", max_len=1024)
-        if Path(repository).resolve() != Path(config["product_repo"]).resolve():
-            raise SupervisorError("runtime_validation repository must be the configured product repository")
+        sha = None
+        if kind == "git_commit":
+            sha = _bounded_str(raw.get("candidate_sha"), "candidate_sha", max_len=40)
+            if not SHA_RE.match(sha):
+                raise SupervisorError("candidate_sha must be a full 40-hex commit SHA")
+            if Path(repository).resolve() != Path(config["product_repo"]).resolve():
+                raise SupervisorError("runtime_validation repository must be the configured product repository")
+        else:
+            if not all(key in out for key in explanation):
+                raise SupervisorError("manifest runtime requires an explicit decision explanation")
+            if raw.get("candidate_sha") is not None:
+                raise SupervisorError("manifest candidates use candidate_digest, never candidate_sha")
+            digest = _bounded_str(raw.get("candidate_digest"), "candidate_digest", max_len=64)
+            if not _SHA256_STR_RE.fullmatch(digest):
+                raise SupervisorError("candidate_digest must be full SHA-256")
+            out.update(candidate_kind="manifest", candidate_digest=digest,
+                       candidate_manifest=_bounded_str(raw.get("candidate_manifest"), "candidate_manifest", max_len=1024))
         if raw.get("runtime_validation_missing") is not True:
             raise SupervisorError("runtime_validation payload must state runtime_validation_missing=true")
         if raw.get("local_gate_result") not in ("PASS", "FAIL"):
@@ -914,10 +989,48 @@ def validate_gate_payload(raw: Any, gate_type: str, *, config: dict[str, Any]) -
         raise SupervisorError(f"unknown gate type {gate_type}")
     return out
 
-def validate_runtime_evidence(raw: Any, *, candidate_sha: str, environment: str, now: float) -> dict[str, Any]:
+
+def verify_runtime_manifest(payload: dict[str, Any], *, approved_root: str | None, config: dict[str, Any]) -> None:
+    """A manifest candidate is a complete immutable directory, separate from mutable runtime data."""
+    root = Path(payload["repository"])
+    if not approved_root or str(root) != approved_root or root.resolve() != root or not root.is_dir():
+        raise SupervisorError("manifest root is not the exact human-approved runtime_manifest_root")
+    manifest = check_safe_file(payload["candidate_manifest"], root=Path(config["review_root"]), max_bytes=int(config["max_artifact_bytes"]), label="candidate manifest")
+    if sha256_file(manifest) != payload["candidate_digest"]:
+        raise SupervisorError("candidate manifest digest changed")
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise SupervisorError("duplicate manifest entry")
+            result[key] = value
+        return result
+    try:
+        members = json.loads(manifest.read_text(), object_pairs_hook=unique)
+    except (ValueError, OSError) as error:
+        raise SupervisorError("candidate manifest is unreadable") from error
+    if not isinstance(members, dict) or not 1 <= len(members) <= 20000:
+        raise SupervisorError("candidate manifest must map 1-20000 canonical paths to SHA-256")
+    for rel, digest in members.items():
+        if not rel or rel.startswith("/") or "\\" in rel or any(p in ("", ".", "..") for p in rel.split("/")) or not isinstance(digest, str) or not _SHA256_STR_RE.fullmatch(digest):
+            raise SupervisorError("invalid manifest path or digest")
+        member = check_safe_file(str(root / rel), root=root, max_bytes=512 * 1024 * 1024, label="manifest member")
+        if sha256_file(member) != digest:
+            raise SupervisorError("manifest member content changed")
+    actual: set[str] = set()
+    for member in root.rglob("*"):
+        if member.is_symlink() or not (member.is_file() or member.is_dir()):
+            raise SupervisorError("symlink or special file in runtime candidate")
+        if member.is_file():
+            actual.add(member.relative_to(root).as_posix())
+    if actual != set(members):
+        raise SupervisorError("runtime manifest has missing or extra files")
+
+def validate_runtime_evidence(raw: Any, *, candidate_sha: str, environment: str, now: float, candidate_kind: str = "git_commit") -> dict[str, Any]:
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
         raise SupervisorError("runtime evidence must be a JSON object with schema_version 1")
-    if raw.get("candidate_sha") != candidate_sha:
+    key = "candidate_digest" if candidate_kind == "manifest" else "candidate_sha"
+    if raw.get(key) != candidate_sha or (candidate_kind == "manifest" and raw.get("candidate_sha") is not None):
         raise SupervisorError("runtime evidence candidate_sha does not match the pending candidate")
     if raw.get("environment") != environment:
         raise SupervisorError("runtime evidence environment does not match the command")
@@ -946,7 +1059,7 @@ def validate_runtime_evidence(raw: Any, *, candidate_sha: str, environment: str,
     epoch = moment.timestamp()
     if epoch > now + 300 or epoch < now - 30 * 86400:
         raise SupervisorError("runtime evidence timestamp is in the future or older than 30 days")
-    return {"schema_version": 1, "candidate_sha": candidate_sha, "environment": environment, "result": raw["result"], "commands": parsed_commands, "timestamp": timestamp}
+    return {"schema_version": 1, key: candidate_sha, "environment": environment, "result": raw["result"], "commands": parsed_commands, "timestamp": timestamp}
 
 def git_head(repo: Path) -> str:
     try:

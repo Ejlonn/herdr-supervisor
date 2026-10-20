@@ -23,7 +23,7 @@ _PROVIDER_STATES = ("AUTHORIZED", "THREAD_CREATING", "THREAD_CREATED", "PANE_CRE
 THREAD_PROVIDERS = ("codex",)
 _THREAD_PHASES = ("THREAD_CREATING", "THREAD_CREATED", "PANE_CREATING", "FRESH_PANE_CREATED", "AGENT_STARTING", "IDENTITY_VERIFIED")
 # Every surface Fresh Codex needs; each is verified read-only and reported by name (doctor, Telegram predicate).
-CODEX_THREAD_COMPONENTS = ("herdr_pane_split", "herdr_agent_start", "herdr_identity_observation", "codex_app_server", "codex_thread_start", "codex_resume_session_id")
+CODEX_THREAD_COMPONENTS = ("herdr_pane_split", "herdr_agent_start", "herdr_identity_observation", "codex_app_server", "codex_thread_start", "codex_resume_session_id", "codex_pane_local_server")
 
 
 def session_contract_supported(config: dict[str, Any], report: Any) -> bool:
@@ -206,7 +206,7 @@ def probe_codex_thread_contract(command: str, runner: Callable[..., Any] = subpr
                 except (OSError, json.JSONDecodeError):
                     client_request, response = None, None
                 thread_start = thread_schema_supports_start(client_request, response)
-    return {"codex_app_server": app_server, "codex_thread_start": thread_start, "codex_resume_session_id": resume}
+    return {"codex_app_server": app_server, "codex_thread_start": thread_start, "codex_resume_session_id": resume, "codex_pane_local_server": resume_help is not None and help_has_lexeme(resume_help, "--no-daemon")}
 
 
 def fresh_codex_components(config: dict[str, Any], herdr_report: Any, codex_contract: Any) -> dict[str, bool]:
@@ -223,6 +223,7 @@ def fresh_codex_components(config: dict[str, Any], herdr_report: Any, codex_cont
         "codex_app_server": contract.get("codex_app_server") is True,
         "codex_thread_start": contract.get("codex_thread_start") is True,
         "codex_resume_session_id": contract.get("codex_resume_session_id") is True,
+        "codex_pane_local_server": contract.get("codex_pane_local_server") is True,
     }
 
 
@@ -406,12 +407,15 @@ def prepare_sessions(
     origin: str = "supervisor",
     request_binding: str | None = None,
     request_envelope: dict[str, Any] | None = None,
+    start_provider: str = "codex",
 ) -> dict[str, Any]:
     """Prepare selected fresh sessions exactly once, then atomically replace ownership.
 
     An interrupted pane-create or agent-start call is intentionally ambiguous and fails closed. The
     operation is never repeated automatically because Herdr has no idempotency key for either action.
     """
+    if start_provider not in PROVIDERS:
+        raise SupervisorError("invalid starting provider for session preparation")
     selected = validate_selection(supervisor.config, selection)
     fresh = tuple(selected["fresh_providers"])
     valid_binding = isinstance(request_binding,str) and len(request_binding)==64 and all(c in "0123456789abcdef" for c in request_binding)
@@ -420,7 +424,7 @@ def prepare_sessions(
         valid_envelope = cli_request_binding(supervisor.config, request_envelope) == request_binding
     if origin not in ("cli","supervisor") or (origin=="cli") != valid_binding or (origin=="cli") != valid_envelope or (origin=="supervisor" and (request_binding is not None or request_envelope is not None)):
         raise SupervisorError("session preparation origin or request binding is invalid")
-    if origin == "cli" and validate_cli_request_envelope(supervisor.config, request_envelope).get("session_selection") != selected:
+    if origin == "cli" and (validate_cli_request_envelope(supervisor.config, request_envelope).get("session_selection") != selected or validate_cli_request_envelope(supervisor.config, request_envelope).get("start") != start_provider):
         raise SupervisorError("session preparation request selection changed")
     if fresh and not _valid_uuid(preparation_id):
         raise SupervisorError("fresh session preparation requires a canonical UUID")
@@ -437,7 +441,7 @@ def prepare_sessions(
             prior=load_json(other,label="session preparation")
             if isinstance(prior,dict) and prior.get("status") not in ("TASK_STARTED","ABANDONED"):
                 raise SupervisorError(f"session preparation {other.stem} is unresolved; inspect it or run `herdr-supervisor abandon-session-start --preparation-id {other.stem}`")
-    owners = supervisor.verify_or_seed_owners()
+    owners = supervisor.verify_or_seed_owners(tuple(p for p in PROVIDERS if p == start_provider or p in fresh))
     if not fresh:
         return {"status": "OWNERSHIP_BOUND", "selection": selected, "owners": owners, "providers": {}}
     contract_probe = getattr(supervisor.herdr, "capability_report", None)
@@ -563,7 +567,7 @@ def prepare_sessions(
                 raise SupervisorError(f"fresh {provider} pane is not an empty shell pane; no agent was started")
             profile = item["profile"]
             if provider in THREAD_PROVIDERS:
-                args = ["resume", item["thread_id"]]  # the pre-created durable thread; the model is already set on it
+                args = ["resume", item["thread_id"], "--no-daemon"]  # pane-local hooks; exact pre-created thread and model retained
             else:
                 args = model_args(supervisor.config, provider, profile)
             name = f"{provider}-run-{preparation_id[:8]}"

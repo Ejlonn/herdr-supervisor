@@ -180,6 +180,13 @@ class HerdrCli:
     def get_agent(self, name: str) -> dict[str, Any]:
         return self._agent(self._run(["agent", "get", name], timeout=30))
 
+    def process_info(self, pane: str) -> dict[str, Any]:
+        response = self._run(["pane", "process-info", "--pane", pane], timeout=10)
+        result = response.get("result", {}).get("process_info") if isinstance(response, dict) else None
+        if not isinstance(result, dict) or result.get("pane_id") != pane:
+            raise HerdrError("pane process contract unavailable")
+        return result
+
     def read_agent(self, name: str, *, source: str, lines: int | None) -> str:
         args = ["agent", "read", name, "--source", source, "--format", "text"]
         if lines is not None:

@@ -102,7 +102,7 @@ class StagingTests(UploadCase):
         self.assertIn("Task to start:\nfile task.md (.md, ", card["text"])
         self.assertIn(excerpt[:120], card["text"], "the already-validated excerpt is the preview")
         self.assertLessEqual(card["text"].count("Details line."), 30, "bounded excerpt, not the 200-line file")
-        self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], [["Start · 0","Start · 1"],["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],["Cancel"]])
+        self.assertEqual([[b["text"] for b in row] for row in card["reply_markup"]["inline_keyboard"]], [["✓ Workflow: Supervised"],["Workflow: Plan approval"],["✓ Start with: Codex"],["Start with: Claude"],["Start · 0","Start · 1"],["Preserve sessions (default)"],["Fresh Codex"],["Fresh Claude + Codex"],["Cancel"]])
         for record_path in self.tg_paths.interactions_dir.glob("*.json"):
             record = json.loads(record_path.read_text())
             self.assertNotIn("excerpt", record); self.assertNotIn("task_text", record)
@@ -363,12 +363,13 @@ class ConfirmationTests(UploadCase):
         self.assertIn("rejected", self.bridge.handle_update(callback(143, buttons["Start Task"])))
         self.assertIn("rejected", self.bridge.handle_update(callback(144, buttons["Cancel"])))
         self.assertEqual(len(self.pending_inbox()), 1)
-        # the fixed worker starts exactly one gated_v2 Codex-first run from the file
+        # the fixed worker starts exactly one Codex-first run from the file, under the default supervised_v2
+        # policy (no explicit workflow_policy on the command); a voluntary plan gate still works.
         self.write_plan()
         self.herdr.responses = [{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]
         self.assertEqual(self.sup.worker(), 4)
         state = self.state()
-        self.assertEqual(state["workflow_policy"], "gated_v2")
+        self.assertEqual(state["workflow_policy"], "supervised_v2")
         self.assertEqual(state["active_agent"], "codex")
         self.assertEqual(state["task_text"], TASK_MD)
         self.assertEqual(state["task_reference"], str(self.paths.task_files_dir / f"{upload_id}.md"))
