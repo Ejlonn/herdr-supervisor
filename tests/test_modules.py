@@ -103,8 +103,9 @@ class CharacterizationTests(V2Case):
 
     def test_configuration_and_state_defaults_are_unchanged(self) -> None:
         # Re-recorded after the general-workflow-profiles change added `default_workflow_policy:
-        # "supervised_v2"` to DEFAULT_CONFIG (previous golden b549cbdf…).
-        self.assertEqual(hashlib.sha256(json.dumps({k:v for k,v in hs.DEFAULT_CONFIG.items() if k not in ("helpers", "native_tracking")}, sort_keys=True).encode()).hexdigest(), "795f4295ca969da752bfa5578f85221a57dfadf4f7dc97023c5e60495faa400f")
+        # "supervised_v2"` to DEFAULT_CONFIG (previous golden b549cbdf…), then after the quota plugin's
+        # id moved from herdr-agent-quota to herdr-agent-usage in the refresh command (previous golden 795f4295…).
+        self.assertEqual(hashlib.sha256(json.dumps({k:v for k,v in hs.DEFAULT_CONFIG.items() if k not in ("helpers", "native_tracking")}, sort_keys=True).encode()).hexdigest(), "54e762185cea73ce22f55dc2b0fc98f2f39326d2a30ebda256c8a889e1ec5e80")
         self.assertEqual(hs.DEFAULT_CONFIG["default_workflow_policy"], "supervised_v2")
         self.assertEqual(hs.DEFAULT_CONFIG["helpers"], {"enabled": False})
         self.assertEqual(hs.DEFAULT_CONFIG["native_tracking"], {"enabled": False, "roots": [], "files": []})
