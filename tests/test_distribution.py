@@ -265,7 +265,7 @@ class DistributionTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         requirements = readme.split("## Requirements", 1)[1].split("\n## ", 1)[0]
         self.assertIn("`~/.local/bin/herdr`", requirements)
-        self.assertIn("`herdr-agent-quota`", requirements)
+        self.assertIn("`herdr-agent-usage`", requirements)
         for role in ("quota snapshots", "refresh"):
             self.assertIn(role, requirements)
         self.assertIn("app-server", requirements)
@@ -274,7 +274,7 @@ class DistributionTests(unittest.TestCase):
             self.assertIn(optional, requirements)
         # The plugin the source actually invokes is the one the README names.
         source = (ROOT / "src/herdr_core.py").read_text()  # DEFAULT_CONFIG owns the refresh command
-        self.assertIn('"--plugin", "herdr-agent-quota"', source)
+        self.assertIn('"--plugin", "herdr-agent-usage"', source)
 
     def test_shell_scripts_parse(self) -> None:
         for script in ("install.sh", "uninstall.sh", "bin/herdr-supervisor", "bin/herdr-telegram", "bin/herdr-query-worker", "bin/herdr-backup", "bin/herdr-codex-reset-worker"):
