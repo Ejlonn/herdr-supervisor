@@ -73,6 +73,10 @@ herdr-telegram doctor --network
 
 Setup begins in shadow mode. Enable actionable control only after reviewing the doctor result and following [Telegram setup](docs/TELEGRAM.md).
 
+## Adaptive project setup
+
+`herdr-supervisor project inspect /path/to/project --output /path/to/private-proposal` defaults to **preserve**: discover the project and stage an inactive isolated profile without editing agent instructions or imposing a workflow. An existing agent can supply citation-bound findings through `--assessment`. Optional `--support-skill NAME=DIR` imports full reviewed copies of stop-slop, UI/UX Pro Max, skill-creator and task-observer independently of workflow choice. Choose `--preset adaptive` to adopt lightweight workflow guidance, or `--preset gated` for the strict plan/implementation flow. Review exact files before `project apply`; setup is never an installer side effect. See [Project setup](docs/PROJECT_SETUP.md).
+
 ## Workflow policy
 
 Every task resolves an immutable `workflow_contract` at start, persisted for the life of the run so

@@ -75,3 +75,9 @@ accepts nullable transcript paths and reports identity only when the event is
 canonical and its pane hosts a local `--no-daemon` Codex client. Shared-server
 contexts and native subagent events are rejected; no prompts or transcript bodies
 are read. The exact hook definition requires native Codex trust review.
+
+`herdr_onboarding.py` provides offline bounded project discovery, staged instruction/skill/profile proposals and fingerprint-bound application. Its CLI dispatch precedes live config, Herdr and Supervisor construction. It does not activate services or alter workflow state.
+
+`herdr_skill_baseline.py` contains the versioned portable skill baseline and its content-hash manifest. Onboarding stages isolated copies and binds their identity into approval; it never reads global installed skills.
+
+`herdr_support_skills.py` stages explicit optional local skill snapshots, including binary data, helpers, references and licenses. Reviewed proposals pin the complete resource inventory; apply reads staged bytes, never global skill paths, and never executes helpers.

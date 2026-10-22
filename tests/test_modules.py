@@ -26,7 +26,7 @@ from v2_fixtures import V2Case, hs  # noqa: E402
 
 SRC = Path(hs.__file__).resolve().parent
 # One-way layering, lowest first. A module may import only modules that appear before it.
-LAYERS = ["herdr_core", "herdr_cli", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_native_results", "herdr_role_readiness", "herdr_redaction", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
+LAYERS = ["herdr_core", "herdr_cli", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_native_results", "herdr_role_readiness", "herdr_redaction", "herdr_skill_baseline", "herdr_support_skills", "herdr_onboarding", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
 FACADE = "herdr_supervisor"
 # Names companion modules and tests consume through the facade (recorded before the split).
 CONSUMED = sorted({
