@@ -1,0 +1,566 @@
+{
+ "sample_00_idle": {
+  "manifest_version": "2026.10.11.1",
+  "matched_rule": "live_prompt_box",
+  "rules": [
+   {
+    "id": "osc_title_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "live_turn_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_agents_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_mcp_task_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "btw_overlay_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "transcript_viewer",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "live_blocked_form",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_blocked_form_named_session",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "dynamic_workflow_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "mcp_elicitation_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_prompt_box",
+    "matched": true,
+    "state": "idle"
+   },
+   {
+    "id": "model_picker_menu",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "bash_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "generic_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "legacy_no_prompt_blocker",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "osc_title_idle",
+    "matched": false,
+    "state": "idle"
+   },
+   {
+    "id": "osc_progress_idle",
+    "matched": false,
+    "state": "idle"
+   }
+  ],
+  "screen_detection_skipped": false,
+  "state": "idle",
+  "visible_blocker": false
+ },
+ "sample_01_working": {
+  "manifest_version": "2026.10.11.1",
+  "matched_rule": "live_turn_working",
+  "rules": [
+   {
+    "id": "osc_title_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "live_turn_working",
+    "matched": true,
+    "state": "working"
+   },
+   {
+    "id": "background_agents_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_mcp_task_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "btw_overlay_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "transcript_viewer",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "live_blocked_form",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_blocked_form_named_session",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "dynamic_workflow_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "mcp_elicitation_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_prompt_box",
+    "matched": true,
+    "state": "idle"
+   },
+   {
+    "id": "model_picker_menu",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "bash_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "generic_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "legacy_no_prompt_blocker",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "osc_title_idle",
+    "matched": false,
+    "state": "idle"
+   },
+   {
+    "id": "osc_progress_idle",
+    "matched": false,
+    "state": "idle"
+   }
+  ],
+  "screen_detection_skipped": false,
+  "state": "working",
+  "visible_blocker": false
+ },
+ "sample_10_working": {
+  "manifest_version": "2026.10.11.1",
+  "matched_rule": "live_prompt_box",
+  "rules": [
+   {
+    "id": "osc_title_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "live_turn_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_agents_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_mcp_task_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "btw_overlay_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "transcript_viewer",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "live_blocked_form",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_blocked_form_named_session",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "dynamic_workflow_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "mcp_elicitation_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_prompt_box",
+    "matched": true,
+    "state": "idle"
+   },
+   {
+    "id": "model_picker_menu",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "bash_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "generic_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "legacy_no_prompt_blocker",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "osc_title_idle",
+    "matched": false,
+    "state": "idle"
+   },
+   {
+    "id": "osc_progress_idle",
+    "matched": false,
+    "state": "idle"
+   }
+  ],
+  "screen_detection_skipped": false,
+  "state": "idle",
+  "visible_blocker": false
+ },
+ "sample_10_working.nonotice": {
+  "manifest_version": "2026.10.11.1",
+  "matched_rule": "background_agents_working",
+  "rules": [
+   {
+    "id": "osc_title_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "live_turn_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_agents_working",
+    "matched": true,
+    "state": "working"
+   },
+   {
+    "id": "background_mcp_task_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "btw_overlay_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "transcript_viewer",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "live_blocked_form",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_blocked_form_named_session",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "dynamic_workflow_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "mcp_elicitation_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_prompt_box",
+    "matched": true,
+    "state": "idle"
+   },
+   {
+    "id": "model_picker_menu",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "bash_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "generic_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "legacy_no_prompt_blocker",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "osc_title_idle",
+    "matched": false,
+    "state": "idle"
+   },
+   {
+    "id": "osc_progress_idle",
+    "matched": false,
+    "state": "idle"
+   }
+  ],
+  "screen_detection_skipped": false,
+  "state": "working",
+  "visible_blocker": false
+ },
+ "sample_22_done": {
+  "manifest_version": "2026.10.11.1",
+  "matched_rule": "live_prompt_box",
+  "rules": [
+   {
+    "id": "osc_title_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "live_turn_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_agents_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_mcp_task_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "btw_overlay_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "transcript_viewer",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "live_blocked_form",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_blocked_form_named_session",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "dynamic_workflow_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "mcp_elicitation_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_prompt_box",
+    "matched": true,
+    "state": "idle"
+   },
+   {
+    "id": "model_picker_menu",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "bash_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "generic_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "legacy_no_prompt_blocker",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "osc_title_idle",
+    "matched": false,
+    "state": "idle"
+   },
+   {
+    "id": "osc_progress_idle",
+    "matched": false,
+    "state": "idle"
+   }
+  ],
+  "screen_detection_skipped": false,
+  "state": "idle",
+  "visible_blocker": false
+ },
+ "sample_28_done": {
+  "manifest_version": "2026.10.11.1",
+  "matched_rule": "live_prompt_box",
+  "rules": [
+   {
+    "id": "osc_title_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "live_turn_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_agents_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "background_mcp_task_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "btw_overlay_working",
+    "matched": false,
+    "state": "working"
+   },
+   {
+    "id": "transcript_viewer",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "live_blocked_form",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_blocked_form_named_session",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "dynamic_workflow_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "mcp_elicitation_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "live_prompt_box",
+    "matched": true,
+    "state": "idle"
+   },
+   {
+    "id": "model_picker_menu",
+    "matched": false,
+    "state": "unknown"
+   },
+   {
+    "id": "bash_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "generic_permission_prompt",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "legacy_no_prompt_blocker",
+    "matched": false,
+    "state": "blocked"
+   },
+   {
+    "id": "osc_title_idle",
+    "matched": false,
+    "state": "idle"
+   },
+   {
+    "id": "osc_progress_idle",
+    "matched": false,
+    "state": "idle"
+   }
+  ],
+  "screen_detection_skipped": false,
+  "state": "idle",
+  "visible_blocker": false
+ }
+}

@@ -409,6 +409,131 @@ class CallbackTests(TelegramCase):
         self.assertEqual(self.state()["continuation"]["note"], "enum")
 
 
+class ApprovalPrecheckTests(TelegramCase):
+    """The Telegram callback runs the same pure approval-time predicates as the receiving worker before anything is queued."""
+
+    def runtime_gate(self) -> dict:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        payload = self.runtime_payload(decision_question="Run?", approval_consequence="c", decline_consequence="d", expected_output="o")
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(payload))}])
+        return self.state()
+
+    def approve_token(self, state: dict) -> str:
+        event = self.sup.list_events()[-1]
+        return self.bridge.new_interaction(action="approve", event=event, gate=state["pending_gate"], chat_id=CHAT)
+
+    def test_a_stale_candidate_binding_is_reported_precisely_and_nothing_is_queued_or_consumed(self) -> None:
+        state = self.runtime_gate()
+        token = self.approve_token(state)
+        self.bridge.enqueuer.head_resolver = self.head_resolver  # the bridge's own read-only controller resolves the same configured repository
+        self.head = "b" * 40  # the configured repository no longer is at the candidate
+        result = self.bridge.handle_update(callback(60, token))
+        self.assertEqual(result["result"], "refused_precheck")
+        self.assertEqual(result["predicates"], ["repository_head"])
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertIn("expected " + "a" * 40, self.texts()[-1])
+        self.assertIn(str(self.product_repo), self.texts()[-1])
+        self.assertIn("configuration was not rewritten", self.texts()[-1])
+        record = hs.load_json(self.tg_paths.interactions_dir / f"{token}.json", label="interaction")
+        self.assertFalse(record["consumed"], "the one-time token is kept so the operator can retry after fixing the binding")
+        # once the binding holds again the same token queues exactly one approval, which the worker still re-checks
+        self.head = "a" * 40
+        retried = self.bridge.handle_update(callback(61, token))
+        self.assertEqual(retried["result"], "enqueued")
+        self.assertEqual(len(self.pending_inbox()), 1)
+        self.assertTrue(self.sup.process_inbox()[0]["ok"])
+
+    def test_a_plan_replacement_that_would_invalidate_a_retained_manifest_candidate_is_reported_and_not_queued(self) -> None:
+        root = self.project_root / "immutable-candidate"
+        root.mkdir()
+        (root / "script.py").write_text("print(1)\n")
+        manifest = self.review_dir / "manifest.json"
+        manifest.write_text(json.dumps({"script.py": hs.sha256_file(root / "script.py")}))
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload(runtime_manifest_root=str(root), push_approval_required=False, rebuild_required=False)))}])
+        self.approve_pending()
+        runtime = self.runtime_payload(candidate_sha=None, repository=str(root), candidate_kind="manifest", candidate_digest=hs.sha256_file(manifest), candidate_manifest=str(manifest),
+                                       decision_question="Run?", approval_consequence="c", decline_consequence="d", expected_output="o", rebuild_required=False)
+        self.resume_with([{"v2": ("review", "human", "runtime_validation", str(runtime))}])
+        replacement = self.plan_payload(runtime_validation_required=False, push_approval_required=False, rebuild_required=False)  # omits the approved manifest root
+        with self.sup.store.transaction():
+            state = self.sup.store.read_state()
+            block = hs.ProtocolBlock(version=2, run_id=state["run_id"], turn_id="00000000-0000-4000-8000-0000000000c1", stage="plan", next_agent="human", gate="plan_approval", payload=str(replacement), handoff="replacement")
+            state["pending_gate"] = self.sup.create_gate(state, block)
+            state["supervisor_state"] = "WAIT_PLAN_APPROVAL"
+            self.sup.store.write_state(state)
+        state = self.state()
+        token = self.approve_token(state)
+        result = self.bridge.handle_update(callback(80, token))
+        self.assertEqual((result["result"], result["predicates"]), ("refused_precheck", ["plan_policy_state"]))
+        self.assertEqual(self.pending_inbox(), [])
+        self.assertIn("plan_policy_state", self.texts()[-1])
+        self.assertIn(str(root), self.texts()[-1])
+        self.assertFalse(hs.load_json(self.tg_paths.interactions_dir / f"{token}.json", label="interaction")["consumed"])
+
+    def test_evidence_the_restricted_daemon_cannot_read_defers_to_the_worker(self) -> None:
+        state = self.runtime_gate()
+        token = self.approve_token(state)
+
+        def unreadable(repo):
+            raise hs.SupervisorError("cannot read repository HEAD")
+
+        self.bridge.enqueuer.head_resolver = unreadable
+        result = self.bridge.handle_update(callback(62, token))
+        self.assertEqual(result["result"], "enqueued", "an unreadable HEAD is not a definitive mismatch; the worker decides at the time of use")
+        self.assertEqual(len(self.pending_inbox()), 1)
+
+
+class DeferHandoffTelegramTests(TelegramCase):
+    def runtime_gate(self) -> dict:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        payload = self.runtime_payload(decision_question="Run?", approval_consequence="c", decline_consequence="d", expected_output="o")
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(payload))}])
+        return self.state()
+
+    def test_defer_offers_a_bound_confirmation_and_the_worker_repeats_the_full_check(self) -> None:
+        state = self.runtime_gate()
+        result = self.bridge.handle_update(message(70, "/defer"))
+        self.assertEqual(result["result"], "offered")
+        card = self.api.sent[-1]
+        self.assertIn("Defer and hand off?", card["text"])
+        self.assertIn("runtime validation pass", card["text"])
+        self.assertIn("nothing is sent to an agent", card["text"])
+        token = card["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        self.assertEqual(self.pending_inbox(), [], "offering enqueues nothing")
+        self.assertEqual(self.bridge.handle_update(callback(71, token))["result"], "enqueued")
+        command = self.pending_inbox()[-1]
+        self.assertEqual((command["action"], command["run_id"], command["gate_id"], command["turn_id"]), ("defer_handoff", state["run_id"], state["pending_gate"]["gate_id"], state["pending_gate"]["turn_id"]))
+        self.assertEqual(sorted(command["unmet"]), ["push_approval", "runtime_validation_pass"])
+        self.assertIn("rejected", self.bridge.handle_update(callback(72, token)), "one-time token")
+        prompts = len(self.herdr.prompts)
+        self.assertTrue(self.sup.process_inbox()[0]["ok"])
+        self.assertEqual(self.state()["supervisor_state"], "DONE")
+        self.assertEqual(len(self.herdr.prompts), prompts, "zero model turns")
+
+    def test_a_stale_confirmation_is_inert_and_ineligible_states_get_no_offer(self) -> None:
+        self.runtime_gate()
+        self.bridge.handle_update(message(73, "/defer"))
+        token = self.api.sent[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        self.herdr.agents["codex-main"]["agent_status"] = "working"  # the agent became busy between the tap and the application
+        self.assertEqual(self.bridge.handle_update(callback(74, token))["result"], "enqueued", "the daemon only has state-only evidence")
+        results = self.sup.process_inbox()
+        self.assertFalse(results[0]["ok"], "the applying worker re-checks with the live agent and refuses")
+        self.assertIn("not settled", results[0]["message"])
+        self.assertNotEqual(self.state()["supervisor_state"], "DONE")
+        self.reset_fixture()
+        self.bridge = self.make_bridge()
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        refused = self.bridge.handle_update(message(75, "/defer"))
+        self.assertEqual(refused["result"], "ineligible")
+        self.assertIn("not available", self.api.sent[-1]["text"])
+
+
 class OffsetAndJournalTests(TelegramCase):
     def test_offset_monotonic_and_no_replay_after_restart(self) -> None:
         self.bridge.write_offset(10)

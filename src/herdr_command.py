@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -273,6 +274,10 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--lines", type=int, default=100)
     doctor = sub.add_parser("doctor", help="read-only live environment check")
     doctor.add_argument("--json", action="store_true")
+    observe = sub.add_parser("role-observe", help="record operator-observed subagent role evidence for the exact live parent session (operator evidence only; invokes nothing)")
+    observe.add_argument("--provider", choices=("claude",), default="claude")
+    observe.add_argument("--kind", required=True, choices=("menu_visible", "agent_tool_catalog", "agent_tool_catalog_absent"))
+    observe.add_argument("--role", action="append", required=True, help="a role name as the operator saw it (repeatable)")
     # ---- V2 gate and worker commands
     for name, help_text in (("approve", "approve the pending plan/push gate (one-time, hash-bound)"), ("reject", "reject the pending gate"), ("revise", "request a revision of the pending gate with a note"), ("answer", "answer the pending generic question")):
         cmd = sub.add_parser(name, help=help_text)
@@ -315,6 +320,15 @@ def build_parser() -> argparse.ArgumentParser:
     done.add_argument("--operator-handoff", action="store_true", help="required: acknowledge that Supervisor will not verify runtime/push actions you perform")
     done.add_argument("--note", default=None, help=f"optional bounded note (max {MAX_HANDOFF_NOTE_CHARS} chars)")
     done.add_argument("--actor", default="cli")
+    defer = sub.add_parser("defer-handoff", help="explicitly defer a pending runtime/push gate and close the settled run as an operator handoff (remaining actions are yours and unverified)")
+    defer.add_argument("--run-id", required=True)
+    defer.add_argument("--confirm", action="store_true", help="apply; without it the exact offer is only shown (read-only)")
+    defer.add_argument("--gate-id", default=None)
+    defer.add_argument("--turn-id", default=None)
+    defer.add_argument("--candidate", default=None)
+    defer.add_argument("--unmet", action="append", default=None, help="an unmet obligation exactly as offered (repeatable)")
+    defer.add_argument("--note", default=None, help=f"optional bounded note (max {MAX_HANDOFF_NOTE_CHARS} chars)")
+    defer.add_argument("--actor", default="cli")
     sub.add_parser("worker", help="detached worker entry point: consume the command inbox, reconcile, continue safe states")
     preflight = sub.add_parser("gate-preflight", help="validate an approval request against current state without creating a gate or writing state")
     preflight.add_argument("--gate-type", required=True, choices=("plan_approval", "generic_question", "runtime_validation", "push_approval"))
@@ -463,6 +477,20 @@ def main(argv: list[str] | None = None) -> int:
                     result = supervisor.return_to_decision(state, run_id=args.run_id, followup_turn_id=turn, actor=args.actor)
             print(result["message"])
             return 0 if result.get("ok") else 1
+        if args.command == "defer-handoff":
+            with supervisor.store.transaction():
+                state = supervisor.store.read_state()
+                if not args.confirm:
+                    ok, reason, offer = supervisor.defer_handoff_eligibility(state, run_id=args.run_id)
+                    print(json.dumps({"ok": ok, "reason": reason, "offer": offer, "confirm_with": None if not ok or offer is None else
+                                      f"herdr-supervisor defer-handoff --run-id {offer['run_id']} --confirm --gate-id {offer['gate_id']} --turn-id {offer['turn_id']}"
+                                      + (f" --candidate {offer['candidate']}" if offer["candidate"] else "") + "".join(f" --unmet {u}" for u in offer["unmet"])}, indent=2, sort_keys=True))
+                    return 0 if ok else 2
+                if not (args.gate_id and args.turn_id and args.unmet):
+                    raise SupervisorError("--confirm needs the exact --gate-id, --turn-id and --unmet values from the offer")
+                result = supervisor.defer_handoff(state, run_id=args.run_id, gate_id=args.gate_id, turn_id=args.turn_id, candidate=args.candidate, unmet=args.unmet, actor=args.actor, note=args.note)
+            print(result["message"])
+            return 0
         if args.command == "done":
             if not args.operator_handoff:
                 raise SupervisorError("done requires --operator-handoff; Supervisor never marks a task complete on its own authority")
@@ -533,6 +561,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(report, indent=2, sort_keys=True))
             else:
                 print_status(report)
+            return 0
+        if args.command == "role-observe":
+            record = supervisor.record_role_observation(args.provider, args.kind, args.role, f"cli:{getpass.getuser()}")
+            print(json.dumps({"ok": True, "recorded": record, "note": "operator evidence only; it is bound to this exact session and version and is invalidated by either changing"}, indent=2, sort_keys=True))
             return 0
         if args.command == "doctor":
             report = supervisor.doctor()

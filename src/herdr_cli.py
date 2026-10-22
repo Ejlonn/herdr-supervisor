@@ -24,7 +24,7 @@ def command_error_code(output: str) -> str:
         if isinstance(error, dict) and isinstance(error.get("code"), str):
             return error["code"]
     lowered = output.lower()
-    for known in ("agent_prompt_stalled", "agent_blocked", "agent_not_found", "agent_not_idle", "agent_not_ready", "timeout"):
+    for known in ("agent_prompt_stalled", "agent_blocked", "agent_not_found", "agent_not_idle", "agent_not_ready", "server_unavailable", "timeout"):
         if known in lowered:
             return known
     return "command_error"
@@ -179,6 +179,61 @@ class HerdrCli:
 
     def get_agent(self, name: str) -> dict[str, Any]:
         return self._agent(self._run(["agent", "get", name], timeout=30))
+
+    DETECTOR_STATES = frozenset({"idle", "working", "done", "blocked", "unknown"})  # the lifecycle vocabulary; anything else is not evidence
+    BACKGROUND_RULE_IDS = frozenset({"background_agents_working", "background_mcp_task_working"})  # named child-running indicators; with every `*_working` rule, state must be "working"
+
+    @staticmethod
+    def reduce_explain(raw: Any) -> dict[str, Any]:
+        """Reduce a `herdr agent explain --json` payload to the detector's own verdict and which rules matched. The rules'
+        region previews (screen text) are deliberately discarded here: they never reach state, logs or prompts. Evidence is never
+        silently dropped: any malformed, duplicate or mistyped relevant field raises HerdrError (a dropped working rule would otherwise
+        read as clear); the caller treats that as unknown evidence."""
+        def bad(what: str) -> HerdrError:
+            return HerdrError(f"herdr agent explain returned {what}")
+
+        if not isinstance(raw, dict) or not isinstance(raw.get("evaluated_rules"), list) or not raw["evaluated_rules"]:
+            raise bad("an unexpected shape")
+        rules: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw["evaluated_rules"]:
+            if not (isinstance(item, dict) and type(item.get("id")) is str and item["id"] and type(item.get("matched")) is bool and type(item.get("state")) is str and item["state"]):
+                raise bad("a malformed rule record")
+            if item["state"] not in HerdrCli.DETECTOR_STATES:
+                raise bad("an unsupported rule state")
+            if (item["id"] in HerdrCli.BACKGROUND_RULE_IDS or item["id"].endswith("_working")) and item["state"] != "working":
+                raise bad("a contradictory state for a working-family rule")
+            if item["id"] in seen:
+                raise bad("a duplicate rule record")
+            seen.add(item["id"])
+            rules.append({"id": item["id"], "matched": item["matched"], "state": item["state"]})
+        if type(raw.get("state")) is not str or raw["state"] not in HerdrCli.DETECTOR_STATES:
+            raise bad("no usable state")
+        for flag in ("screen_detection_skipped", "visible_blocker"):
+            if type(raw.get(flag)) is not bool:
+                raise bad(f"a non-boolean {flag}")
+        matched = raw.get("matched_rule")
+        if matched is None:
+            matched_id = None
+        elif isinstance(matched, dict) and type(matched.get("id")) is str:
+            matched_id = matched["id"]
+        else:
+            raise bad("a malformed matched_rule")
+        version = raw.get("manifest_version")
+        if version is not None and type(version) is not str:
+            raise bad("a malformed manifest_version")
+        return {
+            "state": raw["state"],
+            "matched_rule": matched_id,
+            "rules": rules,
+            "manifest_version": version,
+            "screen_detection_skipped": raw["screen_detection_skipped"],
+            "visible_blocker": raw["visible_blocker"],
+        }
+
+    def explain_agent(self, name: str) -> dict[str, Any]:
+        """Read-only: the installed detector's explanation of an agent's current state (reduced; no screen text)."""
+        return self.reduce_explain(self._run(["agent", "explain", name, "--json"], timeout=30))
 
     def process_info(self, pane: str) -> dict[str, Any]:
         response = self._run(["pane", "process-info", "--pane", pane], timeout=10)

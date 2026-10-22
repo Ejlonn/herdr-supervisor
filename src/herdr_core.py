@@ -57,6 +57,15 @@ GATE_STATE_FOR = {
 
 WORKFLOW_POLICIES = ("v1", "gated_v2", "supervised_v2")
 
+ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# Transient read-only `agent.wait` transport failures (supervisor reliability, batch 2): at most WAIT_RECOVERY_MAX_ATTEMPTS recovery attempts within
+# WAIT_RECOVERY_WINDOW_SECONDS per failure episode, paced; only a successful wait (or a verified settled/blocked transition) ends an episode.
+WAIT_TRANSIENT_CODES = frozenset({"server_unavailable"})
+WAIT_RECOVERY_MAX_ATTEMPTS = 3
+WAIT_RECOVERY_WINDOW_SECONDS = 30.0
+WAIT_RECOVERY_DELAYS = (1.0, 2.0, 4.0)
+
 # Policies that use the V2 typed-gate protocol and carry a resolved workflow_contract. `v1` predates the
 # V2 protocol entirely and is retained only for already-migrated historical state; it is deliberately
 # excluded here and untouched by the contract machinery below.
@@ -523,6 +532,24 @@ def load_config(path: Path) -> dict[str, Any]:
         raise SupervisorError(f"default_workflow_policy must be one of {V2_WORKFLOW_POLICIES}")
     if not isinstance(config.get("quota_block_dismiss_keys"), list):
         raise SupervisorError("quota_block_dismiss_keys must be a list")
+    roles = config.get("subagent_roles")
+    if roles is not None:
+        # Container types are checked before any nested access: a null/list/string/boolean setting is an actionable error, never an AttributeError.
+        if not isinstance(roles, dict) or not set(roles) <= {"claude"}:
+            raise SupervisorError("subagent_roles must be an object that maps claude to its settings")
+        for provider, settings in roles.items():
+            if not isinstance(settings, dict) or not set(settings) <= {"definitions_dir", "roles"}:
+                raise SupervisorError(f"subagent_roles.{provider} must be an object with only definitions_dir and roles")
+            names, directory = settings.get("roles"), settings.get("definitions_dir")
+            if names is not None and (not isinstance(names, list) or not 1 <= len(names) <= 64 or not all(isinstance(n, str) and ROLE_NAME_RE.match(n) for n in names)):
+                raise SupervisorError(f"subagent_roles.{provider}.roles must be 1-64 plain role names")
+            if directory is not None and (not isinstance(directory, str) or not directory.startswith("/") or "\x00" in directory):
+                raise SupervisorError(f"subagent_roles.{provider}.definitions_dir must be an absolute path")
+    roots = config.get("native_session_roots")
+    if roots is not None:
+        # Optional override of the provider-native session roots used by the read-only result recovery; absolute paths only.
+        if not isinstance(roots, dict) or not set(roots) <= set(PROVIDERS) or not all(isinstance(v, str) and v.startswith("/") and "\x00" not in v for v in roots.values()):
+            raise SupervisorError("native_session_roots must map codex/claude to absolute paths")
     patterns = config.get("quota_screen_patterns")
     if not isinstance(patterns, dict):
         raise SupervisorError("quota_screen_patterns must be an object")

@@ -183,3 +183,62 @@ class CommandTests(CliCase):
         self.assertIn("positive", err)
         code, _, err = self.run_cli("run", "--codex-reset-budget", "-1", "task")
         self.assertEqual(code, 2)
+
+
+class DeferHandoffAndRoleCliTests(CliCase):
+    """The new operator controls through the real CLI dispatch: read-only offer first, bound confirmation second; role observations never invoke anything."""
+
+    def runtime_gate(self) -> dict:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}])
+        self.approve_pending()
+        payload = self.runtime_payload(decision_question="Run?", approval_consequence="c", decline_consequence="d", expected_output="o")
+        self.resume_with([{"v2": ("brief", "claude")}, {"v2": ("implement", "codex")}, {"v2": ("review", "human", "runtime_validation", str(payload))}])
+        return self.state()
+
+    def test_defer_handoff_shows_the_exact_offer_read_only_then_applies_only_the_bound_confirmation(self) -> None:
+        state = self.runtime_gate()
+        code, out, _ = self.run_cli("defer-handoff", "--run-id", state["run_id"])
+        offer = json.loads(out)
+        self.assertEqual((code, offer["ok"], offer["offer"]["gate_id"]), (0, True, state["pending_gate"]["gate_id"]))
+        self.assertEqual(self.state()["supervisor_state"], "WAIT_RUNTIME_VALIDATION", "the offer changes nothing")
+        code, _out, err = self.run_cli("defer-handoff", "--run-id", state["run_id"], "--confirm")
+        self.assertEqual(code, 2)
+        self.assertIn("exact --gate-id", err)
+        stale = ["defer-handoff", "--run-id", state["run_id"], "--confirm", "--gate-id", "x", "--turn-id", offer["offer"]["turn_id"], "--unmet", "push_approval"]
+        self.assertEqual(self.run_cli(*stale)[0], 2)
+        command = ["defer-handoff", "--run-id", state["run_id"], "--confirm", "--gate-id", offer["offer"]["gate_id"], "--turn-id", offer["offer"]["turn_id"], "--candidate", offer["offer"]["candidate"]]
+        for item in offer["offer"]["unmet"]:
+            command += ["--unmet", item]
+        code, out, err = self.run_cli(*command)
+        self.assertEqual(code, 0, err)
+        self.assertIn("did not verify the remaining external actions", out)
+        self.assertEqual(self.state()["completion"]["verified_by_supervisor"], False)
+        code, out, _ = self.run_cli("defer-handoff", "--run-id", state["run_id"])
+        self.assertEqual(code, 2)
+        self.assertIn("already DONE", json.loads(out)["reason"])
+
+    def test_status_and_doctor_report_defer_and_role_readiness_without_invoking_anything(self) -> None:
+        self.runtime_gate()
+        code, out, _ = self.run_cli("status", "--json")
+        report = json.loads(out)
+        self.assertEqual((code, report["defer_handoff"]["available"], report["subagent_roles"]["claude"]["selectability"]), (0, True, "UNKNOWN"))
+        before = len(self.herdr.prompts)
+        self.run_cli("doctor", "--json")
+        self.assertEqual(len(self.herdr.prompts), before)
+
+    def test_role_observe_records_operator_evidence_bound_to_the_live_session_and_invokes_nothing(self) -> None:
+        import herdr_role_readiness as rr  # noqa: PLC0415
+
+        original = rr.read_provider_version
+        rr.read_provider_version = lambda command, runner: "2.1.306 (Claude Code)"
+        self.addCleanup(lambda: setattr(rr, "read_provider_version", original))
+        prompts = len(self.herdr.prompts)
+        code, out, err = self.run_cli("role-observe", "--kind", "agent_tool_catalog", "--role", "prospera-tracer", "--role", "prospera-test-runner")
+        self.assertEqual(code, 0, err)
+        record = json.loads(out)["recorded"]
+        self.assertEqual((record["authority"], record["provider_version"], record["roles"]), ("operator_evidence_only", "2.1.306 (Claude Code)", ["prospera-test-runner", "prospera-tracer"]))
+        self.assertTrue(record["actor"].startswith("cli:"))
+        self.assertEqual(len(self.herdr.prompts), prompts)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):  # an unsupported kind never reaches the supervisor
+            herdr_command.main(["role-observe", "--kind", "bogus", "--role", "x"])
