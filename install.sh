@@ -49,7 +49,7 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' \
         "Found Herdr executable at $HERDR_EXE" \
-        "Would install library files in $LIB_DIR" \
+        "Would install library files and the quota dependency lock in $LIB_DIR" \
         "Would install launchers in $BIN_DIR" \
         "Would install inactive user units in $UNIT_DIR" \
         "Would preserve existing configuration, credentials, and state"
@@ -69,6 +69,7 @@ chmod 0700 "$SUP_STATE_DIR/codex-reset" "$SUP_STATE_DIR/codex-reset/pending" \
 for file in "$SOURCE_DIR"/src/*.py; do
     install -m 0644 "$file" "$LIB_DIR/$(basename "$file")"
 done
+install -m 0644 "$SOURCE_DIR/config/quota-dependency.json" "$LIB_DIR/quota-dependency.json"
 for file in "$SOURCE_DIR"/bin/*; do
     install -m 0755 "$file" "$BIN_DIR/$(basename "$file")"
 done
@@ -113,4 +114,6 @@ fi
 cat <<'EOF'
 Installed inactive user-scoped files. No service was loaded, enabled, started, or restarted.
 Next: configure the supervisor, run `herdr-supervisor doctor`, and follow docs/INSTALL.md.
+Quota plugin: run `herdr-quota-dependency check` (read-only) to see whether the pinned herdr-agent-quota plugin is installed;
+this installer never installs, links or configures it. See docs/QUOTA_DEPENDENCY.md.
 EOF

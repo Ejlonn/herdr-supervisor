@@ -1,0 +1,136 @@
+{
+  "id": "cli:plugin",
+  "result": {
+    "plugins": [
+      {
+        "actions": [
+          {
+            "command": [
+              "sh",
+              "-c",
+              "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" configure --apply && herdr server reload-config && exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" startup --provider all"
+            ],
+            "id": "configure",
+            "title": "Install / repair agent quota"
+          },
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus"
+            ],
+            "id": "open-settings",
+            "title": "Open agent quota settings"
+          },
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" refresh --provider all --force"
+            ],
+            "id": "refresh",
+            "title": "Refresh agent quota"
+          },
+          {
+            "command": [
+              "sh",
+              "-c",
+              "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" configure --uninstall && herdr server reload-config"
+            ],
+            "id": "uninstall",
+            "title": "Uninstall agent quota configuration"
+          }
+        ],
+        "build": [
+          {
+            "command": [
+              "cargo",
+              "build",
+              "--release"
+            ]
+          }
+        ],
+        "description": "Credential-scoped AI quota and context for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, and Devin.",
+        "enabled": true,
+        "events": [
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" event"
+            ],
+            "on": "pane.agent_detected"
+          },
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" event"
+            ],
+            "on": "pane.agent_status_changed"
+          },
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"
+            ],
+            "on": "pane.focused"
+          }
+        ],
+        "manifest_path": "/home/user/.config/herdr/plugins/github/herdr-agent-quota-651432b09361/herdr-plugin.toml",
+        "min_herdr_version": "0.9.0",
+        "name": "Herdr Agent Quota",
+        "panes": [
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" dashboard"
+            ],
+            "id": "dashboard",
+            "placement": "popup",
+            "title": "Agent quota"
+          },
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" settings"
+            ],
+            "height": 31,
+            "id": "settings",
+            "placement": "popup",
+            "title": "Agent quota settings",
+            "width": 78
+          }
+        ],
+        "platforms": [
+          "macos",
+          "linux"
+        ],
+        "plugin_id": "herdr-agent-quota",
+        "plugin_root": "/home/user/.config/herdr/plugins/github/herdr-agent-quota-651432b09361",
+        "source": {
+          "installed_unix_ms": 1789078549496,
+          "kind": "github",
+          "managed_path": "/home/user/.config/herdr/plugins/github/herdr-agent-quota-651432b09361",
+          "owner": "levi-qiao",
+          "repo": "herdr-agent-quota",
+          "resolved_commit": "809749e585480047e502df072fb8ddccc4719d4e"
+        },
+        "startup": [
+          {
+            "command": [
+              "sh",
+              "-c",
+              "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" startup --provider all"
+            ]
+          }
+        ],
+        "version": "1.5.4"
+      }
+    ],
+    "type": "plugin_list"
+  }
+}

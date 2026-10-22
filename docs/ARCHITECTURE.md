@@ -35,7 +35,7 @@ Flat modules under `src/`, one-way dependencies (each imports only modules above
 - `herdr_runtime.py` — the supervisor engine: identity-safe command targets, delivery lifecycle, quota/reset reconciliation, thread-start via the helper journal, run/resume/monitor loop, status and doctor data (runtime evidence view, product-repository validity, Fresh Codex components).
 - `herdr_command.py` — argument parser, terminal output, control commands, `main`.
 - `herdr_supervisor.py` — compatibility facade and console entry point re-exporting the supported names.
-- Companions: `herdr_telegram.py` (bridge), `herdr_query.py` (read-only query worker), `herdr_backup.py`, `herdr_artifacts.py`, `herdr_present.py` (rendering), `herdr_codex_reset.py` (banked-reset helper), `telegram_api.py` (HTTPS client).
+- Companions: `herdr_telegram.py` (bridge), `herdr_query.py` (read-only query worker), `herdr_backup.py`, `herdr_artifacts.py`, `herdr_present.py` (rendering), `herdr_codex_reset.py` (banked-reset helper), `herdr_quota_dependency.py` (explicit check/bootstrap for the pinned `herdr-agent-quota` plugin; stdlib only, imports no supervisor module, never touches controller state or snapshot parsing), `telegram_api.py` (HTTPS client).
 
 Command targets are identity-safe: the configured alias is used only while it names the persisted native session; when the alias is absent, the pane of the single live record with the persisted provider and exact session id is used, a changed pane only updates the recorded locator, and provider kind, pane, title, recency, or sole-agent presence never authorize a target.
 

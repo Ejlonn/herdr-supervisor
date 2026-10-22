@@ -98,7 +98,7 @@ jobs:
         run: |
           python -m venv /tmp/wheelenv
           /tmp/wheelenv/bin/pip install --no-cache-dir dist/*.whl
-          for ep in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker; do HOME="$(mktemp -d)" /tmp/wheelenv/bin/$ep --help > /dev/null; done
+          for ep in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker herdr-quota-dependency; do HOME="$(mktemp -d)" /tmp/wheelenv/bin/$ep --help > /dev/null; done
       - name: Installer dry run in an isolated HOME
         run: |
           export HOME="$(mktemp -d)"; mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/herdr"; chmod +x "$HOME/.local/bin/herdr"

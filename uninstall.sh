@@ -57,7 +57,7 @@ remove_file() {
     if [ "$DRY_RUN" -eq 1 ]; then echo "Would remove $1"; else rm -f -- "$1"; fi
 }
 
-for name in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker; do remove_file "$BIN_DIR/$name"; done
+for name in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker herdr-quota-dependency; do remove_file "$BIN_DIR/$name"; done
 for name in herdr-server.service herdr-supervisor-worker.service herdr-supervisor-worker.path herdr-query-worker.service herdr-query-worker.path herdr-telegram.service herdr-backup.service herdr-backup.timer herdr-codex-reset-worker.service herdr-codex-reset-worker.path; do remove_file "$UNIT_DIR/$name"; done
 
 if [ "$DRY_RUN" -eq 1 ]; then

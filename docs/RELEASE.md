@@ -12,6 +12,7 @@ Before any commit or publication:
    Build the sdist and wheel in an isolated environment (`python -m build`), confirm the sdist lists exactly the repository inventory (`MANIFEST.in` is the allowlist), install the wheel into a throwaway prefix, and run every console entry point with `--help`.
 5. Run an isolated temporary-HOME install, missing-token doctor, unit validation, source/install hash reconciliation, and default-preserving uninstall.
 6. Record every live test and every intentionally deferred action.
-7. Obtain separate human authorization for commit, tag, remote creation, push, GitHub publication, or plugin publication.
+7. Confirm `config/quota-dependency.json` still names an exact revision of the owned `herdr-agent-quota` fork, that its recovery-artifact hashes match the files being distributed, and that no documentation links an address that no longer resolves. Run `herdr-quota-dependency bootstrap --dry-run` from a fresh isolated `HOME` against the recovery archive before publishing. A release never moves the pin implicitly.
+8. Obtain separate human authorization for commit, tag, remote creation, push, GitHub publication, or plugin publication.
 
 No repository remote is configured or contacted by the installer. Example configuration contains placeholders only.

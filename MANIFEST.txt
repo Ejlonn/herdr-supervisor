@@ -1,5 +1,6 @@
 # Reviewed source-to-install mapping. User configuration and state are never sourced from live files.
 src/*.py -> ~/.local/lib/herdr-supervisor/
+config/quota-dependency.json -> ~/.local/lib/herdr-supervisor/
 bin/* -> ~/.local/bin/
 systemd/* -> ~/.config/systemd/user/
 config/*.example.json -> ~/.local/share/doc/herdr-supervisor/examples/

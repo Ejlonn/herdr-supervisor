@@ -12,6 +12,18 @@ State schema migration is separate and explicit:
 
 Run this only after reviewing the candidate and making a state backup. It does not activate services.
 
+## Quota plugin dependency
+
+The supervisor needs the `herdr-agent-quota` Herdr plugin at one pinned revision (`config/quota-dependency.json`, installed beside the program files). `install.sh` does not acquire, link, enable, or configure it, and does not run the plugin's own installer, which edits provider hooks and settings. Check and stage it explicitly, in this order:
+
+```sh
+herdr-quota-dependency check                                   # read-only: Herdr, plugin revision, snapshot freshness, build prerequisites
+herdr-quota-dependency bootstrap --stage-dir "$HOME/quota-stage"   # dry run
+herdr-quota-dependency bootstrap --apply --stage-dir "$HOME/quota-stage"   # stage, verify against the lock, build with --locked
+```
+
+An existing installation at the locked revision is preserved; any other revision, duplicate, or unverifiable installation is reported and left alone. Building needs Rust 1.95.0 and the crates in the plugin's `Cargo.lock`; a source archive alone does not make the build offline. The commands that register and enable the staged plugin are printed, not run. Read [Quota plugin dependency](QUOTA_DEPENDENCY.md) for the pin, the offline limits, the operator steps, and rollback.
+
 Configure the workspace and Herdr path in `~/.config/herdr-supervisor/config.json`, then run:
 
 ```sh

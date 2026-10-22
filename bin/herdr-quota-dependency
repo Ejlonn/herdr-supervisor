@@ -1,0 +1,5 @@
+#!/bin/sh
+# Launcher for the explicit herdr-agent-quota dependency check/bootstrap (read-only unless `bootstrap --apply`).
+set -eu
+LIB="${HERDR_SUPERVISOR_LIB:-$HOME/.local/lib/herdr-supervisor}"
+exec python3 "$LIB/herdr_quota_dependency.py" "$@"

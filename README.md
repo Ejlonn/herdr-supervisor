@@ -26,7 +26,7 @@ It is not another AI agent, an API-model router, a provider-quota bypass, or a t
 
 - Linux with Python 3.11 or newer; release validation is performed on Python 3.13
 - Herdr 0.9.0 or newer installed user-scoped with its executable at `~/.local/bin/herdr`; the installer checks this before writing anything, and the headless server unit runs that path. 0.9.0 is the minimum tested CLI contract; `herdr-supervisor doctor` reports the detected version and probes the required commands/options read-only, so a newer version passes only while that contract holds
-- The Herdr plugin [`herdr-agent-quota`](https://github.com/levi-qiao/herdr-agent-quota): it writes the five-hour, weekly, and context quota snapshots the supervisor reads, and provides the non-LLM `refresh` action used to recheck model quota without waking a model
+- The Herdr plugin [`herdr-agent-quota`](https://github.com/Ejlonn/herdr-agent-quota), pinned to one exact revision (manifest 1.5.4; MIT, originally by Levi Qiao and now maintained upstream at `praxstack/herdr-agent-quota`): it writes the five-hour, weekly, and context quota snapshots the supervisor reads, and provides the non-LLM `refresh` action used to recheck model quota without waking a model. A fresh machine checks it with `herdr-quota-dependency check` and stages it with `herdr-quota-dependency bootstrap` (a dry run unless `--apply`); the supervisor installer never installs, links, or configures it, and the pinned source can be verified from a local recovery archive when the repository is unreachable. See [Quota plugin dependency](docs/QUOTA_DEPENDENCY.md)
 - Codex and Claude CLIs with persistent sessions managed through Herdr; the optional Codex banked-reset feature additionally uses Codex's supported app-server reset-credit interface, which is separate from the quota plugin
 - User systemd for detached workers and optional services
 - Per feature, optional: outbound HTTPS to `api.telegram.org:443` (Telegram control), `git` (Git recovery assessment), `ssh` and `rsync` (SSH snapshot backups)
@@ -63,6 +63,15 @@ herdr-supervisor doctor
 ```
 
 The installer copies reviewed files into user-scoped paths, creates restrictive directories, and installs disabled unit definitions. It does not enable, start, reload, or restart services. Existing config, tokens, and state are preserved.
+
+Before the first task, confirm the quota plugin the supervisor depends on. The check is read-only and works for any project, not only the one the supervisor was developed in:
+
+```sh
+herdr-quota-dependency check
+herdr-quota-dependency bootstrap --stage-dir "$HOME/quota-stage"   # dry run; add --apply only after reviewing it
+```
+
+It reports Herdr availability, whether the plugin is installed at the pinned revision, and snapshot freshness as separate facts; missing or stale telemetry is reported as UNKNOWN with the recovery action, never as zero usage. Linking, enabling, and configuring the plugin remain explicit operator steps ([details, build prerequisites, and offline limits](docs/QUOTA_DEPENDENCY.md)).
 
 Configure project paths in `~/.config/herdr-supervisor/config.json`; no Python edit is needed. Configure Telegram interactively without echoing the token:
 
