@@ -125,6 +125,15 @@ class FakeHerdr:
         self.ack_calls: list[tuple[str, int]] = []
         self.help_probes = 0
         self.targets: list[tuple[str, str]] = []  # (command, raw TARGET argument) for identity assertions
+        # Detector explanation (herdr agent explain), reduced: by default a quiet idle pane with no working rule matched.
+        self.explains: list[str] = []  # raw TARGET of every explain call
+        self.explain_matched: set[str] = set()  # rule ids reported as matched
+        self.explain_state = "idle"
+        self.explain_omit: set[str] = set()  # rule ids missing from the evaluated list
+        self.explain_skipped = False
+        self.explain_error: Exception | None = None
+        self.on_explain = None  # callable(fake, target) run before each verdict (script indicators, advance a clock, ...)
+        self.explain_raw: dict | None = None  # a raw `agent explain` payload that is run through the real adapter reducer (may raise HerdrError)
 
     @staticmethod
     def agent(provider: str, name: str, pane: str, session: str, status: str = "idle") -> dict:
@@ -193,6 +202,24 @@ class FakeHerdr:
 
     def get_agent(self, name: str) -> dict:
         return self.agents[self._resolve(name, "get")]
+
+    RULE_IDS = ("osc_title_working", "live_turn_working", "background_agents_working", "background_mcp_task_working", "btw_overlay_working", "live_prompt_box")
+    WORKING_RULE_IDS = ("osc_title_working", "live_turn_working", "background_agents_working", "background_mcp_task_working", "btw_overlay_working")
+
+    def explain_agent(self, name: str) -> dict:
+        key = self._resolve(name, "explain")
+        self.explains.append(name)
+        if self.on_explain is not None:
+            self.on_explain(self, name)
+        if self.explain_error is not None:
+            raise self.explain_error
+        if self.explain_raw is not None:
+            import herdr_cli  # noqa: PLC0415
+
+            return herdr_cli.HerdrCli.reduce_explain(self.explain_raw)
+        rules = [{"id": rule, "matched": rule in self.explain_matched, "state": "working" if rule in self.WORKING_RULE_IDS else "idle"} for rule in self.RULE_IDS if rule not in self.explain_omit]
+        matched = sorted(self.explain_matched)
+        return {"state": self.explain_state, "matched_rule": matched[0] if matched else None, "rules": rules, "manifest_version": "fixture", "screen_detection_skipped": self.explain_skipped, "visible_blocker": self.agents[key].get("agent_status") == "blocked"}
 
     def prompt(self, name: str, text: str, *, timeout_ms: int) -> dict:
         name = self._resolve(name, "prompt")

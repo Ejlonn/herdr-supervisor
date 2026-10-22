@@ -38,6 +38,8 @@ Runtime validation cards: the `Runtime validation required` card explains that t
 
 `Session pane ownership needs repair` cards say which saved session is duplicated, moved, or lost its recorded pane, that no other conversation was adopted and nothing was resent, and what to do: close duplicate panes first, then `Refresh repair preview`; the preview result offers `Apply pane repair` only when exactly one idle carrier of the same session exists in another pane (bound to the run, recovery id, and pane), reports "in place" when the recorded pane already holds it (Resume), or names what must change first. No plan/revision buttons appear on these cards.
 
+`/defer [note]` offers to defer a pending runtime or push gate and hand the settled run off: it sends a confirmation card bound to the run, the gate, the settled turn, the candidate and the unmet obligations, and enqueues nothing until you tap it. The applying worker repeats the full eligibility check (live agent, child-settlement sample, unchanged plan and candidate); nothing is sent to an agent and no PASS or push approval is recorded.
+
 `/done [note]` is the operator-handoff completion. The bridge only enqueues it when the supervisor's own eligibility rule reports a handoff-ready wait (the agent routed `done` and nothing but your runtime validation or push approval is missing); the detached worker repeats that rule with live agent inspection before recording the completion. The Done button is offered only in that state and is bound to the exact run, wait, and readiness turn, so it is inert after any state change. The closing message and `/status` state that the remaining actions are yours and unverified; no push approval or runtime evidence is created.
 
 Uploaded `.md` and `.txt` tasks are untrusted data. They are owner/chat checked, size/type checked, stored under opaque non-overwriting names, previewed, and started only after explicit confirmation. Long outputs use only registered, redacted workflow artifacts; arbitrary filesystem retrieval is unsupported.
@@ -71,6 +73,8 @@ confirmed-delivery safeguards. It does not replay the task or grant approval.
 If repair fails again, **Repair approval request** requests another bound repair
 without a revision note. Stale or duplicate clicks cannot send another prompt.
 Failed prerequisites (for example, a review that has not passed) remain blocked.
+
+Approval buttons for runtime and push gates also run the receiving controller's read-only binding predicates before anything is queued. A definite mismatch (changed plan, changed candidate, wrong configured repository, drifted manifest tree) is reported with the predicate and expected/observed values and is not queued; evidence the restricted bridge cannot read is left to the worker.
 
 Agents can check a request without changing state:
 

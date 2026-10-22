@@ -7,12 +7,15 @@ import dataclasses
 import hashlib
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 import herdr_codex_reset as hcr
+import herdr_native_results as nr
+import herdr_role_readiness as rr
 from herdr_cli import MIN_HERDR_VERSION_TEXT, match_exact_session, session_identity
 from herdr_core import (
     _UUID_RE,
@@ -26,6 +29,10 @@ from herdr_core import (
     SUPERVISOR_VERSION,
     TERMINAL_STATES,
     V2_WORKFLOW_POLICIES,
+    WAIT_RECOVERY_DELAYS,
+    WAIT_RECOVERY_MAX_ATTEMPTS,
+    WAIT_RECOVERY_WINDOW_SECONDS,
+    WAIT_TRANSIENT_CODES,
     WORKFLOW_POLICIES,
     HerdrError,
     OwnerRecoveryNeeded,
@@ -70,6 +77,72 @@ def telegram_doctor_summary() -> dict[str, Any]:
     except Exception as error:  # noqa: BLE001
         return {"status": "ERROR", "detail": type(error).__name__}
 
+# ----- Claude pane-mode settle guard (Claude-first rollout, package 2b). A sampled quiet window gates reading/routing a settled result and
+# delivering any prompt or key to a Claude pane, so a parent turn that ended while background children may still be running is neither
+# consumed nor answered. Screen stability does not prove that every child has finished; unknown or ambiguous evidence stops.
+CLAUDE_QUIET_WINDOW_SECONDS = 8.0
+CLAUDE_SAMPLE_SLEEP_SECONDS = 2.5
+CLAUDE_MAX_SAMPLE_GAP_SECONDS = 4.0
+BACKGROUND_INDICATOR_RULE_IDS = frozenset({"background_agents_working", "background_mcp_task_working"})
+
+
+@dataclasses.dataclass(frozen=True)
+class SettleResult:
+    """kind: clear | hold | blocked | unknown | identity | stop | patience. `detail` holds lifecycle words and detector rule ids only."""
+
+    kind: str
+    detail: str = ""
+    error: Exception | None = None
+
+
+def validate_detector_verdict(verdict: Any) -> SettleResult | None:
+    """Strict validity of a reduced detector verdict, shared by every guard consumer. None = usable; otherwise an `unknown` result.
+    Exact primitive types (a string "true" is not a boolean), unique rule ids, the background rule evaluated, detection not skipped."""
+    if not isinstance(verdict, dict):
+        return SettleResult("unknown", "detection explanation is not a mapping")
+    rules = verdict.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return SettleResult("unknown", "detection explanation has no usable rule evidence")
+    ids: set[str] = set()
+    for rule in rules:
+        if not (isinstance(rule, dict) and type(rule.get("id")) is str and rule["id"] and type(rule.get("matched")) is bool and type(rule.get("state")) is str):
+            return SettleResult("unknown", "detection explanation has a malformed rule record")
+        if rule["state"] not in LIFECYCLE_STATES:
+            return SettleResult("unknown", "detection explanation has an unsupported rule state")
+        if (rule["id"] in BACKGROUND_INDICATOR_RULE_IDS or rule["id"].endswith("_working")) and rule["state"] != "working":
+            return SettleResult("unknown", "detection explanation has a contradictory state for a working-family rule")
+        if rule["id"] in ids:
+            return SettleResult("unknown", "detection explanation repeats a rule id")
+        ids.add(rule["id"])
+    if type(verdict.get("screen_detection_skipped")) is not bool or type(verdict.get("visible_blocker")) is not bool or type(verdict.get("state")) is not str or verdict["state"] not in LIFECYCLE_STATES:
+        return SettleResult("unknown", "detection explanation has malformed top-level fields")
+    if verdict["screen_detection_skipped"]:
+        return SettleResult("unknown", "screen detection was skipped")
+    if "background_agents_working" not in ids:
+        return SettleResult("unknown", "the detector does not evaluate the background-agents rule")
+    return None
+
+
+def matched_working_rules(verdict: dict[str, Any]) -> list[str]:
+    return sorted(rule["id"] for rule in verdict["rules"] if rule["matched"] and rule["state"] == "working")
+
+
+def classify_detector_verdict(verdict: Any) -> SettleResult:
+    """Pure classification of a reduced explain verdict for an agent whose lifecycle is idle/done."""
+    invalid = validate_detector_verdict(verdict)
+    if invalid is not None:
+        return invalid
+    working = matched_working_rules(verdict)
+    if working:
+        kind = "background indicator" if BACKGROUND_INDICATOR_RULE_IDS.intersection(working) else "working evidence"
+        return SettleResult("hold", f"detector {kind}: {', '.join(working)}")
+    if verdict["state"] == "blocked" or verdict["visible_blocker"]:
+        return SettleResult("blocked", "detector reports a blocked screen")
+    if verdict["state"] != "idle":
+        return SettleResult("unknown", f"detector state {verdict['state']!r}")
+    return SettleResult("clear", "detector idle, no working rule matched")
+
+
 class MissingAgentError(SupervisorError):
     """The persisted native session has no live record at all (restorable only under allow_restore)."""
 
@@ -92,6 +165,8 @@ class Supervisor(SupervisorV2Mixin):
         self.sleeper = sleeper
         self.store = StateStore(paths, clock)
         self._live_names: dict[str, str] = {}
+        self.native_roots: dict[str, Path] | None = None  # tests inject; None = configured/default provider roots
+        self.provider_version_reader: Callable[[str], str | None] = self._read_provider_version  # tests inject; read-only `--version`, never a session
         self.head_resolver: Callable[[Path], str] = git_head  # tests inject a fake
         self.reset_gateway = reset_gateway or hcr.JournalGateway(
             paths.codex_reset_dir,
@@ -621,6 +696,277 @@ class Supervisor(SupervisorV2Mixin):
                     raise
         return self.herdr.read_agent(name, source="visible", lines=None)
 
+    # ----- exact-primary native result recovery (supervisor reliability, batch 1)
+
+    def _native_roots(self) -> dict[str, Path]:
+        configured = self.config.get("native_session_roots")
+        roots = dict(nr.default_roots())
+        if isinstance(self.native_roots, dict):
+            roots.update(self.native_roots)
+        elif isinstance(configured, dict):
+            roots.update({provider: Path(value) for provider, value in configured.items() if provider in nr.SUPPORTED_PROVIDERS and isinstance(value, str)})
+        return roots
+
+    def _native_cursor(self, provider: str) -> dict[str, Any] | None:
+        """Source boundary of the owned primary transcript, recorded before a prompt is sent. Best effort: no cursor never blocks a delivery."""
+        try:
+            session_id = self.owners()[provider]["session_id"]
+            root = self._native_roots().get(provider)
+            return nr.capture_cursor(provider, session_id, root) if root is not None else None
+        except (SupervisorError, KeyError, OSError):
+            return None
+
+    def collect_routing_result(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], *, purpose: str) -> tuple[ProtocolBlock | None, str, Any]:
+        """Terminal first (the supported path, unchanged). Only when it holds no valid current frame for an accepted V2 turn is the exact
+        primary session's native transcript consulted, read-only and bounded. Returns (block-from-terminal, terminal output, NativeResult|None).
+        Raw quota screens and follow-up answers never come through here."""
+        output = self.read_output(provider, settled=True)
+        block = parse_protocol(output, state["run_id"], delivery["turn_id"])
+        if block is not None:
+            return block, output, None
+        # Accepted = the prompt was confirmed delivered at some point (`accepted_at` survives the later `completed/rejected_by_policy` marking
+        # of a missing-result wait, which is exactly when the explicit retry runs). An uncertain delivery that was never confirmed stays closed.
+        accepted = delivery.get("status") == "accepted" or isinstance(delivery.get("accepted_at"), str)
+        if state.get("workflow_policy") not in V2_WORKFLOW_POLICIES or not accepted or delivery.get("agent") != provider:
+            return None, output, None
+        try:
+            session_id = self.owners()[provider]["session_id"]
+        except (SupervisorError, KeyError):
+            return None, output, None
+        native = nr.resolve(provider, session_id, state["run_id"], delivery["turn_id"], roots=self._native_roots(), cursor=delivery.get("native_cursor"))
+        self._log(state, "native_result_lookup", agent=provider, turn_id=delivery["turn_id"], purpose=purpose, status=native.status, reason=native.reason[:200],
+                  records=native.provenance.get("records"), scanned_bytes=native.provenance.get("scanned_bytes"), cursor_used=native.provenance.get("cursor_used"))
+        return None, output, native
+
+    # ----- transient wait recovery (supervisor reliability, batch 2)
+
+    def _wait_recovery_ok(self, state: dict[str, Any]) -> None:
+        """A wait that RETURNED normally is the only direct proof the transport works again: the episode ends."""
+        recovery = state.get("wait_recovery")
+        if isinstance(recovery, dict) and recovery.get("attempts"):
+            self._log(state, "wait_recovery_succeeded", attempts=recovery.get("attempts"))
+            state["wait_recovery"] = None
+            self.store.write_state(state)
+
+    def _wait_recovery_responsive(self, state: dict[str, Any]) -> None:
+        """A handled timeout/stall means the server answered but proves no recovery by itself: the episode is kept (so alternating failures and
+        timeouts still exhaust the bound). Only a full window of failure-free responses closes it, so a long-healthy run never carries a stale episode."""
+        recovery = state.get("wait_recovery")
+        if not isinstance(recovery, dict) or not recovery.get("attempts"):
+            return
+        last = recovery.get("last_failure_unix")
+        if isinstance(last, (int, float)) and self.clock() - float(last) >= WAIT_RECOVERY_WINDOW_SECONDS:
+            self._log(state, "wait_recovery_closed", attempts=recovery.get("attempts"), reason="a full window of failure-free responses")
+            state["wait_recovery"] = None
+            self.store.write_state(state)
+
+    def _wait_timeout_ms(self, state: dict[str, Any]) -> int:
+        """The configured wait timeout, except inside an active recovery episode: then no single wait may outlast the remaining episode budget
+        (never below one second), so elapsed time is bounded by the budget instead of being noticed only after another full wait."""
+        configured = int(self.config["wait_timeout_ms"])
+        recovery = state.get("wait_recovery")
+        if not isinstance(recovery, dict) or not recovery.get("attempts") or not isinstance(recovery.get("started_unix"), (int, float)):
+            return configured
+        remaining = WAIT_RECOVERY_WINDOW_SECONDS - (self.clock() - float(recovery["started_unix"]))
+        return max(1000, min(configured, int(remaining * 1000)))
+
+    def _recover_transient_wait(self, state: dict[str, Any], provider: str, name: str, error: HerdrError, *, followup: bool = False) -> str | None:
+        """A classified transient `agent.wait` failure (read-only transport). Bounded, paced, interruptible; before each retry the exact owned
+        session is re-resolved WITHOUT restoration. Nothing is sent: no prompt, no key. Returns None to re-enter the ordinary monitor, or a stop
+        result with a precise reason. The budget is persisted in the task state and resets only after a successful wait."""
+        recovery = state.get("wait_recovery")
+        now = self.clock()
+        if not isinstance(recovery, dict) or type(recovery.get("attempts")) is not int or not isinstance(recovery.get("started_unix"), (int, float)):
+            recovery = {"attempts": 0, "started_unix": now, "last_code": error.code}
+        recovery["attempts"] += 1
+        recovery["last_code"] = error.code
+        recovery["last_failure_unix"] = now
+        state["wait_recovery"] = recovery
+        self.store.write_state(state)
+        within = now - float(recovery["started_unix"]) <= WAIT_RECOVERY_WINDOW_SECONDS
+        if recovery["attempts"] > WAIT_RECOVERY_MAX_ATTEMPTS or not within:
+            self._log(state, "wait_recovery_exhausted", agent=provider, attempts=recovery["attempts"], code=error.code, within_window=within)
+            reason = (f"cannot wait for {name}: Herdr reported {error.code} and the bounded recovery ({WAIT_RECOVERY_MAX_ATTEMPTS} attempts within "
+                      f"{WAIT_RECOVERY_WINDOW_SECONDS:.0f}s) is exhausted. The agent was not prompted or sent keys. Check Herdr, then /resume re-verifies the exact session.")
+            return self._followup_failed(state, reason, delivery_uncertain=True) if followup else self.set_wait_user(state, reason)
+        delay = WAIT_RECOVERY_DELAYS[min(recovery["attempts"], len(WAIT_RECOVERY_DELAYS)) - 1]
+        self._log(state, "wait_recovery_attempt", agent=provider, attempt=recovery["attempts"], code=error.code, delay_seconds=delay)
+        remaining = delay
+        while remaining > 0:  # paced in short slices so pause/cancel interrupts the recovery
+            if not self.check_control(state):
+                return "stop"
+            step = min(1.0, remaining)
+            self.sleeper(step)
+            remaining -= step
+        if not self.check_control(state):
+            return "stop"
+        try:
+            self.ensure_agent(provider, allow_restore=False)
+        except (SupervisorError, HerdrError) as failure:
+            if followup:
+                return self._followup_failed(state, f"cannot safely inspect {name} after {error.code}: {failure}", delivery_uncertain=True)
+            return self._identity_stop(state, failure, f"cannot safely inspect {name} after {error.code}: {failure}")
+        return None
+
+    def _settlement_recheck(self, state: dict[str, Any], provider: str) -> SettleResult:
+        """Immediately before a recovered native result is routed: exact owned identity again (never restored) and the settlement evidence
+        again. Claude: one detector sample (the quiet window already elapsed before the read); other providers: lifecycle idle/done."""
+        if self.settle_applies(provider):
+            return self._settle_sample(provider)
+        try:
+            _target, agent = self._guard_agent(provider)
+        except (SupervisorError, HerdrError) as error:
+            return SettleResult("identity", str(error), error)
+        status = agent.get("agent_status")
+        if status == "working":
+            return SettleResult("hold", "lifecycle working")
+        if status not in READY_STATES:
+            return SettleResult("unknown", f"lifecycle {status!r}")
+        return SettleResult("clear", "lifecycle settled")
+
+    def _accept_native_block(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], native: Any, *, purpose: str) -> ProtocolBlock | None:
+        """Record the source fingerprint once for this run/turn; a repeat of the same frame is harmless, a different frame for the same turn is a conflict."""
+        recoveries = state.setdefault("native_recoveries", [])
+        for earlier in recoveries:
+            if earlier.get("run_id") == state["run_id"] and earlier.get("turn_id") == delivery["turn_id"]:
+                if earlier.get("frame_sha256") != native.provenance.get("frame_sha256"):
+                    raise SupervisorError("a different native routing frame was already recovered for this turn; refusing to route a second one")
+                return None  # already recovered and routed once: duplicate callback/restart creates nothing
+        recoveries.append({"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"], "agent": provider, "purpose": purpose,
+                           "at": iso_utc(self.clock()), **{k: v for k, v in native.provenance.items() if k in ("provider", "dev", "ino", "offset_start", "offset_end", "record_offset", "record_id", "message_sha256", "frame_sha256", "cursor_used", "eligible_finals")}})
+        del recoveries[:-20]
+        self._log(state, "native_result_recovered", agent=provider, turn_id=delivery["turn_id"], purpose=purpose, frame_sha256=native.provenance.get("frame_sha256"))
+        return native.block
+
+    @staticmethod
+    def _native_note(native: Any) -> str:
+        return "" if native is None else f" Native transcript recovery: {native.status} — {native.reason}."
+
+    # ----- Claude settle guard (package 2b)
+
+    @staticmethod
+    def settle_applies(provider: str) -> bool:
+        return provider == "claude"
+
+    @staticmethod
+    def _guard_requires_action(state: dict[str, Any]) -> bool:
+        return state.get("workflow_policy") not in (None, "v1")
+
+    def _guard_agent(self, provider: str, live_agents: list[dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]]:
+        """Exact-identity resolution for the guard: the same identity-safe target every other call uses, the recorded native session
+        verified, and no restoration (a missing or changed agent raises; restoring a pane is not a quiet-window sampling action)."""
+        record = self.owners()[provider]
+        target, agent = self.resolve_target(provider, live_agents=live_agents)
+        identity = session_identity(agent)
+        if identity != record["session_id"]:
+            raise SupervisorError(f"{self.agent_name(provider)} native session is {identity!r}, expected {record['session_id']}; refusing to continue")
+        if agent.get("agent_status") not in LIFECYCLE_STATES:
+            raise SupervisorError(f"{self.agent_name(provider)} reported an invalid lifecycle state: {agent.get('agent_status')!r}")
+        return target, agent
+
+    def _settle_sample(self, provider: str) -> SettleResult:
+        """One exact-identity sample of a Claude pane: the owned session is re-verified (never restored here) and the detector's own
+        explanation is consulted. clear = settled idle/done with no working rule matched; hold = working or a background indicator."""
+        try:
+            target, agent = self._guard_agent(provider)
+        except (SupervisorError, HerdrError) as error:
+            return SettleResult("identity", str(error), error)
+        status = agent.get("agent_status")
+        if status == "working":
+            return SettleResult("hold", "lifecycle working")
+        if status == "blocked":
+            return SettleResult("blocked", "lifecycle blocked")
+        if status not in READY_STATES:
+            return SettleResult("unknown", f"lifecycle {status!r}")
+        explain = getattr(self.herdr, "explain_agent", None)
+        if not callable(explain):
+            return SettleResult("unknown", "the Herdr adapter cannot explain detection state")
+        try:
+            verdict = explain(target)
+        except (HerdrError, SupervisorError) as error:
+            return SettleResult("unknown", f"detection explanation unavailable: {type(error).__name__}")
+        return classify_detector_verdict(verdict)
+
+    def settle_guard(self, state: dict[str, Any], provider: str, purpose: str, *, wait: bool = False, patience: float | None = None, control: bool = True) -> SettleResult:
+        """Sampled quiet window (CLAUDE_QUIET_WINDOW_SECONDS, samples never more than CLAUDE_MAX_SAMPLE_GAP_SECONDS apart) in a settled
+        idle/done lifecycle with no working evidence. wait=False returns "hold" after one paced sample so the caller's deterministic loop
+        decides; wait=True keeps sampling (optionally up to `patience` seconds). Never reads, routes or sends anything itself."""
+        if not self.settle_applies(provider):
+            return SettleResult("clear", "guard applies to Claude pane runs only")
+        started = self.clock()
+        quiet_since: float | None = None
+        last_sample: float | None = None
+        samples = 0
+        announced = False
+        while True:
+            if control and not self.check_control(state):
+                return SettleResult("stop", "control request")
+            result = self._settle_sample(provider)
+            samples += 1
+            now = self.clock()
+            if result.kind == "clear":
+                if quiet_since is None or last_sample is None or now - last_sample > CLAUDE_MAX_SAMPLE_GAP_SECONDS:
+                    quiet_since = now  # first clear sample, or samples too far apart: the window restarts
+                last_sample = now
+                if now - quiet_since >= CLAUDE_QUIET_WINDOW_SECONDS:
+                    self._log(state, "settle_guard_cleared", purpose=purpose, samples=samples, quiet_seconds=round(now - quiet_since, 1))
+                    return SettleResult("clear", f"quiet {now - quiet_since:.1f}s over {samples} samples")
+            else:
+                quiet_since = last_sample = None
+                if result.kind != "hold":
+                    self._log(state, "settle_guard_stopped", purpose=purpose, kind=result.kind, detail=result.detail[:200])
+                    return result
+                if not announced:
+                    self._log(state, "settle_guard_hold", purpose=purpose, detail=result.detail[:200])
+                    announced = True
+                if not wait:
+                    self.sleeper(CLAUDE_SAMPLE_SLEEP_SECONDS)
+                    return result
+            if patience is not None and now - started >= patience:
+                self._log(state, "settle_guard_patience", purpose=purpose, samples=samples)
+                return SettleResult("patience", f"not quiet after {patience:.0f}s")
+            self.sleeper(CLAUDE_SAMPLE_SLEEP_SECONDS)
+
+    def _background_indicator_check(self, provider: str) -> SettleResult:
+        """Immediate recheck before a key is sent to a blocked Claude pane: exact identity plus no matched background-child indicator rule.
+        (A blocked screen is not a quiet idle screen, so the quiet window does not apply to keys.)"""
+        if not self.settle_applies(provider):
+            return SettleResult("clear", "guard applies to Claude pane runs only")
+        try:
+            target, _agent = self._guard_agent(provider)
+        except (SupervisorError, HerdrError) as error:
+            return SettleResult("identity", str(error), error)
+        explain = getattr(self.herdr, "explain_agent", None)
+        if not callable(explain):
+            return SettleResult("unknown", "the Herdr adapter cannot explain detection state")
+        try:
+            verdict = explain(target)
+        except (HerdrError, SupervisorError) as error:
+            return SettleResult("unknown", f"detection explanation unavailable: {type(error).__name__}")
+        invalid = validate_detector_verdict(verdict)
+        if invalid is not None:
+            return invalid
+        working = matched_working_rules(verdict)
+        if working:
+            return SettleResult("hold", "detector working evidence: " + ", ".join(working))
+        return SettleResult("clear", "no working rule matched")
+
+    def _guard_stop(self, state: dict[str, Any], provider: str, guard: SettleResult, *, sent: bool, action: str) -> str:
+        """Map a non-clear guard result onto an existing wait/stop path. Nothing was read, routed or sent."""
+        name = self.agent_name(provider)
+        if guard.kind == "stop":
+            return "stop"
+        if guard.kind == "identity":
+            return self._identity_stop(state, guard.error or SupervisorError(guard.detail), f"cannot safely inspect {name}: {guard.detail}")
+        if guard.kind == "blocked":
+            return self.handle_blocked(state, provider, sent=sent)
+        return self.set_wait_user(
+            state,
+            f"{name} did not reach a quiet settled state, so the supervisor did not {action} ({guard.kind}: {guard.detail}); "
+            "nothing was read, routed or resent. Inspect the pane: background children may still be running.",
+            requires_action=self._guard_requires_action(state),
+        )
+
     # ----- state transitions
 
     def _log(self, state: dict[str, Any], event: str, **details: Any) -> None:
@@ -730,6 +1076,7 @@ class Supervisor(SupervisorV2Mixin):
             "prompt_chars": len(prompt),
             "status": "prepared",
             "prepared_at": iso_utc(self.clock()),
+            "native_cursor": self._native_cursor(state["active_agent"]),
         }
         # Exactly-once accounting: it lives in the same durable write as the delivery record, so a
         # restart that reuses this record never counts the prompt again.
@@ -746,6 +1093,9 @@ class Supervisor(SupervisorV2Mixin):
     def submit(self, state: dict[str, Any], kind: str) -> str:
         provider = state["active_agent"]
         name = self.agent_name(provider)
+        guard = self.settle_guard(state, provider, "deliver_prompt", wait=True, patience=120.0)
+        if guard.kind != "clear":
+            return self._guard_stop(state, provider, guard, sent=False, action="deliver the prompt")
         turn_id, prompt = self._new_delivery(state, kind)
         delivery = state["delivery"]
         if kind.startswith("continuation:") and isinstance(state.get("continuation"), dict):
@@ -881,24 +1231,51 @@ class Supervisor(SupervisorV2Mixin):
                     if self.quota_screen_confirmed(provider, screen):
                         return self.wait_for_quota(state, provider, blocking, midturn=True)
                 try:
-                    self.herdr.wait(name, timeout_ms=int(self.config["wait_timeout_ms"]))
+                    self.herdr.wait(name, timeout_ms=self._wait_timeout_ms(state))
                 except HerdrError as error:
+                    if error.code in WAIT_TRANSIENT_CODES:
+                        stopped = self._recover_transient_wait(state, provider, name, error)
+                        if stopped is not None:
+                            return stopped
+                        continue  # the exact owner was re-verified and the ordinary monitor decides again (working, blocked or settled)
                     if error.code not in {"timeout", "agent_prompt_stalled"}:
                         return self.set_wait_user(state, f"cannot wait for {name}: {error}")
+                    self._wait_recovery_responsive(state)
+                else:
+                    self._wait_recovery_ok(state)
                 continue
             if status == "unknown":
                 return self.set_wait_user(state, f"{name} lifecycle is unknown; completion is not assumed and nothing was resent")
             if status == "blocked":
                 # An approval/question dialog is never routed, even if a current-turn block is visible.
                 return self.handle_blocked(state, provider, sent=True)
-            # idle or done: inspect the settled output.
+            # idle or done: a Claude result is read only after the sampled quiet window (background children may still be pending).
+            guard = self.settle_guard(state, provider, "read_result")
+            if guard.kind == "hold":
+                continue
+            if guard.kind != "clear":
+                return self._guard_stop(state, provider, guard, sent=True, action="read the result")
             try:
-                output = self.read_output(provider, settled=True)
-                block = parse_protocol(output, state["run_id"], delivery["turn_id"])
+                block, output, native = self.collect_routing_result(state, provider, delivery, purpose="monitor")
             except HerdrError as error:
                 return self.set_wait_user(state, f"cannot read {name} output: {error}")
             except SupervisorError as error:
                 return self.set_wait_user(state, str(error))
+            if block is None and native is not None and native.status == nr.CONFLICT:
+                return self.set_wait_user(state, f"{name} settled; the native transcript holds conflicting routing results for turn {delivery['turn_id']}: {native.reason}. Nothing was routed or resent.", requires_action=True)
+            if block is None and native is not None and native.recoverable:
+                checked = self._settlement_recheck(state, provider)
+                if checked.kind == "hold":
+                    self._log(state, "native_route_deferred", agent=provider, turn_id=delivery["turn_id"], detail=checked.detail[:200])
+                    continue  # the recovered frame stays in the file; ordinary monitoring decides again once the pane is quiet
+                if checked.kind != "clear":
+                    return self._guard_stop(state, provider, checked, sent=True, action="route the recovered native result")
+                try:
+                    block = self._accept_native_block(state, provider, delivery, native, purpose="monitor")
+                except SupervisorError as error:
+                    return self.set_wait_user(state, str(error), requires_action=True)
+                if block is None:
+                    return self.set_wait_user(state, f"the native routing result for turn {delivery['turn_id']} was already recovered once; nothing was routed twice", requires_action=True)
             if block is not None:
                 return self.route(state, block)
             # Settled without a matching block (Herdr `done` is never semantic success). A reconciliation
@@ -942,10 +1319,12 @@ class Supervisor(SupervisorV2Mixin):
             if strict:
                 state["missing_result"] = {"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"], "agent": provider,
                                            "attempts": 0, "created_at_unix": self.clock()}
+                if native is not None:
+                    state["missing_result"]["native"] = {"status": native.status, "reason": native.reason[:300]}
             return self.set_wait_user(
                 state,
                 f"{name} settled ({status}) without a protocol block for turn {delivery['turn_id']} "
-                f"(delivery={delivery['status']}) and no blocking quota window exists. The prompt was not resent; inspect the pane and provide guidance.",
+                f"(delivery={delivery['status']}) and no blocking quota window exists. The prompt was not resent; inspect the pane and provide guidance." + self._native_note(native),
                 requires_action=strict,
             )
 
@@ -1163,6 +1542,9 @@ class Supervisor(SupervisorV2Mixin):
             keys = list(self.config.get("quota_block_dismiss_keys") or [])
             if not keys or not self.quota_screen_confirmed(provider, output):
                 return self.set_wait_user(state, f"{name} is still blocked after the quota wait; no key was pressed")
+            indicator = self._background_indicator_check(provider)
+            if indicator.kind != "clear":
+                return self._guard_stop(state, provider, indicator, sent=True, action="press the configured dismissal keys")
             try:
                 self.herdr.send_keys(name, keys)
                 self._log(state, "quota_screen_dismissed", agent=provider, keys=keys)
@@ -1182,6 +1564,13 @@ class Supervisor(SupervisorV2Mixin):
             return self.monitor(state)
         if status in READY_STATES:
             if isinstance(delivery, dict):
+                guard = self.settle_guard(state, provider, "read_result_after_quota")
+                if guard.kind == "hold":
+                    delivery["status"] = "accepted"
+                    self.store.write_state(state)
+                    return self.monitor(state)
+                if guard.kind != "clear":
+                    return self._guard_stop(state, provider, guard, sent=True, action="read the result after the quota wait")
                 try:
                     output = self.read_output(provider, settled=True)
                     block = parse_protocol(output, state["run_id"], delivery["turn_id"])
@@ -1385,11 +1774,18 @@ class Supervisor(SupervisorV2Mixin):
                 elif agent["agent_status"] == "working":
                     # Someone else's turn is running in this session: never stack a prompt on it.
                     try:
-                        self.herdr.wait(self.agent_name(provider), timeout_ms=int(self.config["wait_timeout_ms"]))
+                        self.herdr.wait(self.agent_name(provider), timeout_ms=self._wait_timeout_ms(state))
                     except HerdrError as error:
+                        if error.code in WAIT_TRANSIENT_CODES:
+                            if self._recover_transient_wait(state, provider, self.agent_name(provider), error) is not None:
+                                return 2
+                            continue  # nothing was submitted; the exact owner was re-verified and the loop decides again
                         if error.code not in {"timeout", "agent_prompt_stalled"}:
                             self.set_wait_user(state, f"cannot wait for busy {self.agent_name(provider)}: {error}")
                             return 2
+                        self._wait_recovery_responsive(state)
+                    else:
+                        self._wait_recovery_ok(state)
                     self._log(state, "agent_busy_before_submit", agent=provider)
                     continue
                 elif agent["agent_status"] == "blocked":
@@ -1744,6 +2140,10 @@ class Supervisor(SupervisorV2Mixin):
             report["product_repo"] = {"path": str(repo), "valid": False, "detail": str(error)}
             if state_for_runtime and (state_for_runtime.get("runtime_policy") or {}).get("runtime_validation_required"):
                 report["warnings"].append(f"product repository HEAD is unavailable at {repo}; exact-SHA runtime evidence cannot be recorded until it is")
+        report["subagent_roles"] = self.role_readiness_report(live_agents, owners)
+        claude_roles = report["subagent_roles"]["claude"]
+        if claude_roles["definitions"]["status"] == "installed" and claude_roles["selectability"]["status"] == "UNKNOWN":
+            report["warnings"].append("claude role definitions are installed but their selectability in the running parent session is UNKNOWN (files and menus do not prove it)")
         report["telegram"] = telegram_doctor_summary()
         report["query_session"] = self.query_report()
         report["backup"] = backup_doctor_summary(self.paths, now)
@@ -1785,6 +2185,60 @@ class Supervisor(SupervisorV2Mixin):
         except (SupervisorError, OSError, ValueError):
             report["session_catalog"] = {"sessions": [], "error": "session/helper registry unavailable"}
         return report
+
+    # ----- truthful subagent-role readiness (supervisor reliability, batch 4)
+
+    def _read_provider_version(self, provider: str) -> str | None:
+        """`<command> --version`, cached briefly so status polling never spawns a process per call; the cache is by monotonic-ish controller clock."""
+        cache = self.__dict__.setdefault("_version_cache", {})
+        now = self.clock()
+        hit = cache.get(provider)
+        if hit is not None and now - hit[0] < 300:
+            return hit[1]
+        value = rr.read_provider_version(str(self.config["session_start"]["provider_commands"][provider]), subprocess.run)
+        cache[provider] = (now, value)
+        return value
+
+    def _role_settings(self, provider: str) -> dict[str, Any]:
+        section = (self.config.get("subagent_roles") or {}).get(provider) or {}
+        default_dir = Path(os.path.expanduser("~")) / ".claude" / "agents"
+        directory = Path(str(section.get("definitions_dir"))) if section.get("definitions_dir") else default_dir
+        return {"definitions_dir": directory, "expected_roles": section.get("roles")}
+
+    def role_readiness_report(self, live_agents: list[dict[str, Any]], owners: dict[str, Any] | None) -> dict[str, Any]:
+        """Per provider: definitions installed, the parent's exact session and version, operator observations (bound, never authority) and
+        selectability (UNKNOWN unless a current operator observation exists). Read-only: no agent is invoked and no ownership changes."""
+        observations = rr.load_observations(self.paths.state_dir / "role_observations.json")
+        report: dict[str, Any] = {"codex": {"status": "not_applicable", "detail": "Codex subagents remain disabled by policy; nothing is reported as available",
+                                           "limitations": list(rr.LIMITATIONS)}}
+        # The parent is "verified" only by the control path's own predicate (exact owned session, recorded pane, no duplicate carrier, no moved/changed
+        # identity); anything else is unverified and never restarts, rebinds or repairs anything.
+        verified: str | None = None
+        identity_note: str | None = None
+        try:
+            _target, agent = self._guard_agent("claude", live_agents=live_agents)
+            verified = session_identity(agent)
+        except (SupervisorError, HerdrError) as error:
+            identity_note = str(error)[:240]
+        settings = self._role_settings("claude")
+        try:
+            version = self.provider_version_reader("claude")
+        except (SupervisorError, OSError):
+            version = None
+        report["claude"] = rr.readiness("claude", definitions_dir=settings["definitions_dir"], live_session_id=verified, provider_version=version,
+                                        observations=observations, expected_roles=settings["expected_roles"], identity_note=identity_note)
+        return report
+
+    def record_role_observation(self, provider: str, kind: str, roles: Any, actor: str) -> dict[str, Any]:
+        """Operator evidence, bound to the exact live owned session and the provider version read now. Never an invocation and never authority."""
+        if provider != "claude":
+            raise SupervisorError("role observations are only recorded for claude (Codex subagents are disabled)")
+        _target, agent = self._guard_agent(provider)  # exact identity, never restored
+        session = session_identity(agent)
+        if session is None:
+            raise SupervisorError("the live session identity is unavailable; nothing was recorded")
+        return rr.record_observation(self.paths.state_dir / "role_observations.json", provider=provider, session_id=session, provider_version=self.provider_version_reader(provider),
+                                     kind=kind, roles=roles, actor=actor, now=self.clock())
 
     def herdr_contract(self) -> dict[str, Any] | None:
         """Read-only, cached version/capability contract of the installed Herdr CLI (None without a probe)."""
@@ -1893,8 +2347,13 @@ class Supervisor(SupervisorV2Mixin):
             report["session_catalog"] = self.sessions_report(live=live_agents)
         except (SupervisorError, OSError, ValueError):
             report["session_catalog"] = {"sessions": [], "error": "session/helper registry unavailable; inspect sessions --json"}
+        roles = self.role_readiness_report(live_agents, owners)
+        report["subagent_roles"] = {"claude": {"definitions": roles["claude"]["definitions"]["status"], "selectability": roles["claude"]["selectability"]["status"],
+                                               "session_bound": roles["claude"]["parent"]["session_id"] is not None}, "codex": roles["codex"]["status"]}
         available, reason = self.operator_handoff_eligibility(state, live_agents=live_agents)
         report["operator_handoff"] = {"available": available, "reason": reason}
+        defer_ok, defer_reason, defer_offer = self.defer_handoff_eligibility(state, live_agents=live_agents, inspect_agents=False)
+        report["defer_handoff"] = {"available": defer_ok, "reason": defer_reason, "unmet": (defer_offer or {}).get("unmet", [])}
         return report
 
 def backup_doctor_summary(paths: Paths, now: float) -> dict[str, Any]:

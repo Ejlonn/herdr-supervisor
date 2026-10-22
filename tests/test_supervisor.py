@@ -93,6 +93,14 @@ class FakeHerdr:
             raise hs.HerdrError("missing", code="agent_not_found")
         return self.agents[name]
 
+    def explain_agent(self, name: str) -> dict:
+        """Reduced detector explanation: a quiet idle pane, no working rule matched."""
+        if name not in self.agents:
+            raise hs.HerdrError("missing", code="agent_not_found")
+        ids = ("osc_title_working", "live_turn_working", "background_agents_working", "background_mcp_task_working", "btw_overlay_working", "live_prompt_box")
+        return {"state": "idle", "matched_rule": "live_prompt_box", "manifest_version": "fixture", "screen_detection_skipped": False, "visible_blocker": False,
+                "rules": [{"id": rule, "matched": rule == "live_prompt_box", "state": "idle" if rule == "live_prompt_box" else "working"} for rule in ids]}
+
     def prompt(self, name: str, text: str, *, timeout_ms: int) -> dict:
         self.prompts.append((name, text))
         if not self.responses:
@@ -416,7 +424,7 @@ class QuotaTests(SupervisorTestCase):
         self.assertEqual(hs.blocking_windows(snapshot, NOW), ())
         self.herdr.responses = [{"next": "done"}]
         self.assertEqual(self.supervisor.run_new("task", "claude"), 0)
-        self.assertEqual(self.clock.sleeps, [])
+        self.assertTrue(all(seconds < 4.0 for seconds in self.clock.sleeps), self.clock.sleeps)  # guard pacing only, no quota wait
         self.assertNotIn("quota_wait", self.log_events())
 
     def test_h_midturn_exhaustion_resumes_same_session_with_continuation(self) -> None:
@@ -504,7 +512,7 @@ class QuotaTests(SupervisorTestCase):
 
         def sleep_and_idle(seconds: float) -> None:
             original_sleep(seconds)
-            if self.clock.current >= reset + 60:
+            if self.clock.current >= reset + 60 and len(herdr.prompts) == 1:
                 herdr.agents["claude-main"]["agent_status"] = "idle"
                 herdr.outputs["claude-main"] = "limit reached earlier\n"
 

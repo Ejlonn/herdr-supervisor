@@ -42,7 +42,7 @@ CONFIG_SCHEMA = 1
 MODES = ("unconfigured", "shadow", "actionable")
 CHUNK = 3800
 DEFAULT_TIMEZONE = "UTC"
-COMMANDS = ("sessions", "status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "done", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
+COMMANDS = ("sessions", "status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "done", "defer", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
 UPLOAD_STATUSES = ("pending_confirmation", "reset_authorization", "start_enqueued", "started", "cancelled", "expired", "failed", "superseded")
 # Compact task-start workflow choice (plan item 4): shown before Start, bound into the pending-task
 # identity, and validated by the same staleness checks as session_selection.
@@ -929,6 +929,23 @@ class Bridge:
             command["note"] = note
         return self._enqueue_or_shadow(command, chat_id, f"close run {state['run_id'][:8]} as an operator handoff (remaining actions unverified)")
 
+    def cmd_defer(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        """Defer a pending runtime/push gate and hand the settled run off. This only OFFERS: a confirmation card bound to the run, the settled turn, the
+        gate, the candidate and the explicit unmet obligations is sent; the tap enqueues a durable command that the applying worker re-checks in full."""
+        state = self._state()
+        eligible, reason, offer = self.enqueuer.defer_handoff_eligibility(state, inspect_agents=False)
+        if not eligible or offer is None:
+            self.safe_send(chat_id, f"Defer and hand off is not available: {redact(reason, limit=200)}")
+            return {"result": "ineligible", "reason": reason}
+        event = (self.enqueuer.list_events() or [{}])[-1]
+        token = self.new_interaction(action="defer_handoff", event=event, gate=(state or {}).get("pending_gate"), chat_id=chat_id,
+                                     extra={"run_id": offer["run_id"], "turn_id": offer["turn_id"], "candidate": offer["candidate"], "unmet": offer["unmet"], "note": argument.strip()[:hs.MAX_HANDOFF_NOTE_CHARS] or None})
+        unmet = ", ".join(u.replace("_", " ") for u in offer["unmet"])
+        text = (f"{hp.title_line('Defer and hand off?')}\nThe pending {hp.esc(offer['gate_type'].replace('_', ' '), limit=40)} gate will be marked deferred and the run closed as an operator handoff.\n"
+                f"Unverified, still yours: {hp.esc(unmet, limit=200)}.\nNo PASS, push approval or release readiness is recorded, and nothing is sent to an agent.")
+        self.safe_send(chat_id, text, reply_markup={"inline_keyboard": [[{"text": "Confirm hand-off", "callback_data": token}]]}, html=True)
+        return {"result": "offered", "unmet": offer["unmet"]}
+
     def cmd_logs(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         events = self.enqueuer.list_events()
         if not events:
@@ -1311,6 +1328,11 @@ class Bridge:
             command["run_id"] = record.get("run_id")
         if action == "done":
             command.update(run_id=record.get("run_id"), expected_state=record.get("expected_state"), ready_turn_id=record.get("ready_turn_id"), operator_handoff=True)
+        if action == "defer_handoff":
+            command.update(run_id=record.get("run_id"), gate_id=record.get("gate_id"), turn_id=record.get("turn_id"), candidate=record.get("candidate"), unmet=record.get("unmet"),
+                           expected_state=record.get("expected_state"))
+            if record.get("note"):
+                command["note"] = record["note"]
         if action in ("retry_routing_result", "repair_gate"):
             command.update(run_id=record.get("run_id"), turn_id=record.get("turn_id"))
         if action in ("retry_followup_response", "return_to_decision"):
@@ -1326,6 +1348,21 @@ class Bridge:
             self._consume(record_path, record, note="shadow")
             self._ack(callback_id, f"SHADOW: would {action}; no state changed.")
             return {"callback": action, "result": "shadow"}
+        if action == "approve":
+            # The same pure approval-time predicates the receiving worker applies, evaluated read-only before anything is queued, so a stale
+            # binding is reported precisely instead of surfacing later as an opaque refusal. The token is not consumed; the worker still re-checks.
+            current: dict[str, Any] = self._state() or {}
+            raw_gate = current.get("pending_gate")
+            open_gate: dict[str, Any] = raw_gate if isinstance(raw_gate, dict) else {}
+            if open_gate.get("gate_id") == record.get("gate_id") and open_gate.get("gate_type") in ("plan_approval", "runtime_validation", "push_approval"):
+                # Only a definitive mismatch refuses here. Evidence this restricted daemon cannot read (HEAD unavailable) is left to the receiving
+                # worker, which has the full environment and re-checks at the time of use; the daemon never blocks on what it cannot see.
+                problems = [p for p in self.enqueuer.approval_readiness(current, str(open_gate["gate_type"])) if not (p["predicate"] == "repository_head" and p.get("observed") is None)]
+                if problems:
+                    detail = redact(self.enqueuer.format_binding_problems(problems), limit=600)
+                    self._ack(callback_id, "Approval would be refused: the candidate binding is stale. Details were sent to the chat.")
+                    self.safe_send(chat_id, f"Approval not queued: the {open_gate['gate_type'].replace('_', ' ')} binding no longer holds.\n\n{detail}\n\nNothing was changed and the configuration was not rewritten. Fix the binding, then use the newest card.")
+                    return {"callback": action, "result": "refused_precheck", "predicates": [p["predicate"] for p in problems]}
         # Durable command first, then one-time consumption of the token; a crash in between re-enqueues the same request_id.
         self.enqueuer.enqueue_command(command)
         self._consume(record_path, record, request_id=command["request_id"])
@@ -1371,7 +1408,7 @@ class Bridge:
             if record.get("action") == "retry_followup_response" and (followup.get("reread_attempts") or not followup.get("delivery_uncertain")):
                 return "The one-time reread is not available; return to the decision or request a revision."
             return None
-        if followup is not None and record.get("action") in ("approve", "reject", "answer", "revise", "done", "retry_routing_result", "repair_gate", "ask_agent"):
+        if followup is not None and record.get("action") in ("approve", "reject", "answer", "revise", "done", "defer_handoff", "retry_routing_result", "repair_gate", "ask_agent"):
             return "A question to the agent is in flight; wait for the answer or return to the decision."
         if record.get("action") in ("owner_recovery_preview", "owner_recovery_apply"):
             recovery = state.get("owner_recovery")
@@ -1405,6 +1442,10 @@ class Bridge:
             if state.get("supervisor_state") != record.get("expected_state"):
                 return f"State changed ({state.get('supervisor_state')}); use the newest card."
             return None
+        if record.get("action") == "defer_handoff":
+            eligible, reason, _offer = self.enqueuer.defer_handoff_eligibility(state, run_id=record.get("run_id"), gate_id=record.get("gate_id"), turn_id=record.get("turn_id"),
+                                                                                candidate=record.get("candidate"), unmet=record.get("unmet"), inspect_agents=False)
+            return None if eligible else f"Defer and hand off is no longer available: {redact(reason, limit=160)}"
         if record.get("action") == "done":
             eligible, reason = self.enqueuer.operator_handoff_eligibility(state, run_id=record.get("run_id"), ready_turn_id=record.get("ready_turn_id"), inspect_agents=False)
             return None if eligible else f"Operator handoff is no longer available: {redact(reason, limit=160)}"

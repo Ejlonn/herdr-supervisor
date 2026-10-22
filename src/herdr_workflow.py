@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from herdr_cli import match_exact_session, session_identity
 from herdr_core import (
+    _STAGE_RE,
     ACTIONABLE_EVENTS,
     EVENT_NAMESPACE,
     EVENT_TYPES,
@@ -32,6 +33,7 @@ from herdr_core import (
     SHA_RE,
     TERMINAL_STATES,
     V2_WORKFLOW_POLICIES,
+    WAIT_TRANSIENT_CODES,
     HerdrError,
     OwnerRecoveryNeeded,
     Paths,
@@ -46,7 +48,7 @@ from herdr_core import (
     sha256_file,
     valid_pane_id,
 )
-from herdr_protocol import FollowupFrame, ProtocolBlock, parse_followup, parse_protocol
+from herdr_protocol import FollowupFrame, ProtocolBlock, parse_followup
 from herdr_redaction import credential_value_present
 from herdr_validation import (
     _UPLOAD_ID_RE,
@@ -61,6 +63,7 @@ from herdr_validation import (
     validate_followup_markdown,
     validate_gate_payload,
     validate_runtime_evidence,
+    validate_state_v2,
     validate_upload_record,
     verify_runtime_manifest,
 )
@@ -99,6 +102,22 @@ class SupervisorV2Mixin:
         def ensure_agent(self, provider: str, *, allow_restore: bool = True) -> dict[str, Any]: ...
 
         def read_output(self, provider: str, *, settled: bool) -> str: ...
+
+        def _recover_transient_wait(self, state: dict[str, Any], provider: str, name: str, error: HerdrError, *, followup: bool = False) -> str | None: ...
+
+        def _wait_recovery_ok(self, state: dict[str, Any]) -> None: ...
+
+        def _wait_recovery_responsive(self, state: dict[str, Any]) -> None: ...
+
+        def _wait_timeout_ms(self, state: dict[str, Any]) -> int: ...
+
+        def collect_routing_result(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], *, purpose: str) -> tuple[ProtocolBlock | None, str, Any]: ...
+
+        def _settlement_recheck(self, state: dict[str, Any], provider: str) -> Any: ...
+
+        def _accept_native_block(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], native: Any, *, purpose: str) -> ProtocolBlock | None: ...
+
+        def settle_guard(self, state: dict[str, Any], provider: str, purpose: str, *, wait: bool = False, patience: float | None = None, control: bool = True) -> Any: ...
 
         def report_live_agent(self, provider: str, live_agents: list[dict[str, Any]], owners: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool, bool]: ...
 
@@ -449,15 +468,22 @@ class SupervisorV2Mixin:
         """A real authenticated human continuation gives the workflow new authority or information."""
         state["consecutive_auto_turns"] = {"provider": None, "count": 0}
 
-    def _approved_plan_problem(self, state: dict[str, Any]) -> str | None:
-        """F1: the approved plan artifact must still hash to the approved value before any
-        policy-sensitive continuation. A mismatch supersedes the approval and everything downstream."""
+    def _plan_binding(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        """Pure: the approved plan artifact must still hash to the approved value. Returns the failing predicate with expected/observed, or None."""
         approved = state.get("approved_plan")
         if not isinstance(approved, dict):
             return None
         path = Path(str(approved.get("plan_path")))
         current = sha256_file(path) if path.is_file() else None
         if current == approved.get("plan_sha256"):
+            return None
+        return {"predicate": "approved_plan_hash", "message": PLAN_CHANGED_MESSAGE, "expected": approved.get("plan_sha256"), "observed": current, "path": str(path)}
+
+    def _approved_plan_problem(self, state: dict[str, Any]) -> str | None:
+        """F1: the approved plan artifact must still hash to the approved value before any
+        policy-sensitive continuation. A mismatch supersedes the approval and everything downstream."""
+        problem = self._plan_binding(state)
+        if problem is None:
             return None
         self._invalidate_approval(state, reason=PLAN_CHANGED_MESSAGE)
         return PLAN_CHANGED_MESSAGE
@@ -479,27 +505,89 @@ class SupervisorV2Mixin:
             gate["resolution_note"] = reason
         self._log(state, "approval_invalidated", reason=reason)
 
-    def _candidate_head_problem(self, state: dict[str, Any]) -> str | None:
-        """F4: exact-SHA evidence/approval is only meaningful while repository HEAD equals the candidate."""
+    def _candidate_binding(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        """Pure: the runtime candidate (manifest tree or Git HEAD of the CONFIGURED product repository) must still be what was presented. Returns
+        the failing predicate with expected/observed/path (the configured path is named so a wrong worktree is distinguishable from a changed
+        candidate), plus `invalidate` = the reason an approval-time caller records, or None when nothing may be invalidated."""
         manifest = state.get("runtime_candidate")
         if isinstance(manifest, dict):
+            approved_root = (state.get("runtime_policy") or {}).get("runtime_manifest_root")
             try:
-                verify_runtime_manifest(manifest, approved_root=(state.get("runtime_policy") or {}).get("runtime_manifest_root"), config=self.config)
+                verify_runtime_manifest(manifest, approved_root=approved_root, config=self.config)
             except (SupervisorError, OSError) as error:
-                self._invalidate_candidate(state, reason=str(error))
-                return str(error)
+                return {"predicate": "runtime_manifest", "message": str(error), "expected": approved_root, "observed": manifest.get("repository"),
+                        "path": manifest.get("candidate_manifest"), "invalidate": str(error)}
             return None
         candidate = state.get("candidate_sha")
         if not candidate:
             return None
+        repo = str(self.config["product_repo"])
         try:
-            head = self.head_resolver(Path(self.config["product_repo"]))
+            head = self.head_resolver(Path(repo))
         except SupervisorError as error:
-            return f"repository HEAD unavailable: {error}"
+            return {"predicate": "repository_head", "message": f"repository HEAD unavailable: {error}", "expected": candidate, "observed": None, "path": repo, "invalidate": None}
         if head == candidate:
             return None
-        self._invalidate_candidate(state, reason=f"repository HEAD {head[:12]} no longer equals candidate {candidate[:12]}")
-        return f"candidate changed: repository HEAD {head[:12]} no longer equals candidate {candidate[:12]}; new runtime validation is required"
+        return {"predicate": "repository_head",
+                "message": f"candidate changed: repository HEAD {head[:12]} no longer equals candidate {candidate[:12]}; new runtime validation is required",
+                "expected": candidate, "observed": head, "path": repo, "invalidate": f"repository HEAD {head[:12]} no longer equals candidate {candidate[:12]}"}
+
+    def _candidate_head_problem(self, state: dict[str, Any]) -> str | None:
+        """F4: exact-SHA evidence/approval is only meaningful while repository HEAD equals the candidate."""
+        problem = self._candidate_binding(state)
+        if problem is None:
+            return None
+        if problem.get("invalidate"):
+            self._invalidate_candidate(state, reason=str(problem["invalidate"]))
+        return str(problem["message"])
+
+    def approval_readiness(self, state: dict[str, Any], gate_type: str, gate: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """The approval-time prerequisites that apply to `gate_type`, evaluated on a private copy: the same pure predicates `approve_gate` uses, so
+        a snapshot (preflight) and the receiving controller cannot disagree about what is checked. Writes nothing; success is a snapshot, never a
+        promise: approval re-checks at the time of use. Each problem names the predicate, expected, observed and the configured path."""
+        probe = copy.copy(self)
+        setattr(probe, "_log", lambda *args, **kwargs: None)
+        shadow = copy.deepcopy(state)
+        problems: list[dict[str, Any]] = []
+        if gate_type == "plan_approval":
+            proposed = gate if isinstance(gate, dict) else (state.get("pending_gate") if isinstance((state.get("pending_gate") or {}), dict) else None)
+            if isinstance(proposed, dict) and proposed.get("gate_type") == "plan_approval":
+                found = probe._plan_approval_result_problem(shadow, proposed)
+                if found is not None:
+                    problems.append(found)
+        if gate_type in ("runtime_validation", "push_approval"):
+            for found in (probe._plan_binding(shadow), probe._candidate_binding(shadow)):
+                if found is not None:
+                    problems.append({k: v for k, v in found.items() if k != "invalidate"})
+            if gate_type == "push_approval" and not problems and shadow.get("candidate_sha"):
+                message = probe._push_prerequisite_problem(shadow, str(shadow["candidate_sha"]))
+                if message:
+                    problems.append({"predicate": "push_prerequisite", "message": message, "expected": shadow.get("candidate_sha"), "observed": None, "path": None})
+        return problems
+
+    @staticmethod
+    def format_binding_problems(problems: list[dict[str, Any]]) -> str:
+        parts = []
+        for problem in problems:
+            detail = f"{problem['predicate']}: expected {problem.get('expected')!s}, observed {problem.get('observed')!s}"
+            if problem.get("path"):
+                detail += f" (path {problem['path']})"
+            parts.append(detail)
+        return "; ".join(parts)
+
+    def binding_view(self, state: dict[str, Any]) -> dict[str, Any]:
+        """The decision inputs both control paths resolve identically: configuration source, configured repository and review root, and the
+        approved/candidate identities. Read-only, no secrets."""
+        view: dict[str, Any] = {"config_file": str(self.paths.config_file), "product_repo": str(self.config.get("product_repo")),
+                                "review_root": str(self.config.get("review_root")), "candidate_sha": state.get("candidate_sha"),
+                                "approved_plan_sha256": (state.get("approved_plan") or {}).get("plan_sha256"),
+                                "runtime_manifest_root": (state.get("runtime_policy") or {}).get("runtime_manifest_root")}
+        try:
+            view["repository_head"] = self.head_resolver(Path(str(self.config["product_repo"])))
+        except SupervisorError as error:
+            view["repository_head"] = None
+            view["repository_head_error"] = str(error)[:200]
+        return view
 
     def _invalidate_candidate(self, state: dict[str, Any], *, reason: str) -> None:
         state["runtime_evidence"] = None
@@ -554,6 +642,46 @@ class SupervisorV2Mixin:
 
     # ----- operator handoff: the one eligibility rule for CLI, Telegram, callbacks, and status
 
+    def _settled_idle_problem(self, state: dict[str, Any], *, live_agents: list[dict[str, Any]] | None, inspect_agents: bool) -> str | None:
+        """The shared "nothing is in flight" rule for every operator closure (handoff and defer-and-handoff): no quota wait, unresolved follow-up,
+        Codex reset reconciliation, pending continuation or deferred anomaly, no delivery still settling, no worker owning the agents, and (with
+        inspect_agents) the active agent exactly located and settled. Returns the refusal reason, or None."""
+        if state.get("quota_wait") is not None:
+            return "a quota wait is in flight"
+        if self.followup_unresolved(state) is not None:
+            return "a follow-up question is unresolved; return to the decision first"
+        phase = (state.get("codex_reset") or {}).get("current_redemption_state")
+        if phase not in ("IDLE", "RESET_VERIFIED"):
+            return f"a Codex reset is being reconciled ({phase})"
+        if state.get("continuation") is not None:
+            return "a continuation is still pending delivery"
+        if state.get("deferred_anomaly") is not None:
+            return "an anomaly is deferred for reconciliation"
+        delivery = state.get("delivery")
+        if isinstance(delivery, dict) and delivery.get("status") != "completed":
+            return f"prompt delivery is {delivery.get('status')}; wait for it to settle"
+        if pid_alive(state.get("worker_pid")):
+            return "a worker still owns the agents"
+        if self.paths.lock_file.exists() and WorkerLock.is_held(self.paths.lock_file) and WorkerLock.holder_pid(self.paths.lock_file) != os.getpid():
+            # Another process holds the agents. The worker applying an inbox command holds the lock itself
+            # while no turn is active (worker_pid is None and delivery is settled), which is not a conflict.
+            return "a worker still owns the agents"
+        if inspect_agents:
+            if self.herdr is None:
+                return "agent lifecycle cannot be inspected from this control path"
+            try:
+                agents = live_agents if live_agents is not None else self.herdr.list_agents()
+                owners = self.owners()
+            except (HerdrError, SupervisorError) as error:
+                return f"agent lifecycle could not be established: {error}"
+            provider = str(state.get("active_agent"))
+            live, ambiguous, identity_unavailable = self.report_live_agent(provider, agents, owners)
+            if ambiguous or identity_unavailable or live is None:
+                return f"{provider} session could not be located unambiguously; not settled"
+            if live.get("agent_status") not in READY_STATES:
+                return f"{provider} is still {live.get('agent_status')}; not settled"
+        return None
+
     def operator_handoff_eligibility(self, state: dict[str, Any] | None, *, run_id: str | None = None, ready_turn_id: str | None = None,
                                      live_agents: list[dict[str, Any]] | None = None, inspect_agents: bool = True) -> tuple[bool, str]:
         """Return (eligible, reason). Every rejection names its cause and mutates nothing. With
@@ -580,40 +708,9 @@ class SupervisorV2Mixin:
             return False, "handoff readiness belongs to another run"
         if ready_turn_id is not None and ready_turn_id != ready.get("turn_id"):
             return False, "handoff readiness changed since this action was offered; use the newest card or /status"
-        if state.get("quota_wait") is not None:
-            return False, "a quota wait is in flight"
-        if self.followup_unresolved(state) is not None:
-            return False, "a follow-up question is unresolved; return to the decision first"
-        phase = (state.get("codex_reset") or {}).get("current_redemption_state")
-        if phase not in ("IDLE", "RESET_VERIFIED"):
-            return False, f"a Codex reset is being reconciled ({phase})"
-        if state.get("continuation") is not None:
-            return False, "a continuation is still pending delivery"
-        if state.get("deferred_anomaly") is not None:
-            return False, "an anomaly is deferred for reconciliation"
-        delivery = state.get("delivery")
-        if isinstance(delivery, dict) and delivery.get("status") != "completed":
-            return False, f"prompt delivery is {delivery.get('status')}; wait for it to settle"
-        if pid_alive(state.get("worker_pid")):
-            return False, "a worker still owns the agents"
-        if self.paths.lock_file.exists() and WorkerLock.is_held(self.paths.lock_file) and WorkerLock.holder_pid(self.paths.lock_file) != os.getpid():
-            # Another process holds the agents. The worker applying an inbox command holds the lock itself
-            # while no turn is active (worker_pid is None and delivery is settled), which is not a conflict.
-            return False, "a worker still owns the agents"
-        if inspect_agents:
-            if self.herdr is None:
-                return False, "agent lifecycle cannot be inspected from this control path"
-            try:
-                agents = live_agents if live_agents is not None else self.herdr.list_agents()
-                owners = self.owners()
-            except (HerdrError, SupervisorError) as error:
-                return False, f"agent lifecycle could not be established: {error}"
-            provider = str(state.get("active_agent"))
-            live, ambiguous, identity_unavailable = self.report_live_agent(provider, agents, owners)
-            if ambiguous or identity_unavailable or live is None:
-                return False, f"{provider} session could not be located unambiguously; not settled"
-            if live.get("agent_status") not in READY_STATES:
-                return False, f"{provider} is still {live.get('agent_status')}; not settled"
+        problem = self._settled_idle_problem(state, live_agents=live_agents, inspect_agents=inspect_agents)
+        if problem is not None:
+            return False, problem
         return True, "operator handoff available"
 
     def retry_routing_result(self, state: dict[str, Any], *, run_id: Any, turn_id: Any, actor: str) -> dict[str, Any]:
@@ -644,17 +741,31 @@ class SupervisorV2Mixin:
             raise SupervisorError(f"cannot inspect {name} for the retry: {error}") from error
         if agent.get("agent_status") not in READY_STATES:
             raise SupervisorError(f"{name} is {agent.get('agent_status')}; the settled result can only be reread once the agent is idle")
+        guard = self.settle_guard(state, provider, "retry_result_read", wait=True, patience=30.0, control=False)
+        if guard.kind != "clear":
+            raise SupervisorError(f"{name} may still have background children or its idle state cannot be confirmed ({guard.kind}: {guard.detail}); nothing was read, routed or resent. Try again once the pane is quiet.")
         try:
-            output = self.read_output(provider, settled=True)
-            block = parse_protocol(output, state["run_id"], turn_id)
+            block, _output, native = self.collect_routing_result(state, provider, delivery, purpose="retry")
         except HerdrError as error:
             raise SupervisorError(f"cannot read {name} output: {error}") from error
+        source = "terminal"
+        if block is None and native is not None and native.recoverable:
+            checked = self._settlement_recheck(state, provider)
+            if checked.kind != "clear":
+                raise SupervisorError(f"{name} is not confirmed settled ({checked.kind}: {checked.detail}); the recovered native result was not routed and the one-time retry was not consumed. Try again once the pane is quiet.")
+            block = self._accept_native_block(state, provider, delivery, native, purpose="retry")
+            source = "native transcript"
+            if block is None:
+                raise SupervisorError("the native routing result for this turn was already recovered once; nothing was routed twice")
         missing["attempts"] = int(missing["attempts"]) + 1
         missing["last_attempt_unix"] = self.clock()
-        self._log(state, "routing_result_retry", agent=provider, turn_id=turn_id, actor=actor, recovered=block is not None)
+        if native is not None:
+            missing["native"] = {"status": native.status, "reason": native.reason[:300]}
+        self._log(state, "routing_result_retry", agent=provider, turn_id=turn_id, actor=actor, recovered=block is not None, source=source)
         if block is None:
             self.store.write_state(state)
-            return {"ok": False, "message": f"still no routing result for turn {turn_id[:8]} in the settled transcript; no approval was created and nothing was resent. Ask the agent, request a revision with /revise, or cancel."}
+            detail = "" if native is None else f" Native transcript recovery: {native.status} — {native.reason}."
+            return {"ok": False, "message": f"still no routing result for turn {turn_id[:8]} in the settled transcript; no approval was created and nothing was resent.{detail} Ask the agent, request a revision with /revise, or cancel."}
         state["missing_result"] = None
         state["wait_user_reason"] = None
         state["wait_user_requires_action"] = False
@@ -704,6 +815,121 @@ class SupervisorV2Mixin:
         self.store.write_state(state)
         self._log(state, "operator_handoff", actor=state["completion"]["actor"], unmet=list(ready["unmet"]))
         return {"ok": True, "message": "task closed by operator handoff; Supervisor did not verify the remaining external actions (" + ", ".join(u.replace("_", " ") for u in ready["unmet"]) + ")"}
+
+    # ----- explicit human defer-and-handoff of a settled run blocked only by human-owned runtime/push obligations (supervisor reliability, batch 5)
+
+    def defer_handoff_eligibility(self, state: dict[str, Any] | None, *, run_id: str | None = None, gate_id: str | None = None, turn_id: str | None = None,
+                                  candidate: str | None = None, unmet: list[str] | None = None, live_agents: list[dict[str, Any]] | None = None,
+                                  inspect_agents: bool = True) -> tuple[bool, str, dict[str, Any] | None]:
+        """(eligible, reason, offer). The offer is the exact binding a confirmation must carry: run, pending gate, the settled turn that raised it,
+        the current candidate and the explicit unmet obligations. Pure over `state` (a private copy is evaluated); every refusal names its cause and
+        mutates nothing. Ordinary /done is unaffected. Plan/scope/review uncertainty, a working or unknown agent, uncertain delivery and a changed
+        binding all refuse; with inspect_agents the live agent is exactly located and one more settlement sample is taken at application time."""
+        if state is None:
+            return False, "no supervised task exists", None
+        if run_id is not None and run_id != state.get("run_id"):
+            return False, "run_id does not match the current task", None
+        current = state.get("supervisor_state")
+        if current in TERMINAL_STATES:
+            return False, f"task is already {current}", None
+        gate = state.get("pending_gate")
+        if not isinstance(gate, dict) or gate.get("status") != "pending":
+            return False, "no pending runtime or push gate to defer; this action never replaces a verified completion or a plan/scope decision", None
+        if gate.get("gate_type") not in ("runtime_validation", "push_approval"):
+            return False, f"a {gate.get('gate_type')} decision is pending; only human-owned runtime/push obligations can be deferred", None
+        if current != gate.get("expected_state"):
+            return False, f"task is {current}, not the {gate.get('expected_state')} the pending gate needs", None
+        if not isinstance(state.get("approved_plan"), dict) or not isinstance(state.get("runtime_policy"), dict):
+            return False, "no intact plan approval exists for this run", None
+        probe = copy.copy(self)
+        setattr(probe, "_log", lambda *args, **kwargs: None)
+        shadow = copy.deepcopy(state)
+        if not inspect_agents:
+            # A state-only caller (the restricted Telegram daemon) may be unable to read the repository: unreadable evidence is "not checked here", a
+            # definitive mismatch still refuses, and the applying worker (inspect_agents=True) re-checks everything with the real resolver.
+            real_resolver = self.head_resolver
+
+            def tolerant(repo: Path) -> str:
+                try:
+                    return real_resolver(repo)
+                except SupervisorError:
+                    return str(shadow.get("candidate_sha") or "")
+
+            probe.head_resolver = tolerant
+        for binding in (probe._plan_binding(shadow), probe._candidate_binding(shadow)):
+            if binding is not None:
+                return False, f"binding changed: {self.format_binding_problems([binding])}", None
+        problem, owed = probe._done_problem(shadow)
+        if not owed:
+            return False, problem or "no unmet human-owned runtime/push obligation; nothing to hand off", None
+        proposal = state.get("runtime_proposal")
+        if isinstance(proposal, dict) and proposal.get("status") == "proposed":
+            return False, "runtime evidence is proposed and awaits operator confirmation; confirm or discard it first", None
+        if state.get("owner_recovery") or state.get("invalid_gate") or state.get("missing_result") is not None:
+            return False, "an unresolved recovery or missing-result condition exists", None
+        delivery = state.get("delivery")
+        if not isinstance(delivery, dict) or delivery.get("status") != "completed" or delivery.get("turn_id") != gate.get("turn_id"):
+            return False, "the turn that raised the gate is not a settled, accepted delivery", None
+        if not isinstance(delivery.get("accepted_at"), str):
+            return False, "delivery of the settled turn was never confirmed accepted", None
+        reason = self._settled_idle_problem(state, live_agents=live_agents, inspect_agents=inspect_agents)
+        if reason is not None:
+            return False, reason, None
+        offer = {"run_id": state["run_id"], "gate_id": gate["gate_id"], "gate_type": gate["gate_type"], "turn_id": gate["turn_id"],
+                 "candidate": state.get("candidate_sha") or gate.get("candidate_digest"), "unmet": sorted(owed), "stage": state.get("phase")}
+        for key, given in (("gate_id", gate_id), ("turn_id", turn_id), ("candidate", candidate)):
+            if given is not None and given != offer[key]:
+                return False, f"the offer changed since it was shown ({key} differs); use the newest card or /status", None
+        if unmet is not None and sorted(unmet) != offer["unmet"]:
+            return False, "the unmet obligations changed since the offer was shown; use the newest card or /status", None
+        if inspect_agents and self.herdr is not None:
+            provider = str(state.get("active_agent"))
+            checked = self._settlement_recheck(state, provider)
+            if checked.kind != "clear":
+                return False, f"{provider} is not confirmed settled ({checked.kind}: {checked.detail}); background children may still be running", None
+        return True, "defer-and-handoff available", offer
+
+    def defer_handoff(self, state: dict[str, Any], *, run_id: str, gate_id: str, turn_id: str, candidate: str | None, unmet: list[str], actor: str, chat_id: Any = None,
+                      note: str | None = None, live_agents: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Apply a confirmed defer-and-handoff: the full eligibility is re-run here (never trusted from the control path), the pending gate is
+        marked superseded with its reason (history and approvals are kept), and the run completes as `operator_handoff` with
+        `verified_by_supervisor=false` and the unmet obligations listed. No prompt, read, wake-up, evidence, PASS or push authority is produced."""
+        completion = state.get("completion")
+        if (isinstance(completion, dict) and completion.get("origin") == "defer_handoff" and state.get("run_id") == run_id
+                and (completion.get("deferred_gate") or {}).get("gate_id") == gate_id and completion.get("ready_turn_id") == turn_id):
+            return {"ok": True, "message": "this run was already closed by the same defer-and-handoff confirmation; nothing changed", "duplicate": True}
+        ok, reason, offer = self.defer_handoff_eligibility(state, run_id=run_id, gate_id=gate_id, turn_id=turn_id, candidate=candidate, unmet=unmet, live_agents=live_agents)
+        if not ok or offer is None:
+            raise SupervisorError(f"defer-and-handoff refused: {reason}")
+        if chat_id is not None and type(chat_id) is not int:
+            raise SupervisorError("chat_id must be an integer when present")
+        bounded_note = _bounded_str(note, "note", max_len=MAX_HANDOFF_NOTE_CHARS) if note else None
+        gate = state["pending_gate"]
+        actor_text = _bounded_str(actor, "actor", max_len=200)
+        self._finish_gate(state, gate, "superseded", actor=actor_text, chat_id=chat_id, note=f"deferred by operator handoff; unmet: {', '.join(offer['unmet'])}")
+        now = self.clock()
+        stage = offer["stage"] if isinstance(offer.get("stage"), str) and _STAGE_RE.fullmatch(offer["stage"]) else "review"
+        state["completion"] = {
+            "schema_version": 1, "mode": "operator_handoff", "origin": "defer_handoff", "run_id": state["run_id"], "stage": stage, "ready_turn_id": offer["turn_id"],
+            "actor": actor_text, "chat_id": chat_id, "at_unix": now, "at_utc": iso_utc(now), "note": bounded_note, "unmet": list(offer["unmet"]), "verified_by_supervisor": False,
+            "deferred_gate": {"gate_id": gate["gate_id"], "gate_type": gate["gate_type"], "status": "superseded", "candidate": offer["candidate"]},
+        }
+        state["supervisor_state"] = "DONE"
+        state["completed_at"] = iso_utc(now)
+        state["worker_pid"] = None
+        state["wait_user_reason"] = None
+        state["wait_user_requires_action"] = False
+        state["continuation"] = None
+        state["operator_handoff_ready"] = None
+        state["final_report"] = self.final_report_descriptor(state)
+        event_data = {"stage": stage, "actor": actor_text, "unmet": list(offer["unmet"]), "note": bounded_note, "handoff": f"deferred_{gate['gate_type']}_gate",
+                      "verified_by_supervisor": False, "deferred_gate_id": gate["gate_id"]}
+        if state["final_report"] is not None:
+            event_data["final_report"] = state["final_report"]
+        self.emit_event(state, "TASK_HANDED_OFF", event_data)
+        self.store.write_state(state)
+        self._log(state, "defer_handoff", actor=actor_text, gate_id=gate["gate_id"], unmet=list(offer["unmet"]))
+        return {"ok": True, "message": "task closed by operator handoff; the pending gate was deferred and Supervisor did not verify the remaining external actions (" + ", ".join(u.replace("_", " ") for u in offer["unmet"]) + ")"}
 
     def _runtime_pass_current(self, state: dict[str, Any]) -> bool:
         evidence = state.get("runtime_evidence")
@@ -939,16 +1165,25 @@ class SupervisorV2Mixin:
         return {"ok": True, "message": "Repair requested. Scope is unchanged; the agent will prepare a valid approval request."}
 
     def gate_preflight(self, state: dict[str, Any], gate_type: str, payload: str) -> dict[str, Any]:
-        """Run gate creation on an isolated controller and state; no files/events/state are written."""
+        """Run gate creation AND the approval-time prerequisites that apply to the proposed gate on an isolated controller and state; no files,
+        events, logs or state are written and no authority is created. A pass is a snapshot: approval re-checks at the time of use."""
         probe = copy.copy(self)
         setattr(probe, "_log", lambda *args, **kwargs: None)
         shadow = copy.deepcopy(state)
         block = ProtocolBlock(version=2, run_id=state["run_id"], turn_id=str(uuid.uuid4()), stage="review", next_agent="human", gate=gate_type, payload=payload, handoff="preflight")
+        kinds = ["git_commit", "manifest"]
         try:
-            probe.create_gate(shadow, block)
+            created = probe.create_gate(shadow, block)
         except (SupervisorError, OSError, ValueError) as error:
-            return {"ok": False, "errors": [{"message": str(error)}], "supported_candidate_kinds": ["git_commit", "manifest"]}
-        return {"ok": True, "errors": [], "supported_candidate_kinds": ["git_commit", "manifest"]}
+            # Creation was refused; any approval-time binding that is also stale is reported with its predicate and expected/observed values.
+            structured = [{**p, "detail": p["message"], "message": f"approval would be refused: {self.format_binding_problems([p])}"} for p in self.approval_readiness(state, gate_type)]
+            return {"ok": False, "errors": [{"message": str(error)}, *structured], "supported_candidate_kinds": kinds, "binding": self.binding_view(state)}
+        problems = probe.approval_readiness(shadow, gate_type, gate=created)
+        binding = self.binding_view(shadow)
+        if problems:
+            return {"ok": False, "errors": [{**p, "detail": p["message"], "message": f"approval would be refused: {self.format_binding_problems([p])}"} for p in problems],
+                    "supported_candidate_kinds": kinds, "binding": binding}
+        return {"ok": True, "errors": [], "supported_candidate_kinds": kinds, "binding": binding}
 
     def _load_pending_gate(self, state: dict[str, Any], run_id: str, gate_id: str, *, expected_state: str | None, gate_types: tuple[str, ...]) -> dict[str, Any]:
         if state.get("run_id") != run_id:
@@ -992,6 +1227,44 @@ class SupervisorV2Mixin:
         del state["approvals"][:-200]
         state["pending_gate"] = gate
 
+    def _apply_plan_approval(self, state: dict[str, Any], gate: dict[str, Any], *, gate_id: str, actor: str, chat_id: Any) -> None:
+        """The plan-approval state change, in one place: the receiving controller applies it and the readiness check simulates exactly it."""
+        payload = gate["payload"]
+        state["approved_plan"] = {"plan_path": gate["artifact_path"], "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"], "gate_id": gate_id, "actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock())}
+        state["runtime_policy"] = {key: payload[key] for key in ("runtime_validation_required", "rebuild_required", "rebuild_reason", "push_approval_required", "migration_required")}
+        state["runtime_policy"]["validation_mode"] = payload.get("runtime_validation_mode", "operator_collaborative")
+        if "runtime_manifest_root" in payload:
+            state["runtime_policy"]["runtime_manifest_root"] = payload["runtime_manifest_root"]
+        state["continuation"] = {"kind": "plan_approved", "gate_id": gate_id, "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"]}
+        self._reset_auto_turns(state)
+        # F3: the continuation goes back to the gate's own originating agent — always codex under
+        # gated_v2 (the only agent allowed to raise a plan_approval gate there), but under
+        # supervised_v2 a Claude-started task's approval must return to that same Claude session,
+        # never force a switch to codex.
+        state["active_agent"] = gate["agent"]
+
+    def _plan_approval_result_problem(self, state: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any] | None:
+        """Pure: would approving this plan gate leave the run in a state the validators accept? The proposed policy replaces the approved one while
+        a runtime candidate may be retained (a manifest candidate needs its approved root). Evaluated on a private copy by the same transition code;
+        nothing is cleared, rewritten or invented, and a refusal leaves state and evidence unchanged."""
+        probe = copy.copy(self)
+        setattr(probe, "_log", lambda *args, **kwargs: None)
+        shadow = copy.deepcopy(state)
+        candidate_gate = copy.deepcopy(gate)
+        try:
+            probe._apply_plan_approval(shadow, candidate_gate, gate_id=str(candidate_gate.get("gate_id")), actor="readiness-check", chat_id=None)
+            probe._finish_gate(shadow, candidate_gate, "approved", actor="readiness-check", chat_id=None)
+            shadow["supervisor_state"] = "RUNNING"
+            shadow["wait_user_reason"] = None
+            validate_state_v2(shadow)
+        except SupervisorError as error:
+            retained = state.get("runtime_candidate")
+            return {"predicate": "plan_policy_state", "message": str(error),
+                    "expected": retained.get("repository") if isinstance(retained, dict) else "a state the validators accept",
+                    "observed": (shadow.get("runtime_policy") or {}).get("runtime_manifest_root"),
+                    "path": gate.get("artifact_path")}
+        return None
+
     def approve_gate(self, state: dict[str, Any], *, run_id: str, gate_id: str, actor: str, chat_id: Any = None, expected_state: str | None = None, artifact_sha256: str | None = None, payload_sha256: str | None = None) -> dict[str, Any]:
         gate = self._load_pending_gate(state, run_id, gate_id, expected_state=expected_state, gate_types=("plan_approval", "push_approval", "runtime_validation"))
         try:
@@ -1009,29 +1282,22 @@ class SupervisorV2Mixin:
                 raise SupervisorError("this legacy runtime gate has no execution approval request")
             if gate.get("runtime_authorization"):
                 raise SupervisorError("runtime execution was already authorized")
+            problems = self.approval_readiness(state, "runtime_validation")  # pure, computed before the invalidating checks below
             if self._approved_plan_problem(state) or self._candidate_head_problem(state):
-                raise SupervisorError("runtime candidate or approved plan changed")
+                raise SupervisorError("runtime candidate or approved plan changed" + (f": {self.format_binding_problems(problems)}" if problems else ""))
             gate["runtime_authorization"] = {"actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock()), "payload_sha256": gate["payload_sha256"]}
             gate["summary_fields"]["runtime_authorized"] = True
             self.emit_event(state, "RUNTIME_VALIDATION_READY", {"gate": safe_gate_view(gate)})
             self.store.write_state(state)
             return {"ok": True, "message": "Runtime test authorized. Execute the reviewed checks; this is not a PASS result. Evidence must still be recorded separately.", "gate_id": gate_id}
         if gate["gate_type"] == "plan_approval":
-            payload = gate["payload"]
-            state["approved_plan"] = {"plan_path": gate["artifact_path"], "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"], "gate_id": gate_id, "actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock())}
-            state["runtime_policy"] = {key: payload[key] for key in ("runtime_validation_required", "rebuild_required", "rebuild_reason", "push_approval_required", "migration_required")}
-            state["runtime_policy"]["validation_mode"] = payload.get("runtime_validation_mode", "operator_collaborative")
-            if "runtime_manifest_root" in payload:
-                state["runtime_policy"]["runtime_manifest_root"] = payload["runtime_manifest_root"]
-            state["continuation"] = {"kind": "plan_approved", "gate_id": gate_id, "plan_sha256": gate["artifact_sha256"], "payload_sha256": gate["payload_sha256"]}
-            self._reset_auto_turns(state)
-            # F3: the continuation goes back to the gate's own originating agent — always codex under
-            # gated_v2 (the only agent allowed to raise a plan_approval gate there), but under
-            # supervised_v2 a Claude-started task's approval must return to that same Claude session,
-            # never force a switch to codex.
-            state["active_agent"] = gate["agent"]
+            result_problem = self._plan_approval_result_problem(state, gate)
+            if result_problem is not None:  # before any mutation: the same check preflight ran, on the state this approval would produce
+                raise SupervisorError(f"plan approval refused: {result_problem['message']} ({self.format_binding_problems([result_problem])})")
+            self._apply_plan_approval(state, gate, gate_id=gate_id, actor=actor, chat_id=chat_id)
             event = "PLAN_APPROVED"
         else:
+            readiness = self.approval_readiness(state, "push_approval")  # pure, computed before the invalidating checks below
             problem = self._approved_plan_problem(state) or self._push_prerequisite_problem(state, gate["candidate_sha"])
             if problem:
                 if gate.get("status") == "superseded":
@@ -1041,7 +1307,7 @@ class SupervisorV2Mixin:
                     state["wait_user_requires_action"] = True
                     self.emit_event(state, "WAIT_USER", {"reason": problem, "gate_id": gate_id})
                     self.store.write_state(state)
-                raise SupervisorError(problem)
+                raise SupervisorError(problem + (f": {self.format_binding_problems(readiness)}" if readiness else ""))
             evidence = state.get("runtime_evidence") or {}
             state["push_approval"] = {"gate_id": gate_id, "candidate_sha": gate["candidate_sha"], "plan_sha256": state["approved_plan"]["plan_sha256"], "evidence_sha256": evidence.get("evidence_sha256"), "actor": actor, "chat_id": chat_id, "at": iso_utc(self.clock())}
             state["continuation"] = {"kind": "push_approved", "gate_id": gate_id, "candidate_sha": gate["candidate_sha"]}
@@ -1638,6 +1904,11 @@ class SupervisorV2Mixin:
                 f"persisted response destination rejected before delivery: {destination_problem}; nothing was sent",
                 delivery_uncertain=False,
             )
+        guard = self.settle_guard(state, provider, "followup_delivery", wait=True, patience=120.0)
+        if guard.kind == "stop":
+            return "stop"
+        if guard.kind != "clear":
+            return self._followup_failed(state, f"{name} did not reach a quiet settled state ({guard.kind}: {guard.detail}); the question was not sent", delivery_uncertain=False)
         prompt = self.build_followup_prompt(state, turn_id)
         followup["status"] = "DELIVERING"
         followup["prompt_sha256"] = sha256_bytes(prompt.encode("utf-8"))
@@ -1708,13 +1979,28 @@ class SupervisorV2Mixin:
                     delivery["accepted_at"] = iso_utc(self.clock())
                     self.store.write_state(state)
                 try:
-                    self.herdr.wait(name, timeout_ms=int(self.config["wait_timeout_ms"]))
+                    self.herdr.wait(name, timeout_ms=self._wait_timeout_ms(state))
                 except HerdrError as error:
+                    if error.code in WAIT_TRANSIENT_CODES:
+                        stopped = self._recover_transient_wait(state, provider, name, error, followup=True)
+                        if stopped is not None:
+                            return stopped
+                        continue
                     if error.code not in {"timeout", "agent_prompt_stalled"}:
                         return self._followup_failed(state, f"cannot wait for {name}: {error}", delivery_uncertain=True)
+                    self._wait_recovery_responsive(state)
+                else:
+                    self._wait_recovery_ok(state)
                 continue
             if status not in READY_STATES:
                 return self._followup_failed(state, f"{name} is {status}; no answer can be read and nothing was resent", delivery_uncertain=True)
+            guard = self.settle_guard(state, provider, "followup_read")
+            if guard.kind == "hold":
+                continue
+            if guard.kind == "stop":
+                return "stop"
+            if guard.kind != "clear":
+                return self._followup_failed(state, f"{name} did not reach a quiet settled state ({guard.kind}: {guard.detail}); no answer was read and nothing was resent", delivery_uncertain=True)
             try:
                 output = self.read_output(provider, settled=True)
             except HerdrError as error:
@@ -1805,6 +2091,9 @@ class SupervisorV2Mixin:
             raise SupervisorError(f"cannot inspect {name} for the reread: {error}") from error
         if agent.get("agent_status") not in READY_STATES:
             raise SupervisorError(f"{name} is {agent.get('agent_status')}; the answer can only be reread once the agent is idle")
+        guard = self.settle_guard(state, provider, "followup_reread", wait=True, patience=30.0, control=False)
+        if guard.kind != "clear":
+            raise SupervisorError(f"{name} may still have background children or its idle state cannot be confirmed ({guard.kind}: {guard.detail}); nothing was read. Try again once the pane is quiet.")
         try:
             output = self.read_output(provider, settled=True)
         except HerdrError as error:
@@ -1835,7 +2124,7 @@ class SupervisorV2Mixin:
         request_id = command.get("request_id")
         if not isinstance(request_id, str) or not re.match(r"^[A-Za-z0-9_-]{8,128}$", request_id):
             raise SupervisorError("command request_id must be 8-128 URL-safe characters")
-        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "repair_gate", "retry_routing_result", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply"):
+        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "repair_gate", "retry_routing_result", "defer_handoff", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply"):
             raise SupervisorError(f"unsupported command action {command.get('action')!r}")
         dirs = self.inbox_paths()
         for path in dirs.values():
@@ -2146,6 +2435,18 @@ class SupervisorV2Mixin:
             return self.confirm_runtime_evidence(state, run_id=command.get("run_id"), gate_id=command.get("gate_id"), evidence_sha256=command.get("evidence_sha256"),
                                                  decision=command.get("decision"), actor=actor, chat_id=chat_id if type(chat_id) is int else None,
                                                  candidate_sha=command.get("candidate_sha") or command.get("candidate_digest"), environment=command.get("environment"))
+        if action == "defer_handoff":
+            bound = command.get("run_id")
+            if not isinstance(bound, str) or not bound:
+                raise SupervisorError("defer_handoff must be bound to a run id; unbound controls are refused")
+            unmet = command.get("unmet")
+            if not isinstance(unmet, list) or not all(isinstance(item, str) for item in unmet) or not isinstance(command.get("gate_id"), str) or not isinstance(command.get("turn_id"), str):
+                raise SupervisorError("defer_handoff must carry the exact gate, settled turn and unmet obligations it was offered with")
+            candidate = command.get("candidate")
+            if candidate is not None and not isinstance(candidate, str):
+                raise SupervisorError("candidate must be a string when present")
+            return self.defer_handoff(state, run_id=bound, gate_id=command["gate_id"], turn_id=command["turn_id"], candidate=candidate, unmet=unmet, actor=actor,
+                                      chat_id=chat_id if type(chat_id) is int else None, note=command.get("note") if isinstance(command.get("note"), str) else None)
         if action == "done":
             bound = command.get("run_id")
             if not isinstance(bound, str) or not bound:

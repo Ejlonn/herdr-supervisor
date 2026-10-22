@@ -44,6 +44,32 @@ inventory and extracts bounded explicit native-child metadata;
 `herdr_helpers.py` owns a separate helper registry and at-most-once job journal.
 Neither module changes workflow owner/gate state. See [sessions and helpers](SESSIONS.md).
 
+`herdr_native_results.py` is the bounded, read-only recovery of an exact primary session's final
+routing result from its provider-native transcript. The supported terminal read stays first; the native
+transcript is consulted only when it holds no valid current frame for an accepted V2 turn. The file is found
+only by the exact owned session id below the provider's configured root (or by the validated root-relative path
+recorded at delivery time), never from a payload path, and its own metadata must prove it is the owned primary
+session (Claude: every user/assistant record primary with the owned `sessionId`; Codex: a `session_meta` whose
+id and plain-string source match). It accepts only a primary final (Claude `end_turn` with `isSidechain=false`;
+Codex `final_answer` completed by `task_complete`) after the delivered prompt that carries the turn id, and only
+when the records after that prompt were read completely: a partial, malformed, oversized or unsupported
+result-bearing record there (a final whose content, phase, role, turn id or payload container has an unsupported
+shape; a record type outside the documented list) makes the result `uncertain`, never the earlier frame, while
+valid empty content and documented non-result records stay harmless. The sampled file extent (size, identity,
+modification time) is re-checked after the read and parse: growth, truncation, replacement or an in-place rewrite
+during the read makes the result `uncertain` (the bound is never extended to chase a writer; a later retry on the
+settled file decides). A Codex record type that a newer CLI adds fails closed until it is classified. One budget (directory
+entries, wall-clock seconds, bytes, records) covers discovery, metadata, the window read and parsing. It routes
+nothing itself: the controller re-verifies ownership and settlement and then uses the ordinary parser, route and
+gate path once.
+
+`herdr_role_readiness.py` reports subagent-role readiness without inventing it: definitions installed (names and
+hashes), the parent's exact owned session and the provider CLI's version, operator-reported observations (authenticated
+by the local operator account, bound to that exact session and version, never execution authority) and selectability,
+which stays UNKNOWN unless a current operator observation of the parent's Agent tool catalog exists. A session or version
+change invalidates any observation (a restart of the same session id with the same CLI version is not detected). The
+parent is verified by the control path's own predicate (exact owned session in its recorded pane, no duplicate carrier). It invokes no agent, restarts nothing and edits no definition or permission.
+
 `herdr_native_identity.py` is the Supervisor-owned Codex SessionStart hook. It
 accepts nullable transcript paths and reports identity only when the event is
 canonical and its pane hosts a local `--no-daemon` Codex client. Shared-server
