@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -436,6 +437,134 @@ class TelegramAuthorizationTests(TelegramCase):
         result=self.sup._apply_command_file(command_path)
         self.assertTrue(result["replayed"])
         self.assertEqual(json.loads(pending_path.read_text())["status"],"started")
+
+    # ----- task-start publication race: the authorization must be executable before its command is visible
+
+    def immediate_worker(self,bridge):
+        """Fast worker: consumes the queue synchronously inside the bridge's own enqueue call."""
+        original=bridge.enqueuer.enqueue_command; results=[]
+        def publish(command):
+            path=original(command); results.extend(self.sup.process_inbox()); return path
+        bridge.enqueuer.enqueue_command=publish
+        return results
+    def pending_record(self):
+        return json.loads(next(self.paths.pending_starts_dir.glob("*.json")).read_text())
+    def stage(self,update_id,budget,count=3):
+        bridge=self.enabled_bridge(count); bridge.handle_update(message(update_id,"/task race task"))
+        return bridge,self.budget_tokens()[budget]
+
+    def test_fast_worker_sees_executable_authorization_and_nothing_downgrades_it(self):
+        for budget in (0,1):
+            with self.subTest(budget=budget):
+                self.reset_fixture(); self.sup.reset_gateway=FakeGateway(self,count=3)
+                bridge,token=self.stage(600+budget,budget); results=self.immediate_worker(bridge)
+                outcome=bridge.handle_update(callback(610+budget,token))
+                self.assertEqual(outcome["result"],"enqueued")
+                self.assertEqual(len(results),1); self.assertTrue(results[0]["ok"],results[0])
+                record=self.pending_record()
+                self.assertEqual(record["status"],"started"); self.assertEqual(record["run_id"],results[0]["run_id"])
+                self.assertEqual(self.pending_inbox(),[])
+    def test_receipt_is_durable_before_the_command_is_visible(self):
+        bridge,token=self.stage(620,1); seen=[]
+        original=bridge.enqueuer.enqueue_command
+        def inspect(command):
+            seen.append(self.pending_record()); return original(command)
+        bridge.enqueuer.enqueue_command=inspect
+        bridge.handle_update(callback(621,token))
+        self.assertEqual([r["status"] for r in seen],["start_enqueued"])
+        self.assertEqual((seen[0]["budget"],seen[0]["request_id"]),(1,self.pending_inbox()[0]["request_id"]))
+    def test_publication_failure_is_reported_and_the_same_decision_recovers(self):
+        bridge,token=self.stage(630,1); original=bridge.enqueuer.enqueue_command; calls=[]
+        def flaky(command):
+            calls.append(command["request_id"])
+            if len(calls)==1: raise OSError("disk full")
+            return original(command)
+        bridge.enqueuer.enqueue_command=flaky
+        failed=bridge.handle_update(callback(631,token))
+        self.assertEqual(failed["rejected"],"publication_failed")
+        self.assertEqual(self.pending_inbox(),[]); self.assertEqual(self.pending_record()["status"],"start_enqueued")
+        self.assertIn("could not be queued",self.texts()[-1]); self.assertNotIn("Task start received",self.texts()[-1])
+        self.assertFalse(json.loads((self.tg_paths.interactions_dir/f"{token}.json").read_text())["consumed"])
+        recovered=bridge.handle_update(callback(632,token))
+        self.assertEqual(recovered["result"],"enqueued"); self.assertEqual(calls[0],calls[1])
+        self.assertEqual(len(self.pending_inbox()),1)
+        self.sup.reset_gateway=FakeGateway(self,count=3)
+        self.assertTrue(self.sup.process_inbox()[0]["ok"]); self.assertEqual(self.pending_record()["status"],"started")
+    def test_crash_after_publication_before_token_consumption_republishes_nothing(self):
+        bridge,token=self.stage(640,0); original=bridge._consume; calls=[]
+        def crashing(*a,**kw):
+            calls.append(1)
+            if len(calls)==1: raise RuntimeError("bridge died")
+            return original(*a,**kw)
+        bridge._consume=crashing
+        with self.assertRaises(RuntimeError): bridge.handle_update(callback(641,token))
+        self.assertEqual(len(self.pending_inbox()),1)
+        again=bridge.handle_update(callback(642,token))
+        self.assertEqual(again["result"],"enqueued"); self.assertEqual(len(self.pending_inbox()),1)
+        self.assertTrue(json.loads((self.tg_paths.interactions_dir/f"{token}.json").read_text())["consumed"])
+    def test_replay_after_worker_completed_reconciles_without_new_run_or_prompt(self):
+        bridge,token=self.stage(650,0); original=bridge._consume; calls=[]
+        def crashing(*a,**kw):
+            calls.append(1)
+            if len(calls)==1: raise RuntimeError("bridge died")
+            return original(*a,**kw)
+        bridge._consume=crashing
+        with self.assertRaises(RuntimeError): bridge.handle_update(callback(651,token))
+        first=self.sup.process_inbox(); self.assertTrue(first[0]["ok"])
+        run_id=self.state()["run_id"]; prompts=len(self.herdr.prompts); sent=len(self.texts())
+        replay=bridge.handle_update(callback(652,token))
+        self.assertEqual(replay["result"],"already_accepted")
+        self.assertEqual(self.pending_inbox(),[]); self.assertEqual(self.sup.process_inbox(),[])
+        self.assertEqual(self.state()["run_id"],run_id); self.assertEqual(len(self.herdr.prompts),prompts)
+        self.assertEqual(self.pending_record()["status"],"started"); self.assertEqual(len(self.texts()),sent)
+    def test_committed_authorization_cannot_be_reused_for_another_choice_or_after_expiry(self):
+        bridge,token=self.stage(660,1)
+        def refuse(command): raise OSError("down")
+        bridge.enqueuer.enqueue_command=refuse
+        self.assertEqual(bridge.handle_update(callback(661,token))["rejected"],"publication_failed")
+        other=self.budget_tokens()[0]
+        self.assertEqual(bridge.handle_update(callback(662,other))["rejected"],"stale_pending_start")
+        self.assertEqual(bridge.handle_update(message(663,"/reset-budget 2"))["rejected"],"stale_pending_start")
+        self.assertIn("rejected",bridge.handle_update(callback(664,token,user=999)))
+        self.assertEqual(self.pending_record()["budget"],1)
+        self.clock.current=float(self.pending_record()["expires_at_unix"])+1
+        self.assertIn("rejected",bridge.handle_update(callback(665,token)))
+        self.assertEqual(self.pending_inbox(),[])
+    def test_simultaneous_taps_cannot_write_a_stale_copy_over_worker_state(self):
+        bridge,token=self.stage(690,1); self.sup.reset_gateway=FakeGateway(self,count=3)
+        results=self.immediate_worker(bridge); done=threading.Event(); entered=[]
+        def reader():
+            entered.append(1)
+            if len(entered)==1: done.wait(1.5)  # the first tap loaded `pending` and stalls before committing
+            return hcr.ResetInventory(3,True,FP,self.clock.current)
+        bridge.reset_inventory_reader=reader
+        outcomes=[]
+        def tap(update_id):
+            outcomes.append(bridge.handle_update(callback(update_id,token)))
+            done.set()
+        threads=[threading.Thread(target=tap,args=(691+i,)) for i in range(2)]
+        threads[0].start()
+        while not entered: threading.Event().wait(0.01)
+        threads[1].start()
+        for thread in threads: thread.join(10)
+        self.assertEqual(len(results),1); self.assertTrue(results[0]["ok"],results[0])
+        self.assertEqual(self.pending_record()["status"],"started",outcomes)
+        self.assertEqual(sorted(o["result"] for o in outcomes),["already_accepted","enqueued"])
+        self.assertEqual(self.pending_inbox(),[])
+        self.assertEqual(len(list((self.paths.inbox_dir/"completed").glob("*.json"))),1)
+
+    def test_cancelled_or_superseded_pending_start_is_never_resumed(self):
+        bridge,token=self.stage(670,0)
+        path=next(self.paths.pending_starts_dir.glob("*.json")); record=json.loads(path.read_text())
+        for status in ("cancelled","superseded","expired","failed"):
+            record["status"]=status; hs.atomic_write_json(path,record)
+            self.assertEqual(bridge.handle_update(callback(671,token))["rejected"],"stale_pending_start")
+        self.assertEqual(self.pending_inbox(),[])
+    def test_shadow_mode_persists_nothing(self):
+        bridge,token=self.stage(680,0); self.config["mode"]="shadow"
+        bridge.config["mode"]="shadow"
+        bridge.handle_update(callback(681,token))
+        self.assertEqual(self.pending_record()["status"],"pending"); self.assertEqual(self.pending_inbox(),[])
 
     def test_reset_card_is_explicitly_a_task_start_action(self):
         bridge=self.enabled_bridge(2); bridge.handle_update(message(530,"/task start wording"))

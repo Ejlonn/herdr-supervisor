@@ -824,8 +824,24 @@ class Bridge:
         return self._start_pending_budget(pending[0],int(argument),user_id,chat_id,None,None)
 
     def _start_pending_budget(self,path:Path,budget:int,user_id:int,chat_id:int,callback_id:str|None,interaction:tuple[Path,dict[str,Any]]|None)->dict[str,Any]:
+        # One commit at a time per host: a duplicate tap re-reads the record under the lock and can never
+        # write a stale copy over state the worker advanced after the first tap published the command.
+        self.sup_paths.pending_starts_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with (self.sup_paths.pending_starts_dir/".commit.lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+            return self._start_pending_budget_locked(path,budget,user_id,chat_id,callback_id,interaction)
+
+    def _start_pending_budget_locked(self,path:Path,budget:int,user_id:int,chat_id:int,callback_id:str|None,interaction:tuple[Path,dict[str,Any]]|None)->dict[str,Any]:
         record=hs.load_json(path,label="pending task")
-        if record.get("status")!="pending" or record.get("owner_user_id")!=user_id or record.get("chat_id")!=chat_id or self.clock()>float(record.get("expires_at_unix",0)):
+        status=record.get("status")
+        # `start_enqueued` is the durable receipt written BEFORE the command is published, so a crash or a
+        # publication failure is recoverable by the same decision; `supervisor_consuming`/`started` are
+        # worker-owned and only ever reconciled here, never rewritten.
+        resumed=status in ("start_enqueued","supervisor_consuming","started")
+        request_id=hashlib.sha256(f"pending-start:{record.get('pending_id')}".encode()).hexdigest()[:32]
+        if ((status!="pending" and not resumed) or record.get("owner_user_id")!=user_id or record.get("chat_id")!=chat_id
+                or (status in ("pending","start_enqueued") and self.clock()>float(record.get("expires_at_unix",0)))
+                or (resumed and (record.get("request_id")!=request_id or record.get("budget")!=budget))):
             if callback_id:self._ack(callback_id,"This reset authorization is no longer valid.")
             return {"rejected":"stale_pending_start"}
         resolved_policy = record.get("workflow_policy") or (self.sup_config.get("default_workflow_policy") or "supervised_v2")
@@ -843,7 +859,7 @@ class Bridge:
             if callback_id:self._ack(callback_id,"Budget is outside the displayed range.")
             return {"rejected":"invalid_budget"}
         fingerprint=record.get("account_fingerprint")
-        if budget>0:
+        if budget>0 and status=="pending":  # a committed authorization is re-verified by the worker itself
             try:
                 current=hcr.ensure_inventory_fresh(
                     self.reset_inventory_reader(), now=self.clock(),
@@ -856,7 +872,7 @@ class Bridge:
                 if callback_id:self._ack(callback_id,"Reset inventory changed; review a new authorization card.")
                 return {"rejected":"stale_inventory"}
         task=dict(record["task"])
-        command={"request_id":hashlib.sha256(f"pending-start:{record['pending_id']}".encode()).hexdigest()[:32],"action":"task",
+        command={"request_id":request_id,"action":"task",
                  **task,"preallocated_run_id":record["pending_id"],
                  "pending_start_id":record["pending_id"],"pending_task_sha256":record["task_sha256"],
                  "codex_reset_authorization":{"budget":budget,"available_count":record["available_count"],"account_fingerprint":fingerprint},
@@ -866,21 +882,32 @@ class Bridge:
         if self.config.get("mode")!="actionable":
             if callback_id:self._ack(callback_id,"SHADOW: task not started.")
             return {"result":"shadow"}
-        self.enqueuer.enqueue_command(command)
-        record.update({"status":"start_enqueued","budget":budget,"request_id":command["request_id"]}); hs.atomic_write_json(path,record)
         upload_id = task.get("upload_id")
+        if status=="pending":
+            record.update({"status":"start_enqueued","budget":budget,"request_id":request_id}); hs.atomic_write_json(path,record)
+        if status in ("pending","start_enqueued"):
+            if isinstance(upload_id, str):
+                meta = self._load_upload(upload_id)
+                if meta is not None and meta.get("status") == "reset_authorization":
+                    meta.update({"status":"start_enqueued","request_id":request_id,"start_enqueued_at":hs.iso_utc(self.clock())})
+                    meta.pop("excerpt",None)
+                    hs.atomic_write_json(self._upload_meta_path(upload_id),meta)
+            try:
+                self.enqueuer.enqueue_command(command)  # idempotent per request id; the receipt above is already durable
+            except (hs.SupervisorError,OSError) as error:
+                if callback_id:self._ack(callback_id,"Task start was recorded but could not be queued; tap Start again to retry.")
+                self.safe_send(chat_id,"Task start was recorded but could not be queued; no run was created. Tap the same Start button again to retry.")
+                return {"rejected":"publication_failed","error":type(error).__name__}
         if isinstance(upload_id, str):
-            meta = self._load_upload(upload_id)
-            if meta is not None and meta.get("status") == "reset_authorization":
-                meta.update({"status":"start_enqueued","request_id":command["request_id"],"start_enqueued_at":hs.iso_utc(self.clock())})
-                meta.pop("excerpt",None)
-                hs.atomic_write_json(self._upload_meta_path(upload_id),meta)
-                self._supersede_upload_interactions(upload_id)
+            self._supersede_upload_interactions(upload_id)
         if interaction:
-            self._consume(interaction[0],interaction[1],request_id=command["request_id"])
+            self._consume(interaction[0],interaction[1],request_id=request_id)
+        if status in ("supervisor_consuming","started"):
+            if callback_id:self._ack(callback_id,"This task start was already accepted.")
+            return {"result":"already_accepted","request_id":request_id,"budget":budget}
         if callback_id:self._ack(callback_id,"Task start received; reset budget recorded.")
         self.safe_send(chat_id,f"Task start received\n\nCodex banked resets available at authorization: {record['available_count']}\nAuthorized for this task: {budget}")
-        return {"result":"enqueued","request_id":command["request_id"],"budget":budget}
+        return {"result":"enqueued","request_id":request_id,"budget":budget}
 
     def cmd_plan(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
         state = self._state()
