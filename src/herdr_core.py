@@ -172,7 +172,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
     "project_root": None,  # resolved from HERDR_SUPERVISOR_PROJECT_ROOT or ~/workspace (see resolve_config_defaults)
     "herdr_bin": None,  # resolved from HERDR_BIN_PATH, then PATH
-    "quota_dir": None,  # resolved to $XDG_STATE_HOME/herdr/plugins/herdr-agent-quota
+    "quota_dir": None,  # resolved to $XDG_STATE_HOME/herdr/plugins/herdr-agent-usage
     "quota_safety_buffer_seconds": 120,
     "poll_interval_seconds": 5,
     "prompt_wait_timeout_ms": 20000,
@@ -206,7 +206,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Only Codex quota can be refreshed independently; Claude quota comes from
     # the StatusLine hook and only changes after Claude activity.
     "codex_quota_refresh_command": [
-        "{herdr}", "plugin", "action", "invoke", "refresh", "--plugin", "herdr-agent-quota",
+        "{herdr}", "plugin", "action", "invoke", "refresh", "--plugin", "herdr-agent-usage",
     ],
     # Non-LLM quota refresh per provider. A provider without a verified independent refresh keeps the
     # cached-deadline wait and reports that early refresh is unavailable (never wakes that provider).
@@ -469,7 +469,7 @@ def resolve_config_defaults(config: dict[str, Any]) -> dict[str, Any]:
     """Fill machine-neutral defaults from the environment: nothing here is tied to a person or project."""
     root = config.get("project_root") or os.environ.get("HERDR_SUPERVISOR_PROJECT_ROOT") or str(Path.home() / "workspace")
     config["project_root"] = str(root)
-    config["quota_dir"] = config.get("quota_dir") or str(xdg_state_home() / "herdr" / "plugins" / "herdr-agent-quota")
+    config["quota_dir"] = config.get("quota_dir") or str(xdg_state_home() / "herdr" / "plugins" / "herdr-agent-usage")
     config["review_root"] = config.get("review_root") or str(Path(root) / "reviews")
     config["product_repo"] = config.get("product_repo") or str(root)
     query = config.setdefault("query", {})
