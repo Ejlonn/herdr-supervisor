@@ -173,6 +173,7 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
     preparation=status.get("session_preparation")
     if isinstance(preparation,dict):
         lines.append(f"Session preparation: {esc(preparation.get('status') or 'unknown')} · id {esc(preparation.get('preparation_id') or 'unknown')}")
+    lines.extend(_startup_wait_status_lines(status.get("startup_waits")))
     if state == "WAIT_QUOTA" and isinstance(status.get("quota_wait"), dict):
         wait = status["quota_wait"]
         lines.append(f"Blocked by: {esc(wait.get('provider', '').title())} quota, resets {fmt_local(wait.get('resume_at'), tz)}")
@@ -345,6 +346,51 @@ def _owner_recovery_lines(recovery: dict[str, Any]) -> list[str]:
 
 def render_owner_recovery_wait(recovery: dict[str, Any]) -> Rendered:
     return Rendered("\n".join([title_line("Session pane ownership needs repair"), *_owner_recovery_lines(recovery)]), keyboard=_owner_recovery_keyboard(recovery))
+
+
+def render_startup_wait(event: dict[str, Any]) -> Rendered:
+    """A freshly started provider is not ready: where the human acts (that pane only), what the supervisor will never do, and the two bound controls.
+    The controls carry the exact wait, target and start; none of them sends a key or chooses Update or Skip."""
+    data = event.get("data") or {}
+    wait: dict[str, Any] = data["wait"] if isinstance(data.get("wait"), dict) else {}
+    provider = str(wait.get("provider") or "agent").title()
+    lines = [title_line(f"{provider} start needs you in pane {esc(wait.get('pane_id'), limit=20)}")]
+    lines += [esc(line, limit=420) for line in (data.get("instructions") or [])[:6]]
+    if wait.get("evidence_excerpt"):
+        lines.append("Seen in the pane (redacted): " + esc(" | ".join(str(x) for x in wait["evidence_excerpt"][-2:]), limit=240))
+    extra = {key: wait[key] for key in ("wait_id", "preparation_id", "run_id", "provider", "pane_id") if wait.get(key) is not None}
+    keyboard: Keyboard = [[("I handled it — Continue", "startup_continue", dict(extra)), ("Cancel start", "startup_cancel", dict(extra))]]
+    if wait.get("context") == "run":
+        keyboard.append([("Status", "status", {})])
+    return Rendered("\n".join(lines), keyboard=keyboard)
+
+
+def render_startup_wait_result(event: dict[str, Any]) -> Rendered:
+    data = event.get("data") or {}
+    wait: dict[str, Any] = data["wait"] if isinstance(data.get("wait"), dict) else {}
+    titles = {"resolved": "Startup handled", "expired": "Startup wait expired", "cancelled": "Startup wait cancelled"}
+    outcome = str(data.get("outcome") or "")
+    title = titles.get(outcome, "Startup not continued" if data.get("ok") is False else "Startup update")
+    lines = [title_line(f"{str(wait.get('provider') or 'agent').title()}: {title}"), esc(data.get("message"), limit=700)]
+    keyboard: Keyboard = []
+    if outcome in ("blocker_present", "changed_process", "changed_executable", "changed_contract", "journal_moved", "preparation_stopped") and wait.get("status") == "WAITING":
+        extra = {key: wait[key] for key in ("wait_id", "preparation_id", "run_id", "provider", "pane_id") if wait.get(key) is not None}
+        keyboard = [[("Try Continue again", "startup_continue", dict(extra)), ("Cancel start", "startup_cancel", dict(extra))]]
+    elif data.get("start_original_available") or wait.get("start_original_available"):
+        # The separate human step that follows a continuation: re-apply the ORIGINAL authorized start once. It is offered only while the stored request exists and was not applied.
+        extra = {key: wait[key] for key in ("wait_id", "preparation_id", "provider", "pane_id") if wait.get(key) is not None}
+        keyboard = [[("Start the original task", "startup_start_original", extra)], [("Cancel start", "startup_cancel", dict(extra))]]
+    return Rendered("\n".join(lines), keyboard=keyboard)
+
+
+def _startup_wait_status_lines(waits: Any) -> list[str]:
+    lines = []
+    for wait in (waits if isinstance(waits, list) else [])[:3]:
+        lines.append(f"Startup wait: {esc(str(wait.get('provider') or '').title())} pane {esc(wait.get('pane_id'))} {esc(wait.get('status'))} · {esc(wait.get('kind'))}"
+                     + (f" · folder {esc(wait.get('trust_folder'), limit=120)}" if wait.get("trust_folder") else "")
+                     + (f" · {esc(wait.get('remaining_seconds'))} s left" if wait.get("status") == "WAITING" else "") + f" · wait {esc(abbrev(wait.get('wait_id')))}"
+                     + (" · next: Start the original task (or `start-original`)" if wait.get("start_original_available") else ""))
+    return lines
 
 
 def render_owner_recovery_preview(event: dict[str, Any], tz: str) -> Rendered:
@@ -804,6 +850,10 @@ def render_event(event: dict[str, Any], status: dict[str, Any] | None, gate: dic
         if isinstance(data.get("owner_recovery"), dict) and isinstance((status or {}).get("owner_recovery"), dict):
             return render_owner_recovery_wait((status or {})["owner_recovery"])
         return render_wait_user(str(data.get("reason") or ""), status, tz, requires_action=bool((status or {}).get("wait_user_requires_action")), followup=data.get("followup") if isinstance(data.get("followup"), dict) else None)
+    if kind == "STARTUP_WAIT_REQUIRED":
+        return render_startup_wait(event)
+    if kind == "STARTUP_WAIT_RESULT":
+        return render_startup_wait_result(event)
     if kind == "OWNER_PANE_REPAIRED":
         return render_owner_pane_repaired(event, tz)
     if kind == "AGENT_FOLLOWUP_READY":

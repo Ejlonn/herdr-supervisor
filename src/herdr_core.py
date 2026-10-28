@@ -112,6 +112,7 @@ EVENT_TYPES = (
     "TASK_ERROR", "RECOVERED_AFTER_RESTART", "COMMAND_RESULT", "QUERY_RESULT",
     "CODEX_RESET_AUTHORIZED", "CODEX_RESET_STARTED", "CODEX_RESET_VERIFIED", "CODEX_RESET_UNAVAILABLE",
     "TASK_HANDED_OFF", "AGENT_FOLLOWUP_READY", "RUNTIME_EVIDENCE_PROPOSED", "OWNER_PANE_REPAIRED",
+    "STARTUP_WAIT_REQUIRED", "STARTUP_WAIT_RESULT",
 )
 
 # Who may turn runtime evidence into a canonical PASS/FAIL. Collaborative (default): agents only propose;
@@ -312,6 +313,43 @@ class OwnerRecoveryNeeded(SupervisorError):
 
 OWNER_RECOVERY_CLASSIFICATIONS = ("missing_pane", "moved", "duplicate")
 
+
+class StartupNotReady(SupervisorError):
+    """A just-started provider process is not ready for work and nothing was sent to it (Herdr `agent_not_ready` /
+    `agent_blocked`, a pane that never became a detected agent, or an agent reported blocked/unknown). It is only a
+    SIGNAL for the session-start machinery: the caller decides whether it opens a human startup wait. It carries no
+    authority and never implies that a prompt, update or dialog is on screen."""
+
+    def __init__(self, message: str, *, site: str, code: str | None = None, pane_id: str | None = None, provider: str | None = None) -> None:
+        super().__init__(message)
+        self.site = site
+        self.code = code
+        self.pane_id = pane_id
+        self.provider = provider
+
+
+class BoundPreparationUnstarted(SupervisorError):
+    """Another fresh-session preparation is already bound to the current owners but its task was never started. A different or new task cannot start until that original start is
+    applied through its supported action (or the sessions are explicitly rebound); abandon cannot release a bound preparation, so no generic abandon advice may be attached."""
+
+
+class AbsoluteDeadlinePassed(SupervisorError):
+    """The caller's configured absolute ceiling (`session_start.startup_wait.not_after_unix`, e.g. a diagnostic's total deadline) passed: no further effect of a fresh-session
+    preparation may start, whatever any wait says. Completed history is kept; nothing is rewound."""
+
+
+class StartupWaitRequired(SupervisorError):
+    """A durable, human-handled startup wait was opened (or is still open) for a prepared provider pane. Nothing
+    was sent; the wait record names where the human acts (the diagnostic pane only) and how to continue or cancel."""
+
+    def __init__(self, message: str, *, wait_id: str, provider: str, pane_id: str | None, context: str, expired: bool = False) -> None:
+        super().__init__(message)
+        self.wait_id = wait_id
+        self.provider = provider
+        self.pane_id = pane_id
+        self.context = context
+        self.expired = expired
+
 # The recorded Herdr pane locator contract (`w<digits>:p<digits>`, e.g. w3:p2, w12:p10). One validator for
 # owner records, recovery state, CLI/callback input, and live carriers before any mutation.
 PANE_ID_RE = re.compile(r"^w[0-9]{1,6}:p[0-9]{1,6}$")
@@ -410,6 +448,11 @@ class Paths:
     @property
     def session_preparations_dir(self) -> Path:
         return self.state_dir / "session-preparations"
+
+    @property
+    def startup_waits_dir(self) -> Path:
+        """Durable human-handled startup waits (one 0600 record per wait; see herdr_startup)."""
+        return self.state_dir / "startup-waits"
 
 def iso_utc(epoch: float) -> str:
     return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -579,12 +622,80 @@ def load_config(path: Path) -> dict[str, Any]:
 
     return config
 
+# Optional `session_start.codex_launch_method` (absent = agent-start): how a fresh Codex pane is launched. Mirrored by
+# herdr_helper_context.CODEX_LAUNCH_METHODS (a test pins them equal). Inactive until an operator sets it.
+CODEX_LAUNCH_METHODS = ("agent-start", "explicit-pane-run")
+# Optional `session_start.codex_input_policy` (absent = require-empty-proof): the safety premise for queueing the explicit launch
+# command. `guarded-new-pane` replaces the (unavailable) empty-input proof by an explicitly selected operating profile and is
+# valid only with the explicit pane-run method. Mirrored by herdr_helper_context.CODEX_INPUT_POLICIES (a test pins them equal).
+CODEX_INPUT_POLICIES = ("require-empty-proof", "guarded-new-pane")
+# Optional `session_start.approval_modes` (absent = `inherit` for both providers): a closed per-provider choice of the automatic permission-review
+# mode of FRESH launches. It maps to exactly one fixed provider flag and never to a raw argument; `inherit` keeps today's launch unchanged.
+# Mirrored by herdr_helper_context.APPROVAL_MODES / APPROVAL_MODE_ARGS (a test pins them equal).
+APPROVAL_MODES = {"codex": ("inherit", "auto-review"), "claude": ("inherit", "auto")}
+APPROVAL_MODE_ARGS = {("codex", "auto-review"): ("--approve-for-me",), ("claude", "auto"): ("--permission-mode", "auto")}
+
+
+def approval_mode(config: dict[str, Any], provider: str) -> str:
+    """The configured (validated) approval mode of a provider's fresh launches; absent = inherit."""
+    return str((config["session_start"].get("approval_modes") or {}).get(provider, "inherit"))
+
+
+def approval_mode_args(provider: str, mode: str) -> list[str]:
+    """The fixed launch arguments of a mode: none for inherit; any other value is refused, never passed through."""
+    if mode == "inherit":
+        return []
+    if (provider, mode) not in APPROVAL_MODE_ARGS:
+        raise SupervisorError(f"unsupported approval mode {mode!r} for {provider}")
+    return list(APPROVAL_MODE_ARGS[(provider, mode)])
+
+
+STARTUP_WAIT_DEFAULTS = {"max_seconds": 900, "max_waits_per_provider": 2, "max_continue_attempts": 5}
+
+
+def startup_wait_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Optional `session_start.startup_wait` (absent = the finite defaults): `max_seconds` bounds the TOTAL human wait of one
+    preparation/run per provider (a later wait receives only what is left), `max_waits_per_provider` bounds how many waits one
+    preparation may open, `max_continue_attempts` bounds refused continuations of one wait, and the optional `not_after_unix`
+    is a hard wall-clock ceiling a caller with its own total deadline (a diagnostic) sets once; no wait extends past it."""
+    section = (config.get("session_start") or {}).get("startup_wait", {})
+    if not isinstance(section, dict) or set(section) - {*STARTUP_WAIT_DEFAULTS, "not_after_unix"}:
+        raise SupervisorError("session_start.startup_wait must be an object with only max_seconds, max_waits_per_provider, max_continue_attempts, not_after_unix")
+    merged: dict[str, Any] = {**STARTUP_WAIT_DEFAULTS, **{key: value for key, value in section.items() if key != "not_after_unix"}}
+    for key, (low, high) in {"max_seconds": (60, 86400), "max_waits_per_provider": (1, 5), "max_continue_attempts": (1, 20)}.items():
+        value = merged[key]
+        if type(value) is not int or not low <= value <= high:
+            raise SupervisorError(f"session_start.startup_wait.{key} must be an integer between {low} and {high}")
+    ceiling = section.get("not_after_unix")
+    if ceiling is not None and (isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or ceiling <= 0):
+        raise SupervisorError("session_start.startup_wait.not_after_unix must be a positive epoch number or absent")
+    merged["not_after_unix"] = None if ceiling is None else float(ceiling)
+    return merged
+
+
 def validate_session_start_config(config: dict[str, Any]) -> None:
     section = config.get("session_start")
     if not isinstance(section, dict) or not isinstance(section.get("enabled"), bool):
         raise SupervisorError("session_start configuration is invalid")
     if section.get("direction") not in ("right", "down"):
         raise SupervisorError("session_start.direction must be right or down")
+    # Optional key (absent = off): a paid minimal first turn that makes a provider report its native identity.
+    if type(section.get("native_identity_bootstrap", False)) is not bool:
+        raise SupervisorError("session_start.native_identity_bootstrap must be boolean")
+    if section.get("codex_launch_method", "agent-start") not in CODEX_LAUNCH_METHODS:
+        raise SupervisorError("session_start.codex_launch_method must be one of " + ", ".join(CODEX_LAUNCH_METHODS))
+    policy = section.get("codex_input_policy", "require-empty-proof")
+    if policy not in CODEX_INPUT_POLICIES:
+        raise SupervisorError("session_start.codex_input_policy must be one of " + ", ".join(CODEX_INPUT_POLICIES))
+    if policy == "guarded-new-pane" and section.get("codex_launch_method", "agent-start") != "explicit-pane-run":
+        raise SupervisorError("session_start.codex_input_policy guarded-new-pane requires session_start.codex_launch_method explicit-pane-run")
+    startup_wait_settings(config)  # optional block; raises on any invalid value
+    modes = section.get("approval_modes", {})
+    if not isinstance(modes, dict) or set(modes) - set(APPROVAL_MODES):
+        raise SupervisorError("session_start.approval_modes must be an object keyed only by " + ", ".join(APPROVAL_MODES))
+    for provider, mode in modes.items():
+        if type(mode) is not str or mode not in APPROVAL_MODES[provider]:
+            raise SupervisorError(f"session_start.approval_modes.{provider} must be one of " + ", ".join(APPROVAL_MODES[provider]))
     ratio = section.get("ratio")
     if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0.1 <= float(ratio) <= 0.9:
         raise SupervisorError("session_start.ratio must be between 0.1 and 0.9")

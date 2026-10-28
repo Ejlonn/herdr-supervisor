@@ -1,0 +1,6 @@
+{
+  "capture_method": "read-only: herdr --version; herdr pane run --help; herdr pane process-info --help; herdr agent rename --help; the first lines of /usr/bin/env --help; two paragraphs of `herdr --skill` (available shell pane definition; pane run admission). No pane run, rename, start, prompt or any other mutation was executed.",
+  "captured_on": "2026-10-25",
+  "herdr_version": "herdr 0.9.5",
+  "limits": "Help text only. The installed skill states that `pane run` queues command text and Enter and that success acknowledges admission, not execution; live startup behavior, the timing of process appearance, and agent detection/rename of a pane started this way are NOT observed and remain for the separately approved bounded acceptance. The installed skill defines an available shell pane as 'at its interactive prompt, with the shell itself in the foreground' and states the pane run line-input check 'covers this submission, not an earlier incomplete line'. No Herdr command reports that a pane's command line is empty; a supported empty-input contract was searched for read-only (pane --help, pane get/read/wait-output/process-info help, skill) and NOT found."
+}

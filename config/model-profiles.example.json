@@ -1,0 +1,15 @@
+{
+  "_review": "Example only; merge a reviewed copy of session_start.model_profiles into config.json. Replace every placeholder with a model identifier that `codex` / `claude` accept on THIS host and account (check the provider's own model list or an existing run). The supervisor never guesses, probes by prompting, or substitutes a model, and `default` always inherits the provider's own configuration.",
+  "session_start": {
+    "model_profiles": {
+      "codex": {
+        "default": {"label": "Default", "model": null},
+        "reviewed-large": {"label": "Large (reviewed)", "model": "REPLACE-WITH-A-CODEX-MODEL-ID-AVAILABLE-TO-THIS-ACCOUNT"}
+      },
+      "claude": {
+        "default": {"label": "Default", "model": null},
+        "reviewed-fast": {"label": "Fast (reviewed)", "model": "REPLACE-WITH-A-CLAUDE-MODEL-ID-AVAILABLE-TO-THIS-ACCOUNT"}
+      }
+    }
+  }
+}

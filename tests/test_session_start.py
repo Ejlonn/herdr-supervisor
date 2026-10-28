@@ -17,11 +17,16 @@ from v2_fixtures import CLAUDE_SESSION, CODEX_SESSION, V2Case
 
 class SessionSelectionTests(V2Case):
     def preparation_record(self, prep: str, selection: dict, *, status: str, provider_status: str,
-                           pane: str | None = None, session: str | None = None) -> dict:
+                           pane: str | None = None, session: str | None = None, direct: bool = False) -> dict:
         item={"status":provider_status,"old_pane_id":"w3:p2","old_session_id":CODEX_SESSION,
               "profile":"default","preparation_id":prep}
-        if provider_status != "AUTHORIZED":
-            # Fresh Codex journals carry the pre-created thread (id persisted before any pane exists); the
+        if direct:
+            # A NEW fresh Codex item: no thread fields, the direct-launch marker, the exact launch request and the context it was authorized under.
+            import herdr_helper_context as hctx
+            item.update({"launch_method":"explicit-pane-run","input_policy":"require-empty-proof","fresh_launch":"direct-cli","launch_request":{"cwd":str(self.project_root),"model":None},
+                         "helper_context_fingerprint":hctx.fingerprint(self.helper_descriptor(str(self.project_root)))})
+        elif provider_status != "AUTHORIZED":
+            # LEGACY fresh-Codex journals (written by the earlier library) carry the pre-created thread (id persisted before any pane exists); the
             # identity Herdr must later observe is exactly that thread.
             item.update({"thread_request_id":f"thread-{prep}-codex","thread_payload":{"cwd":str(self.project_root),"model":None,"ephemeral":False}})
             if provider_status != "THREAD_CREATING":
@@ -80,20 +85,21 @@ class SessionSelectionTests(V2Case):
         self.assertEqual(herdr_cli.session_identity(self.herdr.agents["codex-main"]),CODEX_SESSION)
 
     def test_nondefault_profile_uses_only_fixed_model_argv(self) -> None:
+        import shlex
         self.config["session_start"]["model_profiles"]["codex"]["large"]={"label":"Large","model":"gpt-approved"}
         self.config["session_start"]["model_profiles"]["claude"]["opus"]={"label":"Opus","model":"claude-opus"}
-        self.sup.model_flag_supported=lambda provider: provider=="claude"
+        self.sup.model_flag_supported=lambda provider: True
         self.sup.prepare_task_sessions({"policy":"fresh-all","profiles":{"codex":"large","claude":"opus"}},preparation_id=str(uuid.uuid4()))
         starts={kind:args for _,kind,_,args in self.herdr.starts}
-        # Codex: the configured model is set on the pre-created thread; the launch only resumes that exact thread.
-        self.assertEqual(self.thread_journal.requests[0][1],{"cwd":str(self.project_root),"model":"gpt-approved","ephemeral":False})
-        self.assertEqual(starts["codex"],["resume",self.thread_journal.requests[0][0] and self.herdr.starts[0][3][1],"--no-daemon"])
-        self.assertEqual(starts["codex"][1],self.thread_journal.results[self.thread_journal.requests[0][0]]["thread"]["thread_id"])
+        # Codex: the configured model is a fixed argv pair of the direct launch command; there is no thread and no resume argument.
+        (_, command), = self.herdr.pane_runs
+        self.assertEqual(shlex.split(command)[-3:],["--model","gpt-approved","--no-daemon"])
+        self.assertEqual((self.thread_journal.requests,"codex" in starts),([],False))
         # Claude: unchanged provider-specific launch with the fixed --model argv only.
         self.assertEqual(starts["claude"],["--model","claude-opus"])
 
     def test_fresh_claude_and_fresh_all_success_preserve_every_old_agent(self) -> None:
-        for policy, expected in (("fresh-claude", {"claude"}), ("fresh-all", {"codex","claude"})):
+        for policy, expected_starts, expected_runs in (("fresh-claude", {"claude"}, 0), ("fresh-all", {"claude"}, 1)):
             with self.subTest(policy=policy):
                 self.reset_fixture()
                 old_agents=dict(self.herdr.agents)
@@ -102,17 +108,21 @@ class SessionSelectionTests(V2Case):
                     preparation_id=str(uuid.uuid4()),
                 )
                 self.assertEqual(result["status"],"OWNERSHIP_BOUND")
-                self.assertEqual({entry[1] for entry in self.herdr.starts},expected)
+                self.assertEqual({entry[1] for entry in self.herdr.starts},expected_starts,"Codex is never started through the generic agent start")
+                self.assertEqual(len(self.herdr.pane_runs),expected_runs)
                 for name,record in old_agents.items():
                     self.assertEqual(self.herdr.agents[name],record)
 
     def test_reported_model_mismatch_never_changes_owners(self) -> None:
         self.config["session_start"]["model_profiles"]["codex"]["large"]={"label":"Large","model":"gpt-approved"}
         self.sup.model_flag_supported=lambda provider: True
-        original=self.herdr.start_agent
-        def start(name,*,kind,pane_id,args):
-            original(name,kind=kind,pane_id=pane_id,args=args); self.herdr.agents[name]["model"]="other"
-        self.herdr.start_agent=start
+        original=self.herdr.pane_run
+        def run(pane,command):
+            result=original(pane,command)
+            for agent in self.herdr.agents.values():
+                if agent.get("pane_id")==pane: agent["model"]="other"
+            return result
+        self.herdr.pane_run=run
         with self.assertRaisesRegex(hs.SupervisorError,"different model"):
             self.sup.prepare_task_sessions({"policy":"fresh-codex","profiles":{"codex":"large","claude":"default"}},preparation_id=str(uuid.uuid4()))
         self.assertEqual(self.sup.owners(),self.owners)
@@ -132,9 +142,9 @@ class SessionSelectionTests(V2Case):
     def test_restart_before_split_runs_the_recorded_operation_once(self) -> None:
         prep=str(uuid.uuid4()); path=self.paths.session_preparations_dir/f"{prep}.json"
         selection=herdr_sessions.validate_selection(self.config,{"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}})
-        hs.atomic_write_json(path,self.preparation_record(prep,selection,status="SESSION_SELECTION_AUTHORIZED",provider_status="AUTHORIZED"))
+        hs.atomic_write_json(path,self.preparation_record(prep,selection,status="SESSION_SELECTION_AUTHORIZED",provider_status="AUTHORIZED",direct=True))
         result=self.sup.prepare_task_sessions(selection,preparation_id=prep)
-        self.assertEqual(result["status"],"OWNERSHIP_BOUND"); self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.starts),1)
+        self.assertEqual(result["status"],"OWNERSHIP_BOUND"); self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.pane_runs),1); self.assertEqual(self.herdr.starts,[])
 
     def test_unresolved_other_preparation_blocks_new_start(self) -> None:
         first=str(uuid.uuid4()); second=str(uuid.uuid4())
@@ -230,13 +240,14 @@ class SessionSelectionTests(V2Case):
         self.assertEqual(self.herdr.splits,[]); self.assertEqual(self.herdr.starts,[])
 
     def test_preserved_owner_drift_fails_before_binding(self) -> None:
-        original=self.herdr.start_agent
-        def drift(name,*,kind,pane_id,args):
-            original(name,kind=kind,pane_id=pane_id,args=args)
+        original=self.herdr.rename_agent
+        def drift(target,name):
+            result=original(target,name)
             changed=json.loads(json.dumps(self.owners)); changed["claude"]={"pane_id":"w8:p8","session_id":"77777777-7777-4777-8777-777777777777"}
             self.herdr.agents["external-claude"]=self.herdr.agent("claude","external-claude","w8:p8",changed["claude"]["session_id"])
             hs.atomic_write_json(self.paths.owners_file,changed,mode=0o600)
-        self.herdr.start_agent=drift
+            return result
+        self.herdr.rename_agent=drift
         with self.assertRaisesRegex(hs.SupervisorError,"ownership changed"):
             self.sup.prepare_task_sessions({"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}},preparation_id=str(uuid.uuid4()))
 
@@ -253,27 +264,31 @@ class SessionSelectionTests(V2Case):
             self.sup.prepare_task_sessions(selection,preparation_id=prep)
 
     def test_missing_or_reused_old_identity_fails_before_binding(self) -> None:
-        original=self.herdr.start_agent
-        def remove_old(name,*,kind,pane_id,args):
-            original(name,kind=kind,pane_id=pane_id,args=args)
+        original=self.herdr.rename_agent
+        def remove_old(target,name):
+            result=original(target,name)
             del self.herdr.agents["codex-main"]
-        self.herdr.start_agent=remove_old
+            return result
+        self.herdr.rename_agent=remove_old
         with self.assertRaisesRegex(hs.SupervisorError,"preparation codex owner"):
             self.sup.prepare_task_sessions({"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}},preparation_id=str(uuid.uuid4()))
-        self.reset_fixture(); original=self.herdr.start_agent
-        def reuse_old(name,*,kind,pane_id,args):
-            original(name,kind=kind,pane_id=pane_id,args=args)
+        self.reset_fixture(); original=self.herdr.rename_agent
+        def reuse_old(target,name):
+            result=original(target,name)
             del self.herdr.agents["codex-main"]
             self.herdr.agents[name]["agent_session"]["value"]=CODEX_SESSION
-        self.herdr.start_agent=reuse_old
-        with self.assertRaisesRegex(hs.SupervisorError,"instead of the pre-created thread|distinct"):
+            return result
+        self.herdr.rename_agent=reuse_old
+        with self.assertRaisesRegex(hs.SupervisorError,"distinct from the preserved owner set"):
             self.sup.prepare_task_sessions({"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}},preparation_id=str(uuid.uuid4()))
+        self.assertEqual(self.sup.owners(),self.owners)
 
     def test_moved_old_identity_fails_before_binding(self) -> None:
-        original=self.herdr.start_agent
-        def move_old(name,*,kind,pane_id,args):
-            original(name,kind=kind,pane_id=pane_id,args=args); self.herdr.agents["codex-main"]["pane_id"]="w8:p7"
-        self.herdr.start_agent=move_old
+        original=self.herdr.rename_agent
+        def move_old(target,name):
+            result=original(target,name); self.herdr.agents["codex-main"]["pane_id"]="w8:p7"
+            return result
+        self.herdr.rename_agent=move_old
         with self.assertRaisesRegex(hs.SupervisorError,"preparation codex owner"):
             self.sup.prepare_task_sessions({"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}},preparation_id=str(uuid.uuid4()))
 
@@ -281,26 +296,27 @@ class SessionSelectionTests(V2Case):
         modes=("wrong","missing","duplicate","busy")
         for mode in modes:
             with self.subTest(mode=mode):
-                self.reset_fixture(); original=self.herdr.start_agent
-                def mutate(name,*,kind,pane_id,args,mode=mode):
-                    original(name,kind=kind,pane_id=pane_id,args=args)
+                self.reset_fixture(); original=self.herdr.rename_agent
+                def mutate(target,name,mode=mode):
+                    result=original(target,name)
                     if mode=="wrong": self.herdr.agents[name]["agent"]="claude"
                     if mode=="missing": self.herdr.agents[name]["agent_session"]={}
                     if mode=="duplicate": self.herdr.agents["duplicate"]=dict(self.herdr.agents[name],name="duplicate",pane_id="w8:p9")
                     if mode=="busy": self.herdr.agents[name]["agent_status"]="working"
-                self.herdr.start_agent=mutate
+                    return result
+                self.herdr.rename_agent=mutate
                 with self.assertRaises(hs.SupervisorError):
                     self.sup.prepare_task_sessions({"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}},preparation_id=str(uuid.uuid4()))
                 self.assertEqual(self.sup.owners(),self.owners)
 
     def test_actual_start_timeout_reconciles_without_second_start(self) -> None:
-        original=self.herdr.start_agent; calls=[0]
-        def timeout(name,*,kind,pane_id,args):
-            calls[0]+=1; original(name,kind=kind,pane_id=pane_id,args=args)
+        original=self.herdr.pane_run; calls=[0]
+        def timeout(pane,command):
+            calls[0]+=1; original(pane,command)
             raise hs.HerdrError("timeout",code="timeout")
-        self.herdr.start_agent=timeout; prep=str(uuid.uuid4()); selection={"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}}
-        with self.assertRaises(hs.HerdrError): self.sup.prepare_task_sessions(selection,preparation_id=prep)
-        self.herdr.start_agent=original
+        self.herdr.pane_run=timeout; prep=str(uuid.uuid4()); selection={"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}}
+        with self.assertRaises(hs.SupervisorError): self.sup.prepare_task_sessions(selection,preparation_id=prep)
+        self.herdr.pane_run=original
         self.assertEqual(self.sup.prepare_task_sessions(selection,preparation_id=prep)["status"],"OWNERSHIP_BOUND")
         self.assertEqual(calls[0],1); self.assertEqual(len(self.herdr.splits),1)
 
@@ -313,10 +329,10 @@ class SessionSelectionTests(V2Case):
         self.sup.initialize=original
         with self.assertRaisesRegex(hs.SupervisorError,"unresolved"):
             self.sup.run_new("different cli task","codex",session_selection=selection)
-        self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.starts),1)
+        self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.pane_runs),1)
         self.herdr.responses=[{"v1":"done"}]
         self.assertEqual(self.sup.run_new("stable cli task","codex",session_selection=selection),0)
-        self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.starts),1); self.assertEqual(len(self.herdr.prompts),1)
+        self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.pane_runs),1); self.assertEqual(len(self.herdr.prompts),1)
         records=[json.loads(p.read_text()) for p in self.paths.session_preparations_dir.glob("*.json")]
         self.assertEqual(len(records),1); self.assertEqual(records[0]["status"],"TASK_STARTED")
         self.assertEqual(self.state()["session_preparation"]["status"],"TASK_STARTED")
@@ -336,10 +352,10 @@ class SessionSelectionTests(V2Case):
         self.assertEqual(self.sup.resume(),0)
         self.assertEqual(self.state()["run_id"],run_id)
         self.assertEqual(json.loads(record_path.read_text())["status"],"TASK_STARTED")
-        self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.starts),1); self.assertEqual(len(self.herdr.prompts),1)
+        self.assertEqual(len(self.herdr.splits),1); self.assertEqual(len(self.herdr.pane_runs),1); self.assertEqual(len(self.herdr.prompts),1)
         self.herdr.next_sessions["codex"]="66666666-6666-4666-8666-666666666666"; self.herdr.responses=[{"v1":"done"}]
         self.assertEqual(self.sup.run_new("later cli task","codex",session_selection=selection),0)
-        self.assertEqual(len(self.herdr.splits),2); self.assertEqual(len(self.herdr.starts),2); self.assertEqual(len(self.herdr.prompts),2)
+        self.assertEqual(len(self.herdr.splits),2); self.assertEqual(len(self.herdr.pane_runs),2); self.assertEqual(len(self.herdr.prompts),2)
 
     def test_cli_post_initialize_recovery_rejects_every_request_binding_mismatch(self) -> None:
         selection={"policy":"fresh-codex","profiles":{"codex":"default","claude":"default"}}
@@ -423,7 +439,8 @@ class SessionSelectionTests(V2Case):
                 self.assertEqual((view["status"],view["origin"],view["policy"],view["profiles"]),("TASK_STARTED","cli","fresh-codex",{"codex":"default","claude":"default"}))
                 self.assertEqual(view["request_binding"],record["request_binding"])
                 codex=view["providers"]["codex"]
-                self.assertEqual(set(codex),{"status","old_session","new_session","pane_id"})
+                self.assertEqual(set(codex),{"status","old_session","new_session","pane_id","launch_method","input_policy","fresh_launch"}, "operational fields only: the launch form is shown, the private launch request and context binding are not")
+                self.assertEqual((codex["launch_method"],codex["fresh_launch"]),("explicit-pane-run","direct-cli"))
                 self.assertEqual((codex["status"],codex["old_session"],len(codex["new_session"])),("IDENTITY_VERIFIED",CODEX_SESSION[:8],8))
                 self.assertEqual(codex["new_session"],record["providers"]["codex"]["session_id"][:8])
                 self.assertEqual(codex["pane_id"],record["providers"]["codex"]["pane_id"])
@@ -502,7 +519,7 @@ class SessionSelectionTests(V2Case):
             self.sup.abandon_session_preparation(first_record["preparation_id"])
         self.herdr.next_sessions["codex"]="66666666-6666-4666-8666-666666666666"; self.herdr.responses=[{"v1":"done"}]
         self.assertEqual(self.sup.run_new("second cli task","codex",session_selection=selection),0)
-        self.assertEqual(len(self.herdr.splits),2); self.assertEqual(len(self.herdr.starts),2)
+        self.assertEqual(len(self.herdr.splits),2); self.assertEqual(len(self.herdr.pane_runs),2)
         self.assertEqual(json.loads(first.read_text())["status"],"TASK_STARTED")
 
     def test_rebind_and_abandon_refuse_while_worker_lock_is_held(self) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+import herdr_startup as hst
 from herdr_cli import match_exact_session, session_identity
 from herdr_core import (
     _STAGE_RE,
@@ -34,9 +36,12 @@ from herdr_core import (
     TERMINAL_STATES,
     V2_WORKFLOW_POLICIES,
     WAIT_TRANSIENT_CODES,
+    BoundPreparationUnstarted,
     HerdrError,
     OwnerRecoveryNeeded,
     Paths,
+    StartupNotReady,
+    StartupWaitRequired,
     SupervisorError,
     WorkerLock,
     atomic_write_json,
@@ -46,6 +51,7 @@ from herdr_core import (
     pid_alive,
     sha256_bytes,
     sha256_file,
+    startup_wait_settings,
     valid_pane_id,
 )
 from herdr_protocol import FollowupFrame, ProtocolBlock, parse_followup
@@ -134,6 +140,9 @@ class SupervisorV2Mixin:
         def _mark_session_preparation_started(self, preparation_id: str) -> dict[str, Any] | None: ...
         def validate_session_selection(self, selection: Any) -> dict[str, Any]: ...
         def read_session_preparation(self, preparation_id: str) -> dict[str, Any] | None: ...
+        def continue_startup(self, wait_id: str, *, actor: str) -> dict[str, Any]: ...
+        def cancel_startup(self, wait_id: str, *, actor: str) -> dict[str, Any]: ...
+        def sweep_startup_waits(self) -> list[str]: ...
         def session_preparation_view(self, record: dict[str, Any] | None) -> dict[str, Any] | None: ...
 
         def route(self, state: dict[str, Any], block: ProtocolBlock) -> str: ...
@@ -154,12 +163,14 @@ class SupervisorV2Mixin:
 
     # ----- events / outbox
 
-    def emit_event(self, state: dict[str, Any], event_type: str, data: dict[str, Any]) -> str:
+    def emit_event(self, state: dict[str, Any], event_type: str, data: dict[str, Any], *, identity: str | None = None) -> str:
+        """`identity` (optional) replaces the run id in the DERIVED event id only: an event that belongs to a durable sub-record (a startup wait) names that record, so its id can never equal
+        the id of any run event or of another record's event, whatever the sequence numbers are. Without it the id is unchanged (same run + sequence + type = the same event)."""
         if event_type not in EVENT_TYPES:
             raise SupervisorError(f"unknown event type {event_type}")
         seq = int(state.get("event_sequence") or 0) + 1
         run_id = state.get("run_id") or "unassigned"
-        event_id = str(uuid.uuid5(EVENT_NAMESPACE, f"{run_id}:{seq}:{event_type}"))
+        event_id = str(uuid.uuid5(EVENT_NAMESPACE, f"{identity or run_id}:{seq}:{event_type}"))
         now = self.clock()
         event = {
             "schema_version": 1,
@@ -1359,6 +1370,8 @@ class SupervisorV2Mixin:
         self._abandon_followup_for_revision(state, actor)
         if isinstance(state.get("owner_recovery"), dict):
             raise SupervisorError("the session's pane ownership must be repaired (or the run cancelled) before any revision can be delivered")
+        if state.get("supervisor_state") == "WAIT_USER" and state.get("wait_user_requires_action") and self._blocking_run_wait(run_id) is not None:
+            raise SupervisorError("this run is stopped at a startup wait (or its expired remains): a revision would be delivered to a provider that is not ready; continue or cancel the startup wait, or cancel the run")
         if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action"):
             raise SupervisorError("guidance is only accepted for an action-required WAIT_USER; use the pending gate's id otherwise")
         if (state.get("pending_gate") or {}).get("status") == "pending":
@@ -2124,19 +2137,23 @@ class SupervisorV2Mixin:
         request_id = command.get("request_id")
         if not isinstance(request_id, str) or not re.match(r"^[A-Za-z0-9_-]{8,128}$", request_id):
             raise SupervisorError("command request_id must be 8-128 URL-safe characters")
-        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "repair_gate", "retry_routing_result", "defer_handoff", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply"):
+        if command.get("action") not in ("task", "approve", "reject", "revise", "answer", "pause", "resume", "cancel", "refresh_quota", "done", "repair_gate", "retry_routing_result", "defer_handoff", "ask_agent", "retry_followup_response", "return_to_decision", "runtime_confirm", "owner_recovery_preview", "owner_recovery_apply", "startup_continue", "startup_cancel", "startup_start_original"):
             raise SupervisorError(f"unsupported command action {command.get('action')!r}")
         dirs = self.inbox_paths()
         for path in dirs.values():
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for path in dirs.values():
-            existing = sorted(path.glob(f"*-{request_id}.json"))
-            if existing:
-                return existing[0]
-        # FIFO order comes from a real monotonic-ish nanosecond prefix; identity from the request id.
-        target = dirs["pending"] / f"{time.time_ns():020d}-{request_id}.json"
-        atomic_write_json(target, {**command, "enqueued_at": iso_utc(self.clock())})
-        return target
+        # The existence check and the write are one critical section: simultaneous callers (duplicate Start
+        # taps, two bridge threads) otherwise each pass the check and write a file for the same request id.
+        with (self.paths.inbox_dir / ".enqueue.lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for path in dirs.values():
+                existing = sorted(path.glob(f"*-{request_id}.json"))
+                if existing:
+                    return existing[0]
+            # FIFO order comes from a real monotonic-ish nanosecond prefix; identity from the request id.
+            target = dirs["pending"] / f"{time.time_ns():020d}-{request_id}.json"
+            atomic_write_json(target, {**command, "enqueued_at": iso_utc(self.clock())})
+            return target
 
     def process_inbox(self, *, actions: set[str] | None = None, live_state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Consume commands under the transaction lock, idempotent per request_id. `processing/` is
@@ -2261,6 +2278,8 @@ class SupervisorV2Mixin:
             preserved = ", ".join(f"{p} {str(owners[p]['session_id'])[:8]}" for p in PROVIDERS)
         except SupervisorError:
             preserved = "the current sessions"
+        if isinstance(error, (StartupWaitRequired, BoundPreparationUnstarted)):
+            return f"No task was delivered. {error}\nPreserved unchanged: {preserved}."
         return (f"No task was delivered. {error} Preserved unchanged: {preserved}. Recovery: send the same task again to reconcile "
                 f"a settled result, run `herdr-supervisor abandon-session-start --preparation-id {preparation_id}` to release this attempt, "
                 "or start with Preserve sessions.")
@@ -2376,6 +2395,8 @@ class SupervisorV2Mixin:
             except SupervisorError as error:
                 # The operator-facing outcome: nothing was delivered, the old sessions are intact, and the
                 # concrete recovery choices (retry adopts a settled result; abandon frees a new sequence).
+                if isinstance(error, StartupWaitRequired) and not error.expired:
+                    self._bind_original_request(error.wait_id, command)  # the original authorized request, replayable only through startup_start_original
                 raise SupervisorError(self._session_preparation_failure_message(str(command.get("preallocated_run_id")), error)) from error
             new_state = self.initialize(text, requested_start, task_reference=reference, workflow_policy=requested_policy, char_limit=char_limit,
                                         codex_reset_authorization=authorization if isinstance(authorization, dict) else None,
@@ -2397,6 +2418,8 @@ class SupervisorV2Mixin:
             if task_file is not None:
                 self._mark_upload_started(command, new_state["run_id"])
             return result
+        if action in ("startup_continue", "startup_cancel", "startup_start_original"):
+            return self.apply_startup_command(state, command, action, actor)
         if state is None:
             raise SupervisorError("no supervised task exists")
         if action == "refresh_quota":
@@ -2482,6 +2505,11 @@ class SupervisorV2Mixin:
         if action == "resume":
             if state["supervisor_state"] in TERMINAL_STATES:
                 raise SupervisorError(f"task is already {state['supervisor_state']}")
+            blocking = self._blocking_run_wait(state.get("run_id"))
+            if blocking is not None and blocking["wait_id"] != getattr(self, "_startup_resume_for", None) and state["supervisor_state"] == "WAIT_USER":
+                if blocking["status"] == "EXPIRED":
+                    raise SupervisorError(f"the startup wait {blocking['wait_id'][:8]} of this run expired at {iso_utc(blocking['deadline_unix'])}; the run stays stopped (cancel it; capture and cleanup remain) - a resume now would be a new effect after the deadline")
+                raise SupervisorError(f"this run is waiting for your startup handling (wait {blocking['wait_id'][:8]}): continue it with `herdr-supervisor continue-startup --wait-id {blocking['wait_id']}` after you handled the pane, or cancel it; a plain resume would skip the identity and contract checks")
             if isinstance(state.get("owner_recovery"), dict) and state["supervisor_state"] == "WAIT_USER":
                 # Resume clears the condition only when fresh live evidence shows the exact session back in its
                 # recorded pane (duplicate closed, original kept): no locator change, no adoption. Anything else
@@ -2577,6 +2605,7 @@ class SupervisorV2Mixin:
         except SupervisorError:
             return 3  # another worker owns the agents; intentional no-op
         try:
+            self.sweep_startup_waits()  # file reads/writes only: expire overdue human startup waits, reconcile continued ones
             self.process_inbox()
             state = self.store.read_state(required=False)
             if state is None:
@@ -2636,13 +2665,304 @@ class SupervisorV2Mixin:
             raise OwnerRecoveryNeeded(f"{provider} native session {record['session_id'][:8]} is not live and its recorded pane {pane_id} is unavailable; nothing was created, started, or resent",
                                       provider=provider, classification="missing_pane", session_id=record["session_id"], recorded_pane=pane_id, live_panes=carriers)
         args = [part.format(session_id=record["session_id"]) for part in self.config["agents"][provider]["native_resume_args"]]
-        self.herdr.start_agent(name, kind=provider, pane_id=pane_id, args=args)
+        try:
+            self.herdr.start_agent(name, kind=provider, pane_id=pane_id, args=args)
+        except HerdrError as error:
+            if error.code in ("agent_not_ready", "agent_blocked"):
+                raise StartupNotReady(f"{name} was restored in its recorded pane {pane_id} but is not ready ({error.code})", site="run_restore_not_ready", code=error.code, pane_id=pane_id, provider=provider) from error
+            raise
         agent = self.herdr.get_agent(name)
         if session_identity(agent) != record["session_id"] or agent.get("agent") != provider:
             raise SupervisorError(f"{name} restored with native session {session_identity(agent)!r} ({agent.get('agent')!r}), expected {record['session_id']} ({provider}); refusing")
         if agent.get("pane_id") != pane_id:
             raise SupervisorError(f"{name} restored outside its recorded pane ({agent.get('pane_id')} != {pane_id}); refusing")
         return agent
+
+    # ----- human-handled startup waits (preparation context lives in herdr_sessions; this is the nonterminal-run context)
+
+    def _run_process_record(self, pane: str) -> dict[str, Any]:
+        info = self.herdr.process_info(pane)
+        processes = info.get("foreground_processes") if isinstance(info, dict) else None
+        if not isinstance(processes, list) or len(processes) != 1 or not isinstance(processes[0], dict) or type(processes[0].get("pid")) is not int or type(info.get("shell_pid")) is not int:
+            raise SupervisorError(f"pane {pane} does not have exactly one provable foreground process")
+        process = processes[0]
+        if not isinstance(process.get("argv"), list) or not isinstance(process.get("cwd"), str):
+            raise SupervisorError(f"pane {pane}'s foreground process record is incomplete")
+        ticks = getattr(self, "startup_process_ticks", hst.process_start_ticks)
+        return {"pid": process["pid"], "shell_pid": info["shell_pid"], "argv": list(process["argv"]), "cwd": os.path.realpath(process["cwd"]), "start_ticks": ticks(process["pid"])}
+
+    def _run_executable_record(self, provider: str) -> dict[str, Any]:
+        return getattr(self, "startup_executable_record", hst.executable_record)(str(self.config["session_start"]["provider_commands"][provider]))
+
+    def enter_startup_wait(self, state: dict[str, Any], error: StartupNotReady) -> str:
+        """A restored provider process in its recorded pane is not ready (e.g. a startup prompt): persist a bounded human wait bound to the run, provider, exact
+        pane, recorded native session and the observed process, publish one notification, and stop. Nothing is sent or pressed; a plain resume is refused."""
+        provider = error.provider
+        if provider not in PROVIDERS:
+            return self.set_wait_user(state, str(error))
+        owners = self.owners()
+        pane, name = owners[provider]["pane_id"], self.agent_name(provider)
+        now = self.clock()
+        reason = f"{name} was restored in its recorded pane but is not ready"
+        try:
+            process = self._run_process_record(pane)
+        except (SupervisorError, OSError) as failure:
+            return self.set_wait_user(state, f"{error}; no startup wait was opened because the restored process could not be proven ({failure})", requires_action=True)
+        evidence = hst.capture_screen(getattr(self.herdr, "pane_read", None), pane, now=now)
+        classification = hst.evidence_classification(provider, evidence)
+        if classification["kind"] == "trust_dialog":
+            return self.set_wait_user(state, f"{reason} and shows a folder-trust dialog in pane {pane}: that is a separate decision, not an update wait; no key was pressed and nothing was sent", requires_action=True)
+        trust = None
+        if classification["kind"] == "claude_trust_folder":
+            trust, why = hst.trust_folder_binding(classification, str(self.config["project_root"]), process.get("cwd"))
+            if trust is None:
+                return self.set_wait_user(state, f"{reason} and shows a Claude folder-trust prompt in pane {pane} but {why}: no wait was opened, no key was pressed and nothing was sent; do not trust it on this basis", requires_action=True)
+        prior = hst.list_waits(self.paths, run_id=state["run_id"], provider=provider)
+        try:
+            wait = hst.new_wait_record(context="run", provider=provider, pane_id=pane, phase="RUN_RESTORE", site="run_restore_not_ready", cause_code=error.code, now=now,
+                                       settings=startup_wait_settings(self.config), prior=prior, evidence=evidence, classification=classification, executable=self._run_executable_record(provider),
+                                       process=process, run_id=state["run_id"], agent_name=name, binding={"session_id": owners[provider]["session_id"], "pane_id": pane}, trust_folder=trust)
+        except SupervisorError as failure:
+            return self.set_wait_user(state, f"{error}; no startup wait was opened: {failure}", requires_action=True)
+        for old in prior:
+            if old["status"] in hst.OPEN_STATUSES:
+                hst.close_wait(old, "SUPERSEDED", now, f"replaced by {wait['wait_id'][:8]}")
+                hst.write_wait(self.paths, old)
+        view = hst.wait_view(wait, now)
+        state["supervisor_state"] = "WAIT_USER"
+        state["wait_user_reason"] = f"{reason}. " + " ".join(hst.instructions(view))
+        state["wait_user_requires_action"] = True
+        state["worker_pid"] = None
+        hst.emit_wait_event(self.emit_event, wait, "STARTUP_WAIT_REQUIRED", {"wait": view, "instructions": hst.instructions(view)}, state=state)
+        wait["notified"] = True
+        hst.write_wait(self.paths, wait)
+        self.store.write_state(state)
+        self._log(state, "startup_wait", provider=provider, pane=pane, wait_id=wait["wait_id"], kind=classification["kind"])
+        return "stop"
+
+    def apply_startup_command(self, state: dict[str, Any] | None, command: dict[str, Any], action: str, actor: str) -> dict[str, Any]:
+        """startup_continue / startup_cancel, authenticated by the inbox identity. The wait id is the capability and is bound to its preparation or run:
+        unknown, stale, duplicate, expired and cross-run requests change nothing and send nothing."""
+        wait_id = command.get("wait_id")
+        if not isinstance(wait_id, str):
+            raise SupervisorError("a startup command must carry the wait_id")
+        try:
+            wait = hst.read_wait(self.paths, wait_id)
+        except SupervisorError as error:
+            return {"ok": False, "kind": "unknown_wait", "message": f"{error}; nothing was changed"}
+        if wait is None:
+            return {"ok": False, "kind": "unknown_wait", "message": f"unknown startup wait {wait_id[:8]}; nothing was changed"}
+        if wait["context"] == "preparation":
+            bound = command.get("preparation_id")
+            if bound is not None and bound != wait["preparation_id"]:
+                return {"ok": False, "kind": "cross_run", "wait_id": wait_id, "message": "this control belongs to a different start; nothing was changed"}
+            if action == "startup_start_original":
+                return self._start_original_request(state, wait, actor)
+            return self.continue_startup(wait_id, actor=actor) if action == "startup_continue" else self.cancel_startup(wait_id, actor=actor)
+        if action == "startup_start_original":
+            return {"ok": False, "kind": "wrong_context", "wait_id": wait_id, "message": "a running task has no original start request to replay"}
+        if state is None or command.get("run_id") != state.get("run_id") or wait["run_id"] != state.get("run_id"):
+            return {"ok": False, "kind": "cross_run", "wait_id": wait_id, "message": "this control belongs to a different run; nothing was changed"}
+        return self._run_startup_continue(state, wait, command, actor) if action == "startup_continue" else self._run_startup_cancel(state, wait, command, actor)
+
+    def _bind_original_request(self, wait_id: str, command: dict[str, Any]) -> None:
+        """Keep the ORIGINAL authorized task-start request (its request id, pending-start id, reset authorization, selection and task reference) on the wait, so the supported
+        `startup_start_original` action can re-apply exactly it later. No approval is created here; the pending-start record still decides at replay time."""
+        wait = hst.read_wait(self.paths, wait_id)
+        if wait is None or wait["context"] != "preparation" or wait.get("origin_command") is not None or command.get("action") != "task":
+            return
+        if str(command.get("preallocated_run_id")) != wait["preparation_id"]:
+            return
+        wait["origin_command"] = json.loads(json.dumps(command))
+        hst.add_history(wait, self.clock(), "original_request_bound", str(command.get("request_id"))[:16])
+        hst.write_wait(self.paths, wait)
+
+    def _start_original_request(self, state: dict[str, Any] | None, wait: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Re-apply the stored original task-start request (same request id, same preparation, same pending-start authority) once the preparation is ready. It is a separate human step:
+        a continuation never starts a run. Exactly-once: the run's processed-request ledger and the wait's start marker both refuse a second application; a fresh or different task has
+        another request/preparation identity and is refused by the unresolved-preparation guard."""
+        wait_id = wait["wait_id"]
+
+        def refuse(kind: str, message: str) -> dict[str, Any]:
+            result = {"ok": False, "kind": kind, "wait_id": wait_id, "message": message}
+            hst.announce_wait(self.paths, self.emit_event, self.clock(), wait, "STARTUP_WAIT_RESULT", ok=False, outcome=kind, message=message,
+                              start_original_available=isinstance(wait.get("origin_command"), dict) and wait.get("original_started_at_unix") is None and wait["status"] in ("CONTINUING", "RESOLVED"))
+            return result
+
+        origin = wait.get("origin_command")
+        if not isinstance(origin, dict):
+            return {"ok": False, "kind": "no_original_request", "wait_id": wait_id, "message": "no original start request is stored for this preparation (a CLI start is repeated by running the same `run` command; otherwise adopt the sessions with `rebind-sessions --apply`)"}
+        if wait.get("original_started_at_unix") is not None:
+            return {"ok": False, "kind": "already_started", "wait_id": wait_id, "message": f"the original request was already applied (run {str(wait.get('original_run_id'))[:8]}); nothing was done again"}
+        if wait["status"] not in ("CONTINUING", "RESOLVED"):
+            return {"ok": False, "kind": "not_resolved", "wait_id": wait_id, "message": f"the startup wait is {wait['status']}; handle the pane and continue it first"}
+        if origin.get("preallocated_run_id") != wait["preparation_id"] or origin.get("action") != "task":
+            return {"ok": False, "kind": "binding", "wait_id": wait_id, "message": "the stored request does not belong to this preparation; nothing was done"}
+        request_id = origin.get("request_id")
+        prior = (state.get("processed_requests") or {}).get(request_id) if isinstance(state, dict) else None
+        if isinstance(prior, dict):
+            # Only an actual SUCCESSFUL original request for THIS preparation deduplicates. A failed (`ok: false`) entry — e.g. the original start refused while an older run was still the
+            # current state — is history to preserve, not a start: it neither blocks nor marks. A success naming another run is a contradiction and is refused.
+            if prior.get("ok") is True:
+                if prior.get("run_id") != wait["preparation_id"]:
+                    return refuse("binding", "the run ledger records this request as started for a different run; nothing was done")
+                wait["original_started_at_unix"], wait["original_run_id"] = float(self.clock()), prior.get("run_id")
+                hst.add_history(wait, self.clock(), "original_started", "already in the run ledger")
+                hst.write_wait(self.paths, wait)
+                return {"ok": False, "kind": "already_started", "wait_id": wait_id, "message": "the original request was already applied; nothing was done again"}
+        try:
+            result = self.apply_command(state, json.loads(json.dumps(origin)))
+        except StartupWaitRequired as again:
+            return refuse("waiting_again", str(again))
+        except SupervisorError as error:
+            return refuse("start_refused", f"The original request was refused ({error}); nothing was started or resent.")
+        if result.get("ok") is not True or result.get("run_id") != wait["preparation_id"]:
+            return refuse("start_refused", "The original request did not start the prepared run; nothing was recorded as started and nothing was resent.")
+        now = self.clock()
+        fresh = hst.read_wait(self.paths, wait_id) or wait
+        fresh["original_started_at_unix"], fresh["original_run_id"] = float(now), result.get("run_id")
+        hst.add_history(fresh, now, "original_started", f"{actor[:40]} run {str(result.get('run_id'))[:8]}")
+        hst.write_wait(self.paths, fresh)
+        return {**result, "kind": "started", "wait_id": wait_id}
+
+    def _blocking_run_wait(self, run_id: Any) -> dict[str, Any] | None:
+        """The run's LATEST startup wait when it still stops the run: waiting, or expired (an expired wait is inert: the run is never resumed past its deadline)."""
+        if not isinstance(run_id, str):
+            return None
+        waits = hst.list_waits(self.paths, run_id=run_id)
+        return waits[-1] if waits and waits[-1]["status"] in ("WAITING", "EXPIRED") else None
+
+    def sweep_run_startup_waits(self) -> list[str]:
+        """Reconcile open running-task waits with the run (files and the state only): a wait whose run left the action-required wait is resolved, one whose run ended is cancelled, and an
+        overdue one expires (the run stays in its action-required wait; cancel, capture and cleanup remain)."""
+        changed: list[str] = []
+        now = self.clock()
+        state = self.store.read_state(required=False)
+        for wait in hst.list_waits(self.paths, statuses=hst.OPEN_STATUSES):
+            if wait["context"] != "run":
+                continue
+            live = isinstance(state, dict) and state.get("run_id") == wait["run_id"] and state.get("supervisor_state") not in TERMINAL_STATES
+            if not live:
+                hst.close_wait(wait, "CANCELLED", now, "run ended")
+            elif not (state.get("supervisor_state") == "WAIT_USER" and state.get("wait_user_requires_action")):  # type: ignore[union-attr]
+                hst.close_wait(wait, "RESOLVED", now, "run left the wait")
+            elif hst.expired(wait, now):
+                hst.close_wait(wait, "EXPIRED", now, "deadline reached")
+                with self.store.transaction():
+                    live_state = self.store.read_state()
+                    hst.emit_wait_event(self.emit_event, wait, "STARTUP_WAIT_RESULT", {"wait": hst.wait_view(wait, now), "ok": False, "outcome": "expired",
+                                                                                          "message": "The startup wait expired; the run stays stopped. Only cancel, capture and cleanup remain."}, state=live_state)
+                    self.store.write_state(live_state)
+            else:
+                continue
+            hst.write_wait(self.paths, wait)
+            changed.append(wait["wait_id"])
+        return changed
+
+    def _run_startup_cancel(self, state: dict[str, Any], wait: dict[str, Any], command: dict[str, Any], actor: str) -> dict[str, Any]:
+        if wait["status"] not in hst.OPEN_STATUSES:
+            return {"ok": False, "kind": "not_waiting", "wait_id": wait["wait_id"], "message": f"startup wait {wait['wait_id'][:8]} is {wait['status']}; nothing was changed"}
+        hst.close_wait(wait, "CANCELLED", self.clock(), f"cancelled by {actor[:40]}")
+        hst.write_wait(self.paths, wait)
+        result = self.apply_command(state, {**command, "action": "cancel"})
+        return {**result, "kind": "cancelled", "wait_id": wait["wait_id"]}
+
+    def _run_startup_problem(self, state: dict[str, Any], wait: dict[str, Any]) -> tuple[str, str] | None:
+        provider, pane = wait["provider"], wait["pane_id"]
+        try:
+            owners = self.owners()
+            if owners[provider]["pane_id"] != pane or owners[provider]["session_id"] != wait["binding"].get("session_id"):
+                return "journal_moved", "the recorded owner of this provider changed while the run waited"
+            if not self.herdr.pane_available(pane):
+                return "changed_process", f"pane {pane} is gone"
+            problem = hst.process_problem(wait["process"], self._run_process_record(pane))
+            if problem:
+                return "changed_process", problem
+            agent = self.ensure_agent(provider, allow_restore=False)  # exact recorded native session in its recorded pane, never a replacement
+        except SupervisorError as error:
+            return "blocker_present", str(error)
+        if agent.get("pane_id") != pane:
+            return "changed_process", f"the session is now in pane {agent.get('pane_id')}, not {pane}"
+        if agent.get("agent_status") not in READY_STATES:
+            return "blocker_present", f"the {provider} agent still reports {agent.get('agent_status')!r}"
+        screen = hst.capture_screen(getattr(self.herdr, "pane_read", None), pane, now=self.clock())
+        blocker = hst.screen_blocker(provider, wait, screen)
+        if blocker:
+            return "blocker_present", blocker
+        folder = hst.trust_folder_problem(wait, str(self.config["project_root"]))
+        if folder:
+            return "changed_contract", folder
+        after = self._run_executable_record(provider)
+        wait["executable_after"] = {**after, "checked_at_unix": float(self.clock())}  # executable/version before (at the wait) and after (now) are both on the record
+        problem = hst.executable_problem(wait["executable"], after)
+        if problem:
+            return "changed_executable", problem
+        return self._run_contract_problem()
+
+    def _run_contract_problem(self) -> tuple[str, str] | None:
+        report = getattr(self.herdr, "capability_report", None)
+        contract = report() if callable(report) else None
+        if not isinstance(contract, dict) or contract.get("compatible") is not True:
+            return "changed_contract", "the Herdr contract is no longer verified as compatible"
+        return None
+
+    def _run_startup_continue(self, state: dict[str, Any], wait: dict[str, Any], command: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = self.clock()
+        refusal = hst.wait_refusal(wait, wait["wait_id"])
+        if refusal:
+            return {"ok": False, "kind": "not_waiting", "wait_id": wait["wait_id"], "message": refusal}
+
+        def expire(moment: float, why: str) -> dict[str, Any]:
+            hst.close_wait(wait, "EXPIRED", moment, why)
+            hst.write_wait(self.paths, wait)
+            return {"ok": False, "kind": "expired", "wait_id": wait["wait_id"], "message": f"The startup wait expired at {iso_utc(wait['deadline_unix'])} ({why}); nothing was continued and the run stays stopped. Cancel the run or capture; panes and sessions were preserved."}
+
+        if hst.expired(wait, now):
+            return expire(now, "deadline reached")
+        if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action"):
+            return {"ok": False, "kind": "journal_moved", "wait_id": wait["wait_id"], "message": f"the run is {state.get('supervisor_state')}, not in the startup wait; nothing was changed"}
+        wait["continue_attempts"] += 1
+        if wait["continue_attempts"] > startup_wait_settings(self.config)["max_continue_attempts"]:
+            hst.close_wait(wait, "CANCELLED", now, "continuation attempts exhausted")
+            hst.write_wait(self.paths, wait)
+            return {"ok": False, "kind": "cancelled", "wait_id": wait["wait_id"], "message": "continuation attempts are exhausted; the wait was closed. Cancel the run or request a revision"}
+        problem = self._run_startup_problem(state, wait)
+        checked = self.clock()  # the checks can be slow: the ORIGINAL deadline is evaluated against the time they actually finished
+        if hst.expired(wait, checked):
+            return expire(checked, "deadline reached while the checks were running")
+        if problem is not None:
+            kind, reason = problem
+            hst.add_history(wait, checked, "refused", f"{kind}: {reason}")
+            hst.write_wait(self.paths, wait)
+            hold = "The process or its contract changed, so this run holds for explicit restart authority (cancel it). " if kind != "blocker_present" else "Handle the pane, then continue again. "
+            note = ""
+            if kind in ("changed_process", "changed_executable"):
+                contracts = self._run_contract_problem()
+                note = " Deployed contracts after the change: " + ("verified (the replacement process is still not adopted)." if contracts is None else f"NOT verified ({contracts[1]}).")
+                wait["contracts_after_change"] = "verified" if contracts is None else f"not verified: {contracts[1]}"[:200]
+                hst.write_wait(self.paths, wait)
+            return {"ok": False, "kind": kind, "wait_id": wait["wait_id"], "message": f"Not continued ({kind}): {reason}.{note} Nothing was sent. {hold}"}
+        # The only new effect is the resume, applied while the wait is still open and re-checked against the original deadline immediately before it. A crash after the resume but before
+        # the wait is closed is reconciled by `sweep_run_startup_waits` (the run left the action-required wait).
+        if hst.expired(wait, self.clock()):
+            return expire(self.clock(), "deadline reached before the resume")
+        state["wait_user_requires_action"] = False
+        self._startup_resume_for = wait["wait_id"]  # in-process only: this exact verified continuation may pass the plain-resume guard, nothing an inbox file can name
+        try:
+            result = self.apply_command(state, {**command, "action": "resume"})
+        except SupervisorError:
+            state["wait_user_requires_action"] = True
+            raise
+        finally:
+            self._startup_resume_for = None
+        done = self.clock()
+        wait["continued_at_unix"] = float(checked)
+        hst.close_wait(wait, "RESOLVED", done, f"continued by {actor[:40]}")
+        hst.write_wait(self.paths, wait)
+        live_state = self.store.read_state() or state
+        hst.emit_wait_event(self.emit_event, wait, "STARTUP_WAIT_RESULT", {"wait": hst.wait_view(wait, done), "ok": True, "outcome": "resolved", "message": "startup handling confirmed; the same native session resumed"}, state=live_state)
+        self.store.write_state(live_state)
+        return {**result, "kind": "resolved", "wait_id": wait["wait_id"]}
 
     # ----- exact-session pane-ownership recovery (nonterminal runs): structured wait, bound preview/apply
 

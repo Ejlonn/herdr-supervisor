@@ -1,0 +1,1 @@
+1. Update now (runs `sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh |

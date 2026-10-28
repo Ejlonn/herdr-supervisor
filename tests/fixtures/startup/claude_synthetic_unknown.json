@@ -1,0 +1,9 @@
+{
+  "synthetic": true,
+  "note": "SYNTHETIC: not a native Claude capture. No Claude startup screen was ever retained.",
+  "visible_lines": [
+    "Claude Code update available",
+    "  1. Update now",
+    "  2. Skip"
+  ]
+}
