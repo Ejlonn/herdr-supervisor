@@ -11,7 +11,6 @@ import json
 import os
 import re
 import selectors
-import shutil
 import subprocess
 import time
 import uuid
@@ -19,25 +18,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import herdr_helper_context as hctx
+
 
 class ResetError(RuntimeError):
     pass
 
 
+# Declares that this worker understands requests that bind a helper-context fingerprint; readiness checks the
+# installed copy for exactly this line.
+HELPER_CONTEXT_PROTOCOL = 1
 SAFE_ID = re.compile(r"[A-Za-z0-9_-]{2,128}")
 SAFE_ENV = ("HOME", "PATH", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "LANG", "LC_ALL", "TERM")
 
 
 def resolve_codex_bin() -> str:
-    configured = None
+    configured: Any = None
     path = Path(os.environ.get("HERDR_SUPERVISOR_CONFIG", Path.home() / ".config/herdr-supervisor/config.json"))
     with contextlib.suppress(OSError, json.JSONDecodeError, TypeError, AttributeError):
-        value = json.loads(path.read_text())
-        configured = (value.get("codex_reset") or {}).get("codex_bin")
-    for candidate in (configured, shutil.which("codex"), str(Path.home() / ".local/bin/codex")):
-        if isinstance(candidate, str) and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    raise ResetError("Codex executable not found; configure codex_reset.codex_bin")
+        configured = json.loads(path.read_text())
+    try:
+        return hctx.resolve_codex_bin(configured if isinstance(configured, dict) else None)
+    except hctx.ContextError as error:
+        raise ResetError(str(error)) from error
 
 
 def _fsync_dir(path: Path) -> None:
@@ -263,7 +266,10 @@ def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def make_request(operation: str, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def make_request(operation: str, payload: dict[str, Any], request_id: str, context_fingerprint: str | None = None) -> dict[str, Any]:
     if operation not in ("inventory", "consume", "thread_start") or not isinstance(request_id, str) or not SAFE_ID.fullmatch(request_id):
         raise ResetError("invalid reset-helper request")
     if not isinstance(payload, dict) or (operation == "inventory" and payload):
@@ -273,6 +279,11 @@ def make_request(operation: str, payload: dict[str, Any], request_id: str) -> di
     if operation == "thread_start":
         thread_start_params(payload)  # strict shape; the digest below binds the exact request
     core = {"schema_version": 2, "request_id": request_id, "operation": operation, "payload": payload}
+    if context_fingerprint is not None:
+        # Only thread/start binds the producer's helper-context fingerprint; legacy requests stay unbound.
+        if operation != "thread_start" or not isinstance(context_fingerprint, str) or not FINGERPRINT_RE.fullmatch(context_fingerprint):
+            raise ResetError("invalid reset-helper context fingerprint")
+        core["context_fingerprint"] = context_fingerprint
     return {**core, "request_digest": hashlib.sha256(_canonical(core)).hexdigest()}
 
 
@@ -282,7 +293,7 @@ def validate_request(value: Any, filename_id: str) -> dict[str, Any]:
     operation, payload = value.get("operation"), value.get("payload")
     if not isinstance(operation, str) or not isinstance(payload, dict):
         raise ResetError("reset-helper request operation or payload is malformed")
-    expected = make_request(operation, payload, filename_id)
+    expected = make_request(operation, payload, filename_id, value.get("context_fingerprint"))
     if value != expected:
         raise ResetError("reset-helper request digest or schema mismatch")
     return expected
@@ -294,8 +305,8 @@ class JournalGateway:
         self.timeout = timeout
         self.sleeper = sleeper
 
-    def request(self, operation: str, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
-        request = make_request(operation, payload, request_id)
+    def request(self, operation: str, payload: dict[str, Any], request_id: str, context_fingerprint: str | None = None) -> dict[str, Any]:
+        request = make_request(operation, payload, request_id, context_fingerprint)
         pending = self.root / "pending" / f"{request_id}.json"
         result = self.root / "results" / f"{request_id}.json"
         if pending.exists():
@@ -333,18 +344,18 @@ class JournalGateway:
     def consume(self, key: str, request_id: str) -> str:
         return str(self.request("consume", {"idempotency_key": key}, request_id)["outcome"])
 
-    def thread_start(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+    def thread_start(self, payload: dict[str, Any], request_id: str, context_fingerprint: str | None = None) -> dict[str, Any]:
         """Submit one thread-start request; a timeout is ambiguous (the thread may exist) and raises."""
-        result = self.request("thread_start", payload, request_id)
+        result = self.request("thread_start", payload, request_id, context_fingerprint)
         thread = result.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("thread_id"), str) or not THREAD_ID_RE.fullmatch(thread["thread_id"]):
             raise ResetError("thread-start helper result has no canonical thread id")
         return thread
 
-    def result_if_present(self, operation: str, payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+    def result_if_present(self, operation: str, payload: dict[str, Any], request_id: str, context_fingerprint: str | None = None) -> dict[str, Any] | None:
         """Read a settled helper result for this exact request without submitting or waiting. Used to
         reconcile an operation whose outcome was unknown when the caller last ran. None = still unknown."""
-        request = make_request(operation, payload, request_id)
+        request = make_request(operation, payload, request_id, context_fingerprint)
         result = self.root / "results" / f"{request_id}.json"
         if not result.exists():
             return None
@@ -357,7 +368,16 @@ class JournalGateway:
         return value
 
 
-def process_once(root: Path, client: AppServerClient | None = None) -> int:
+def worker_context_fingerprint(root: Path, cwd: str) -> str:
+    """The worker's own view of the helper context for a request's working directory (same resolver as the producer)."""
+    return hctx.fingerprint_for_environment(root, cwd, os.environ, Path.home())
+
+
+def process_once(root: Path, client: AppServerClient | None = None, *, require_context: bool = False,
+                 context_fingerprint: Callable[[Path, str], str] = worker_context_fingerprint) -> int:
+    """Process the journal. With `require_context` (the deployed worker) a thread/start request must carry the
+    producer's helper-context fingerprint and the worker must reproduce it; an unbound legacy request is moved
+    to `held/` unexecuted (never replayed, never given a result) so the path watcher does not retrigger on it."""
     client = client or AppServerClient()
     pending, processing, results = (root / name for name in ("pending", "processing", "results"))
     for directory in (pending, processing, results):
@@ -379,6 +399,13 @@ def process_once(root: Path, client: AppServerClient | None = None) -> int:
             if not SAFE_ID.fullmatch(filename_id):
                 raise ResetError("unsafe reset-helper request filename")
             request = validate_request(json.loads(target.read_text()), filename_id)
+            if require_context and request["operation"] == "thread_start" and "context_fingerprint" not in request and not recovered:
+                held = root / "held"
+                held.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.replace(target, held / source.name)
+                _fsync_dir(processing)
+                _fsync_dir(held)
+                continue
             result_path = results / f"{filename_id}.json"
             if result_path.exists():
                 existing = json.loads(result_path.read_text())
@@ -387,6 +414,10 @@ def process_once(root: Path, client: AppServerClient | None = None) -> int:
                 target.unlink(missing_ok=True)
                 continue
             if request["operation"] == "thread_start":
+                if require_context and "context_fingerprint" in request:
+                    own = context_fingerprint(root, request["payload"]["cwd"])
+                    if own != request["context_fingerprint"]:
+                        raise ResetError(f"helper context mismatch (request {request['context_fingerprint'][:12]}, worker {own[:12]}); thread was not started")
                 if recovered:
                     # thread/start has no idempotency key. A request found in flight after a restart may or may
                     # not have created a thread; record that as a definitive uncertain outcome and never resend.
@@ -423,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 3
-        return process_once(root)
+        return process_once(root, require_context=True)
 
 
 if __name__ == "__main__":

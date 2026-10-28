@@ -8,7 +8,7 @@ import re
 import subprocess
 from typing import Any, Iterable
 
-from herdr_core import HerdrError
+from herdr_core import HerdrError, valid_pane_id
 
 
 def command_error_code(output: str) -> str:
@@ -55,6 +55,17 @@ OPTIONAL_CAPABILITIES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] 
     ("prompt lifecycle acknowledgement (--until + agent_prompt_stalled)", ("agent", "prompt"), ("--until", "agent_prompt_stalled")),
     ("task-start pane split (--direction/--ratio/--cwd/--no-focus)", ("pane", "split"), ("--direction", "--ratio", "--cwd", "--no-focus")),
 )
+
+
+# Optional commands used only by the explicit Codex launch method (kept apart from the contract the 0.9.0 fixtures record).
+LAUNCH_CAPABILITIES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("pane run", ("pane", "run"), ()),
+    ("pane process-info (--pane)", ("pane", "process-info"), ("--pane",)),
+    ("agent rename", ("agent", "rename"), ()),
+)
+# Not derivable from help: no installed Herdr command reports an empty pane command line, so this is a fixed unmet
+# capability (see herdr_helper_context.NO_EMPTY_INPUT_CONTRACT). A future contract must replace this constant.
+EMPTY_INPUT_CAPABILITY = "pane empty interactive input proof"
 
 
 def help_has_lexeme(help_text: str | None, lexeme: str) -> bool:
@@ -311,6 +322,73 @@ class HerdrCli:
             return False
         pane = response.get("result", {}).get("pane") if isinstance(response, dict) else None
         return isinstance(pane, dict) and pane.get("agent") in (None, "")
+
+    def rename_pane(self, pane_id: str, label: str) -> None:
+        """Set the display label of one exact pane (`herdr pane rename`). The agent alias is a separate field."""
+        self._run(["pane", "rename", pane_id, label], timeout=30, json_result=False)
+
+    def pane_label(self, pane_id: str) -> str | None:
+        """The pane's display label, or None when Herdr reports none. The field name `label` is not yet captured
+        from a live renamed pane (an unrenamed pane has no such key in Herdr 0.9.5), so an absent value yields
+        NAME_UNVERIFIED in the preparation journal rather than success."""
+        response = self._run(["pane", "get", pane_id], timeout=30)
+        pane = response.get("result", {}).get("pane") if isinstance(response, dict) else None
+        label = pane.get("label") if isinstance(pane, dict) else None
+        return label if isinstance(label, str) and label else None
+
+    def launch_capability_report(self) -> dict[str, bool]:
+        """Read-only (`--help`) probe of the optional commands the explicit Codex launch method uses; cached."""
+        cached = getattr(self, "_launch_capabilities", None)
+        if cached is None:
+            cached = {}
+            for name, command, fragments in LAUNCH_CAPABILITIES:
+                text = self.help_text(command)
+                cached[name] = text is not None and all(help_has_lexeme(text, fragment) for fragment in fragments)
+            cached[EMPTY_INPUT_CAPABILITY] = False
+            self._launch_capabilities = cached
+        return cached
+
+    def pane_run(self, pane_id: str, command: str) -> Any:
+        """Queue one command line in an existing pane (`herdr pane run`). Success acknowledges ADMISSION only, never
+        execution; the caller must observe the pane and must never resubmit after an uncertain outcome."""
+        return self._run(["pane", "run", pane_id, command], timeout=30, json_result=False)
+
+    def rename_agent(self, target: str, name: str) -> Any:
+        """Name the agent Herdr detected at `target` (an exact pane id) (`herdr agent rename`)."""
+        return self._run(["agent", "rename", target, name], timeout=30, json_result=False)
+
+    def pane_metadata(self, pane_id: str) -> dict[str, Any]:
+        """Exact pane metadata from `herdr pane get` (installed Herdr 0.9.5 schema: pane_id string, focused boolean, agent
+        string|null, cwd string|null). The requested identity and the exact boolean are validated here; anything else raises.
+        `focused` is an instantaneous observation: it is neither focus history nor evidence about the line contents."""
+        response = self._run(["pane", "get", pane_id], timeout=30)
+        pane = response.get("result", {}).get("pane") if isinstance(response, dict) else None
+        if (not isinstance(pane, dict) or pane.get("pane_id") != pane_id or type(pane.get("focused")) is not bool
+                or not (pane.get("agent") is None or isinstance(pane.get("agent"), str)) or not (pane.get("cwd") is None or isinstance(pane.get("cwd"), str))):
+            raise HerdrError("pane metadata is missing, foreign or malformed", code="pane_metadata_invalid")
+        return {"pane_id": pane["pane_id"], "focused": pane["focused"], "agent": pane.get("agent"), "cwd": pane.get("cwd")}
+
+    def pane_read(self, pane_id: str, *, lines: int = 60) -> str:
+        """The visible screen of one exact pane (`herdr pane read --source visible`, read-only; it never sends input). Rendered text is EVIDENCE
+        for a human and for provider-specific recognition from retained captures, never a lifecycle or readiness contract."""
+        if not valid_pane_id(pane_id) or type(lines) is not int or not 1 <= lines <= 200:
+            raise HerdrError("pane read needs a canonical pane id and 1-200 lines", code="pane_read_invalid")
+        return str(self._run(["pane", "read", pane_id, "--source", "visible", "--lines", str(lines)], timeout=15, json_result=False))
+
+    def pane_input_empty(self, pane_id: str) -> bool | None:
+        """True only if a SUPPORTED Herdr contract proves the pane's command line is empty at an interactive prompt.
+        Herdr 0.9.5 has none (`pane process-info` shows processes, not the line editor; `pane read` is rendered text, not a
+        contract; the installed skill says the `pane run` check does not cover an earlier incomplete line), so this is
+        always None: unknown, never an assumption of emptiness."""
+        return None
+
+    def pane_launch_context(self) -> dict[str, str] | None:
+        """The executable and CODEX_HOME that `agent start --kind codex` will launch, if Herdr exposes them.
+
+        Herdr 0.9.5 does not: `agent start` resolves a canonical executable inside the Herdr server's own environment
+        and offers neither a binding option nor a query (see tests/fixtures/herdr/0.9.5-pane-label/agent-start-help.txt).
+        Returning None is the explicit missing-contract answer; the supervisor's own PATH/HOME is never a substitute."""
+        return None
 
     def create_workspace(self, *, label: str, cwd: str) -> str | None:
         """Create a non-focused workspace through the installed API and return its pane id, or None."""

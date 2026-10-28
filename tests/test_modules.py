@@ -26,7 +26,7 @@ from v2_fixtures import V2Case, hs  # noqa: E402
 
 SRC = Path(hs.__file__).resolve().parent
 # One-way layering, lowest first. A module may import only modules that appear before it.
-LAYERS = ["herdr_core", "herdr_cli", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_native_results", "herdr_role_readiness", "herdr_redaction", "herdr_skill_baseline", "herdr_support_skills", "herdr_onboarding", "herdr_validation", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
+LAYERS = ["herdr_core", "herdr_cli", "herdr_helper_context", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_native_results", "herdr_role_readiness", "herdr_redaction", "herdr_skill_baseline", "herdr_support_skills", "herdr_onboarding", "herdr_validation", "herdr_startup", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
 FACADE = "herdr_supervisor"
 # Names companion modules and tests consume through the facade (recorded before the split).
 CONSUMED = sorted({
@@ -62,7 +62,7 @@ class ModuleBoundaryTests(unittest.TestCase):
                 if dep in LAYERS:
                     self.assertLess(LAYERS.index(dep), index, f"{module} -> {dep} violates the one-way layering")
                 else:
-                    self.assertIn(dep, {"herdr_codex_reset", "herdr_backup", "herdr_telegram", "herdr_query", "herdr_present", "herdr_artifacts"}, f"{module} imports {dep}")
+                    self.assertIn(dep, {"herdr_codex_reset", "herdr_helper_context", "herdr_backup", "herdr_telegram", "herdr_query", "herdr_present", "herdr_artifacts"}, f"{module} imports {dep}")
         # companions may use the facade; the facade itself only re-exports
         facade_imports = project_imports(SRC / f"{FACADE}.py")
         self.assertTrue(facade_imports <= set(LAYERS), facade_imports)

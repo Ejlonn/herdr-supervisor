@@ -34,9 +34,10 @@ import herdr_codex_reset as hcr
 import herdr_present as hp
 import herdr_query
 import herdr_redaction as hr
+import herdr_startup as hst
 import herdr_supervisor as hs
 import telegram_api as tg
-from herdr_sessions import fresh_policy_supported, probe_codex_thread_contract, probe_model_flag, session_contract_supported
+from herdr_sessions import probe_model_flag, session_contract_supported
 
 CONFIG_SCHEMA = 1
 MODES = ("unconfigured", "shadow", "actionable")
@@ -233,6 +234,8 @@ class Bridge:
         model_capability_reader: Callable[[str], bool] | None = None,
         session_capability_reader: Callable[[], bool] | None = None,
         fresh_policy_reader: Callable[[str], bool] | None = None,
+        fresh_reason_reader: Callable[[], list[str]] | None = None,
+        fresh_note_reader: Callable[[], list[str]] | None = None,
     ) -> None:
         self.sup_paths = sup_paths
         self.sup_config = sup_config
@@ -245,10 +248,13 @@ class Bridge:
         self.sleeper = sleeper
         self.rng = rng or (lambda: secrets.randbelow(1000) / 1000)
         self.reset_inventory_reader = reset_inventory_reader or (lambda: (_ for _ in ()).throw(hcr.ResetError("inventory reader not configured")))
-        self.model_capability_reader = model_capability_reader or (lambda provider: probe_model_flag(self.sup_config["session_start"]["provider_commands"][provider]))
+        self._model_flag_cache: dict[str, tuple[float, bool]] = {}
+        self.model_capability_reader = model_capability_reader or self._cached_model_flag
         self.session_capability_reader = session_capability_reader or (lambda: False)
         # Policy-level eligibility: fresh Claude needs the Herdr contract; fresh Codex needs the complete thread
         # chain (app-server, thread/start, resume SESSION_ID, pane split/start, identity observation).
+        self.fresh_reason_reader = fresh_reason_reader or (lambda: [])
+        self.fresh_note_reader = fresh_note_reader or (lambda: [])
         self.fresh_policy_reader = fresh_policy_reader or (lambda policy: policy == "preserve" or (policy == "fresh-claude" and self.fresh_session_supported()))
         self.tz = str(tg_config.get("timezone") or DEFAULT_TIMEZONE)
         # A typed, mutation-free view of supervisor state and a command enqueuer (typed API, no pane control).
@@ -264,6 +270,35 @@ class Bridge:
             return self.session_capability_reader() is True
         except (OSError,hs.SupervisorError):
             return False
+
+    MODEL_FLAG_TTL_SECONDS = 300.0
+
+    def _cached_model_flag(self, provider: str) -> bool:
+        """Bounded, cached read-only `--model` probe so a button acknowledgement never waits on a repeated CLI spawn."""
+        now = self.clock()
+        cached = self._model_flag_cache.get(provider)
+        if cached is None or now - cached[0] > self.MODEL_FLAG_TTL_SECONDS:
+            cached = (now, probe_model_flag(self.sup_config["session_start"]["provider_commands"][provider]))
+            self._model_flag_cache[provider] = cached
+        return cached[1]
+
+    def _fresh_assumption_note(self, fresh: set[str]) -> str:
+        """When Fresh Codex runs under the explicitly selected guarded profile say so honestly: an operating assumption, not a proof."""
+        if "codex" not in fresh:
+            return ""
+        try:
+            notes = [str(note) for note in self.fresh_note_reader()]
+        except (OSError, hs.SupervisorError):
+            return ""
+        return f"\nNote: {redact(notes[0], limit=420)}" if notes else ""
+
+    def _fresh_unavailable_note(self) -> str:
+        """Actionable reason (bounded, redacted) when Fresh Codex is hidden because the helper is not ready."""
+        try:
+            reasons = [str(reason) for reason in self.fresh_reason_reader()]
+        except (OSError, hs.SupervisorError):
+            return ""
+        return f"\nFresh Codex is unavailable: {redact(reasons[0], limit=220)}" if reasons else ""
 
     def fresh_policy_available(self, policy: str) -> bool:
         """Shared with the worker: a fresh choice is shown, accepted at callback time, and executed only while
@@ -704,6 +739,8 @@ class Bridge:
         rows.append([{"text":"Cancel","callback_data":cancel}])
         consequence="A Full Reset can refresh both 5-hour and weekly windows and may change the weekly reset date."
         suffix="\nFor a larger value use /reset-budget N." if available>8 else ""
+        if not self.fresh_policy_available("fresh-codex"):
+            suffix+=self._fresh_unavailable_note()
         identity_note="" if fingerprint else "\nAutomatic redemption is unavailable because the account identity could not be verified; choose 0."
         mode_note="\n\nSHADOW: selecting a budget will not start a task." if self.config.get("mode") != "actionable" else ""
         shown_count=str(inventory_count) if inventory_count is not None else "unavailable"
@@ -754,6 +791,11 @@ class Bridge:
         identity_note="" if record.get("account_fingerprint") else "\nAutomatic reset redemption is unavailable; reset budget must remain 0."
         suffix="\nUse /reset-budget N for a larger authorized value." if int(record["available_count"])>8 else ""
         profiles=", ".join(f"{p}: {selection['profiles'][p]}" for p in sorted(fresh)) or "current models"
+        for provider in sorted(fresh):
+            if len(self.sup_config["session_start"]["model_profiles"][provider]) == 1:
+                profiles += f"\n{provider.title()}: only Default is configured (no alternative models). Default inherits the provider's own configuration and does not select a known model."
+        profiles += self._fresh_assumption_note(fresh)
+
         workflow_label = WORKFLOW_POLICY_LABELS.get(workflow_policy, workflow_policy)
         start_label = START_AGENT_LABELS.get(starting_agent, starting_agent)
         self.safe_send(chat_id,f"Ready to start this task\n\nTask:\n{self._task_preview(record['task'])}\n\nWorkflow: {workflow_label}\nStart agent: {start_label}\nSessions: {selection['policy']}\nModels: {profiles}\nExisting sessions stay preserved; each fresh session uses provider quota only when first prompted.\nBanked Codex resets available: {shown if shown is not None else 'unavailable'}\nA Full Reset can refresh both 5-hour and weekly windows and may change the weekly reset date.{identity_note}{suffix}\n\nTap one Start task button to create the run.",reply_markup={"inline_keyboard":rows})
@@ -1177,7 +1219,7 @@ class Bridge:
             self._ack(callback_id, problem)
             return {"rejected": problem}
         action = record["action"]
-        if action in ("session_policy", "session_profile", "workflow_policy", "starting_agent"):
+        if action in ("workflow_policy", "starting_agent"):
             pending_id = record.get("pending_id")
             path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
             if not isinstance(pending_id, str) or not path.exists():
@@ -1211,27 +1253,14 @@ class Bridge:
                 self._ack(callback_id,"Choice recorded; review the final Start task card.")
                 self._send_start_confirmation(chat_id,pending)
                 return {"callback":action,"result":"selection_updated"}
-            selection=dict(pending["session_selection"]); selection["profiles"]=dict(selection["profiles"])
-            if action=="session_policy":
-                policy=record.get("policy")
-                if policy not in ("preserve","fresh-codex","fresh-all"):
-                    self._ack(callback_id,"Unsupported session policy."); return {"rejected":"invalid_session_policy"}
-                if not self.fresh_policy_available(policy):
-                    self._ack(callback_id,"Fresh session creation is no longer available."); return {"rejected":"invalid_session_capability"}
-                selection={"policy":policy,"profiles":{"codex":"default","claude":"default"}}
-            else:
-                provider,profile=record.get("provider"),record.get("profile")
-                fresh={"fresh-codex":{"codex"},"fresh-claude":{"claude"},"fresh-all":{"codex","claude"}}.get(selection["policy"],set())
-                if provider not in fresh or profile not in self.sup_config["session_start"]["model_profiles"].get(provider,{}):
-                    self._ack(callback_id,"That model profile is no longer available."); return {"rejected":"invalid_model_profile"}
-                if profile != "default" and not self.model_capability_reader(provider):
-                    self._ack(callback_id,"That model capability is no longer available."); return {"rejected":"invalid_model_capability"}
-                selection["profiles"][provider]=profile
-            pending.update({"session_selection":selection,"view_revision":int(pending["view_revision"])+1})
-            hs.atomic_write_json(path,pending); self._consume(record_path,record)
-            self._ack(callback_id,"Choice recorded; review the final Start task card.")
-            self._send_start_confirmation(chat_id,pending)
-            return {"callback":action,"result":"selection_updated"}
+        if action in ("session_policy", "session_profile"):
+            try:
+                return self._selection_callback(callback_id, record, record_path, chat_id, action)
+            except (hs.SupervisorError, OSError, ValueError, KeyError, TypeError) as error:
+                # Every selection button gets bounded visible feedback, including an internal failure; the
+                # choice is idempotent UI state, so the owner can simply tap the newest card again.
+                self._ack(callback_id, f"That choice could not be applied ({type(error).__name__}); nothing was started. Use the newest card.")
+                return {"rejected": "selection_error", "error": type(error).__name__}
         if action == "reset_budget_cancel":
             pending_id = record.get("pending_id")
             path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
@@ -1273,6 +1302,8 @@ class Bridge:
             hb.request_backup(self.sup_paths)
             self._ack(callback_id, "Backup run requested.")
             return {"callback": "backup_now", "result": "backup_requested"}
+        if action in ("startup_continue", "startup_cancel", "startup_start_original"):
+            return self._startup_callback(update_id, callback_id, record_path, record, user_id, chat_id, data)
         # F10: every callback is revalidated against live run/gate/state/artifact before any action,
         # early return, or shadow preview; a card from an earlier run or a changed artifact is inert.
         problem = self._revalidate_against_state(record)
@@ -1367,6 +1398,50 @@ class Bridge:
         self.enqueuer.enqueue_command(command)
         self._consume(record_path, record, request_id=command["request_id"])
         self._ack(callback_id, "Request received; the supervisor will confirm separately.")
+        return {"callback": action, "result": "enqueued", "request_id": command["request_id"]}
+
+    def _startup_card_problem(self, record: dict[str, Any], wait: dict[str, Any] | None) -> str | None:
+        """A startup card is bound to one exact wait (and its start, provider and pane). Anything stale, finished, expired or foreign is inert."""
+        if wait is None:
+            return "This startup wait is no longer valid."
+        allowed = {"startup_continue": ("WAITING",), "startup_start_original": ("CONTINUING", "RESOLVED")}.get(str(record.get("action")), hst.OPEN_STATUSES)
+        if wait["status"] not in allowed:
+            return f"This startup wait is {wait['status'].lower()}; use the newest card or /status."
+        if record.get("action") == "startup_start_original" and (not isinstance(wait.get("origin_command"), dict) or wait.get("original_started_at_unix") is not None):
+            return "The original task was already started, or no original request is stored; use /status."
+        if hst.expired(wait, self.clock()):
+            return "This startup wait has expired; nothing continues. Start again when ready."
+        owner = wait.get("preparation_id") or wait.get("run_id")  # a pre-run event is keyed by its preparation id; the token record carries it as run_id
+        if record.get("run_id") not in (None, owner) or any(record.get(key) is not None and record.get(key) != wait.get(key) for key in ("preparation_id", "provider", "pane_id")):
+            return "This card belongs to a different start; use the newest card."
+        return None
+
+    def _startup_callback(self, update_id: int, callback_id: str, record_path: Path, record: dict[str, Any], user_id: int, chat_id: int, data: str) -> dict[str, Any]:
+        """Continue / Cancel of a human startup wait. The callback never touches a pane: it validates the card against the durable wait record and queues ONE
+        command; the worker re-verifies the same process, executable and contracts and is the only place anything is continued."""
+        action = record["action"]
+        wait_id = record.get("wait_id")
+        try:
+            wait = hst.read_wait(self.sup_paths, wait_id) if isinstance(wait_id, str) else None
+        except hs.SupervisorError:
+            wait = None
+        problem = self._startup_card_problem(record, wait)
+        if problem or wait is None:
+            self._ack(callback_id, problem or "This startup wait is no longer valid.")
+            return {"rejected": problem or "unknown_wait"}
+        if self.config.get("mode") != "actionable":
+            self._consume(record_path, record, note="shadow")
+            self._ack(callback_id, f"SHADOW: would {action}; no state changed.")
+            return {"callback": action, "result": "shadow"}
+        command = {"request_id": self.request_id_for(update_id, data), "action": action, "actor": f"telegram:{user_id}", "chat_id": chat_id, "source": "telegram", "callback_query_id": callback_id,
+                   "interaction_id": data, "created_at": hs.iso_utc(self.clock()), "wait_id": wait["wait_id"]}
+        if wait["context"] == "preparation":
+            command["preparation_id"] = wait["preparation_id"]
+        else:
+            command["run_id"] = wait["run_id"]
+        self.enqueuer.enqueue_command(command)  # durable command first, then one-time consumption of the token (a crash in between re-enqueues the same request id)
+        self._consume(record_path, record, request_id=command["request_id"])
+        self._ack(callback_id, {"startup_continue": "Continuing: the same process is re-checked first.", "startup_start_original": "Applying the original authorized task start once."}.get(action, "Cancelling the start."))
         return {"callback": action, "result": "enqueued", "request_id": command["request_id"]}
 
     def _consume(self, record_path: Path, record: dict[str, Any], **extra: Any) -> None:
@@ -1481,6 +1556,43 @@ class Bridge:
         if record.get("artifact_sha256") and Path(str(gate.get("artifact_path"))).exists() and hs.sha256_file(Path(gate["artifact_path"])) != record["artifact_sha256"]:
             return hs.PLAN_CHANGED_MESSAGE
         return None
+
+
+    def _selection_callback(self, callback_id: str, record: dict[str, Any], record_path: Path, chat_id: int, action: str) -> dict[str, Any]:
+        """Session-policy / model-profile selection for one pending task start."""
+        pending_id = record.get("pending_id")
+        path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
+        if not isinstance(pending_id, str) or not path.exists():
+            self._ack(callback_id,"This task start is no longer valid."); return {"rejected":"missing_pending_start"}
+        pending=hs.load_json(path,label="pending task")
+        if (pending.get("status")!="pending" or pending.get("task_sha256")!=record.get("task_sha256")
+                or pending.get("view_revision")!=record.get("view_revision")):
+            self._ack(callback_id,"This task choice is stale; use the newest card."); return {"rejected":"stale_pending_start"}
+        selection=dict(pending["session_selection"]); selection["profiles"]=dict(selection["profiles"])
+        ack: str | None = None
+        if action=="session_policy":
+            policy=record.get("policy")
+            if policy not in ("preserve","fresh-codex","fresh-all"):
+                self._ack(callback_id,"Unsupported session policy."); return {"rejected":"invalid_session_policy"}
+            if not self.fresh_policy_available(policy):
+                self._ack(callback_id,"Fresh session creation is no longer available."); return {"rejected":"invalid_session_capability"}
+            selection={"policy":policy,"profiles":{"codex":"default","claude":"default"}}
+        else:
+            provider,profile=record.get("provider"),record.get("profile")
+            fresh={"fresh-codex":{"codex"},"fresh-claude":{"claude"},"fresh-all":{"codex","claude"}}.get(selection["policy"],set())
+            if provider not in fresh or profile not in self.sup_config["session_start"]["model_profiles"].get(provider,{}):
+                self._ack(callback_id,"That model profile is no longer available."); return {"rejected":"invalid_model_profile"}
+            if profile != "default" and not self.model_capability_reader(provider):
+                self._ack(callback_id,"That model capability is no longer available."); return {"rejected":"invalid_model_capability"}
+            same = selection["profiles"][provider] == profile
+            selection["profiles"][provider]=profile
+            label = self.sup_config["session_start"]["model_profiles"][provider][profile]["label"]
+            ack = f"{provider.title()} model unchanged: {label} (already selected)." if same else f"{provider.title()} model set to {label}."
+        pending.update({"session_selection":selection,"view_revision":int(pending["view_revision"])+1})
+        hs.atomic_write_json(path,pending); self._consume(record_path,record)
+        self._ack(callback_id,ack or "Choice recorded; review the final Start task card.")
+        self._send_start_confirmation(chat_id,pending)
+        return {"callback":action,"result":"selection_updated"}
 
     def _ack(self, callback_id: str, text: str) -> None:
         if not callback_id:
@@ -1928,7 +2040,7 @@ class Bridge:
         pending = self._supersede_decision_cards_replaced_by_answers(pending, delivery_dir, counts)
         now = self.clock()
         summarize_paths: list[Path] = []
-        informational = [item for item in pending if not item[0].get("actionable") and item[0].get("type") not in ("COMMAND_RESULT", "QUERY_RESULT", "AGENT_FOLLOWUP_READY", "RUNTIME_EVIDENCE_PROPOSED")]
+        informational = [item for item in pending if not item[0].get("actionable") and item[0].get("type") not in ("COMMAND_RESULT", "QUERY_RESULT", "AGENT_FOLLOWUP_READY", "RUNTIME_EVIDENCE_PROPOSED", "STARTUP_WAIT_REQUIRED", "STARTUP_WAIT_RESULT")]
         collapse = len(informational) > int(self.config["informational_collapse_after"])
         batch = pending if limit is None else self._fair_batch(pending, [item[2].name for item in pending], limit, "outbox")
         for event, sidecar, sidecar_path in batch:
@@ -2563,7 +2675,11 @@ def build_bridge(tg_paths: TelegramPaths | None = None, *, api: Any = None) -> B
                   # redemption. Inventory is read-only; each request still gets a unique durable identity.
                   reset_inventory_reader=journal_reset_inventory_reader(sup_paths, sup_config),
                   session_capability_reader=lambda: session_contract_supported(sup_config,herdr.capability_report()),
-                  fresh_policy_reader=lambda policy: fresh_policy_supported(sup_config, policy, herdr.capability_report(), probe_codex_thread_contract(sup_config["session_start"]["provider_commands"]["codex"]) if policy in ("fresh-codex","fresh-all") else None))
+                  # One shared predicate: the same bounded-cache supervisor report doctor and execution use,
+                  # so a hidden/offered fresh choice cannot disagree with what execution would accept.
+                  fresh_policy_reader=supervisor.fresh_policy_supported,
+                  fresh_reason_reader=lambda: [] if supervisor.helper_readiness()["ready"] else list(supervisor.helper_readiness()["reasons"]),
+                  fresh_note_reader=lambda: list(supervisor.helper_readiness().get("notes") or []))
 
 
 def main(argv: list[str] | None = None) -> int:

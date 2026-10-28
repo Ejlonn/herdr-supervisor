@@ -1,0 +1,7 @@
+{
+  "capture_method": "read-only: herdr --version; herdr pane rename --help; herdr agent start --help; herdr pane get <existing-pane> (values replaced by placeholders, key set identical to the live response). No rename, start, prompt, send-keys, split or any other mutation was executed.",
+  "captured_on": "2026-10-25",
+  "herdr_version": "herdr 0.9.5",
+  "limits": "An existing, never-renamed pane has no label key. The key name Herdr uses for a pane display label AFTER a rename was NOT observed; the adapter reads `label` and treats an absent value as NAME_UNVERIFIED. `pane-get-labelled-SYNTHETIC.json` is a hand-written shape, not a capture.",
+  "placeholders": {"cwd": "/home/user/workspace", "pane": "w1:p3", "session_id": "11111111-1111-4111-8111-111111111111", "terminal_title": "example terminal title"}
+}

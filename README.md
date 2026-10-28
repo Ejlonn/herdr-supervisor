@@ -208,3 +208,10 @@ Optional [sessions and helpers](docs/SESSIONS.md): inspect all live sessions and
 explicit native child relationships, or dispatch bounded read-only jobs to
 separately registered helper panes. Helpers keep their model/session and return
 evidence; the parent's human approval gates remain in control. Disabled by default.
+
+### Human-handled fresh-session startup
+
+Direct fresh Codex launches, `--no-daemon`, bounded update/trust waits and exact
+process-bound continuation are described in [Fresh sessions](docs/FRESH_SESSIONS.md).
+The operator handles provider dialogs; no automatic update, Trust choice or
+current-session restart occurs. Installation preserves existing configuration.

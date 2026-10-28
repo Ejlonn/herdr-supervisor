@@ -31,6 +31,7 @@ from herdr_core import (
 from herdr_helpers import HelperManager
 from herdr_onboarding import apply_project, inspect_project
 from herdr_runtime import Supervisor
+from herdr_startup import read_wait
 from herdr_validation import StateStore, load_task_file, register_query_provider
 
 
@@ -68,6 +69,13 @@ def print_status(report: dict[str, Any]) -> None:
             print(f"Session prep: {preparation.get('status')} id={preparation.get('preparation_id') or 'unknown'}")
     if report.get("wait_user_reason"):
         print(f"WAIT_USER:    {report['wait_user_reason']}")
+    for wait in report.get("startup_waits") or []:
+        print(f"Startup wait: {wait.get('provider')} pane {wait.get('pane_id')} {wait.get('status')} ({wait.get('kind')}, {'recognized' if wait.get('recognized') else 'NOT recognized'}); {wait.get('remaining_seconds')} s left, wait {wait.get('wait_id')}")
+        if wait.get("trust_folder"):
+            print(f"              folder: {wait.get('trust_folder')} (the folder this start was authorized for) — review it yourself: trusting it lets Claude Code read, edit and execute files there; choose Trust or Exit in THAT pane.")
+        print(f"              next: handle it in THAT pane yourself, then `herdr-supervisor continue-startup --wait-id {wait.get('wait_id')}` (or `cancel-startup`). Nothing is pressed or sent for you.")
+        if wait.get("status") in ("CONTINUING", "RESOLVED") and wait.get("start_original_available"):
+            print(f"              then: `herdr-supervisor start-original --wait-id {wait.get('wait_id')}` applies the original authorized task start once (a new /task is refused meanwhile).")
     recovery = report.get("owner_recovery")
     if isinstance(recovery, dict):
         what = {"duplicate": "the same saved session is live in more than one pane", "moved": "the saved session is live in a different pane than recorded", "missing_pane": "the recorded pane is gone and the session is not live"}.get(str(recovery.get("classification")), "pane ownership needs repair")
@@ -144,6 +152,16 @@ def print_doctor(report: dict[str, Any]) -> None:
     if session:
         components = session.get("fresh_codex_components") or {}
         print(f"fresh codex:  {'available' if session.get('fresh_codex_available') else 'unavailable'}" + ("" if session.get("fresh_codex_available") else " (missing: " + ", ".join(n for n, ok in components.items() if not ok) + ")"))
+        helper = session.get("helper") or {}
+        if session.get("codex_launch_method") == "explicit-pane-run":
+            print(f"codex input:  policy={session.get('codex_input_policy')} empty-input proof={(session.get('helper') or {}).get('empty_input_proof', 'unavailable')}" + ("  (OPERATING ASSUMPTION, not proof)" if session.get("codex_input_policy") == "guarded-new-pane" else ""))
+            for note in (session.get("helper") or {}).get("notes") or []:
+                print(f"  note: {note}")
+        print(f"codex launch: method={session.get('codex_launch_method') or 'agent-start'} (explicit-pane-run specifies the context by command; agent-start is unverified)")
+        print(f"codex fresh:  {session.get('fresh_codex_launch') or 'unknown'} (a new Codex TUI in the fresh pane; no pre-created thread, no resume; the native id is learned from the owned pane)")
+        print(f"codex helper: {'ready' if helper.get('ready') else 'NOT READY'} context={str(helper.get('fingerprint') or '-')[:12]} evidence={helper.get('evidence')} (quota-reset helper only; a fresh Codex start no longer needs it; structural read-only; not a deployment acceptance)")
+        for reason in helper.get("reasons") or []:
+            print(f"  helper: {reason}")
     session_start=report.get("session_start") or {}
     print(f"fresh start:  {'available' if session_start.get('fresh_available') else 'unavailable'} enabled={session_start.get('enabled')} pane_split={session_start.get('pane_split')} agent_start={session_start.get('agent_start')} model_flags={session_start.get('model_flag')}")
     for provider in ("claude", "codex"):
@@ -349,8 +367,16 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--pane", default=None, help="the previewed live pane (required with --apply)")
     repair.add_argument("--apply", action="store_true")
     repair.add_argument("--actor", default="operator-cli")
+    cont = sub.add_parser("continue-startup", help="after YOU handled a startup update/notice in the waiting provider pane: verify the same process and contracts, then continue the journaled start (never presses a key)")
+    cont.add_argument("--wait-id", required=True)
+    original = sub.add_parser("start-original", help="after a startup wait was continued: re-apply the ORIGINAL authorized task-start request once (same request, preparation and authority; no new approval)")
+    original.add_argument("--wait-id", required=True)
+    cancel_start = sub.add_parser("cancel-startup", help="release a waiting start: the preparation becomes inert; no pane, session or process is closed")
+    cancel_start.add_argument("--wait-id", required=True)
     abandon = sub.add_parser("abandon-session-start", help="mark a failed pre-binding session preparation inert; created panes/sessions remain alive")
     abandon.add_argument("--preparation-id", required=True)
+    helper_ctx = sub.add_parser("helper-context", help="read-only: show this project's reset-helper context, readiness and explicit setup steps; --render-dir writes inactive unit files for review (nothing is installed or enabled)")
+    helper_ctx.add_argument("--render-dir", default=None)
     sub.add_parser("migrate", help="back up V1 state, write schema 2, tighten state permissions (no service activation)")
     events = sub.add_parser("events", help="list durable outbox events for the current run")
     events.add_argument("--json", action="store_true")
@@ -439,9 +465,24 @@ def main(argv: list[str] | None = None) -> int:
                     result = supervisor.owner_recovery_apply(state, run_id=args.run_id, recovery_id=args.recovery_id, pane=args.pane, actor=args.actor)
             print(result["message"])
             return 0
+        if args.command == "helper-context":
+            print(json.dumps(supervisor.helper_context_report(render_dir=args.render_dir), indent=2, sort_keys=True))
+            return 0
         if args.command == "abandon-session-start":
             print(json.dumps(supervisor.abandon_session_preparation(args.preparation_id),indent=2,sort_keys=True))
             return 0
+        if args.command in ("continue-startup", "cancel-startup", "start-original"):
+            actor = f"cli:{getpass.getuser()}"
+            with WorkerLock(supervisor.paths.lock_file):
+                with supervisor.store.transaction():
+                    current = supervisor.store.read_state(required=False)
+                    startup_wait = read_wait(supervisor.paths, args.wait_id)
+                    command = {"action": {"continue-startup": "startup_continue", "cancel-startup": "startup_cancel", "start-original": "startup_start_original"}[args.command], "wait_id": args.wait_id, "actor": actor}
+                    if startup_wait is not None and startup_wait["context"] == "run":
+                        command["run_id"] = startup_wait["run_id"]
+                    result = supervisor.apply_command(current, command)
+            print(result["message"])
+            return 0 if result.get("ok") else 2
         if args.command in ("approve", "reject", "revise", "answer"):
             with supervisor.store.transaction():
                 state = supervisor.store.read_state()

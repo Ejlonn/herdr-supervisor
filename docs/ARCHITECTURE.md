@@ -31,7 +31,9 @@ Flat modules under `src/`, one-way dependencies (each imports only modules above
 - `herdr_redaction.py` — the single redaction and sensitive-remainder policy used by every outward path.
 - `herdr_validation.py` — state defaults, migration and validation, the durable `StateStore`, and the safe-file, task, upload, gate-payload, runtime-evidence, and query-registry validators.
 - `herdr_workflow.py` — V2 events, gates, inbox/outbox, approvals, operator handoff, missing-result retry, the gate-preserving agent follow-up (suspend → one prompt → verified hash-bound response → restore), recovery (mixin).
-- `herdr_sessions.py` — bounded new-task session/model policy, provider capability probing (model flag; Codex app-server/`thread/start`/`resume` chain), durable fresh preparation (thread-first for Codex), exact identity verification, and atomic ownership binding.
+- `herdr_sessions.py` — bounded fresh-session/model policy, explicit direct Codex launches, journaled native identity and ownership binding, and human-handled startup continuation. Legacy thread-first records remain readable.
+- `herdr_helper_context.py` — validated provider HOME/cwd/executable context, deterministic launch recipes, exact input-policy and approval-mode contracts, and helper unit rendering/readiness.
+- `herdr_startup.py` — durable startup waits, bounded screen classification, exact process/executable binding, expiry and at-most-once continuation.
 - `herdr_runtime.py` — the supervisor engine: identity-safe command targets, delivery lifecycle, quota/reset reconciliation, thread-start via the helper journal, run/resume/monitor loop, status and doctor data (runtime evidence view, product-repository validity, Fresh Codex components).
 - `herdr_command.py` — argument parser, terminal output, control commands, `main`.
 - `herdr_supervisor.py` — compatibility facade and console entry point re-exporting the supported names.

@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -14,8 +15,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 import herdr_codex_reset as hcr
+import herdr_helper_context as hctx
 import herdr_native_results as nr
 import herdr_role_readiness as rr
+import herdr_startup as hst
 from herdr_cli import MIN_HERDR_VERSION_TEXT, match_exact_session, session_identity
 from herdr_core import (
     _UUID_RE,
@@ -38,8 +41,10 @@ from herdr_core import (
     OwnerRecoveryNeeded,
     Paths,
     QuotaError,
+    StartupNotReady,
     SupervisorError,
     WorkerLock,
+    approval_mode,
     atomic_write_json,
     iso_local,
     iso_utc,
@@ -50,15 +55,22 @@ from herdr_protocol import ProtocolBlock, parse_protocol
 from herdr_quota import QuotaSnapshot, QuotaWindow, blocking_windows, parse_quota_snapshot, quota_as_dict, quota_resume_at
 from herdr_session_catalog import native_snapshot, refresh_native, session_catalog
 from herdr_sessions import (
+    assert_recorded_approval_modes,
+    cancel_startup_wait,
     cli_request_binding,
     cli_request_envelope,
-    fresh_codex_components,
+    continue_startup_wait,
+    fresh_codex_direct_components,
     fresh_policy_supported,
     preparation_view,
     prepare_sessions,
+    probe_approval_capability,
+    probe_codex_direct_contract,
     probe_codex_thread_contract,
     probe_model_flag,
     session_contract_supported,
+    startup_wait_views,
+    sweep_startup_waits,
     validate_preparation_record,
     validate_selection,
 )
@@ -157,12 +169,14 @@ class Supervisor(SupervisorV2Mixin):
         clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
         reset_gateway: Any | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.paths = paths
         self.config = config
         self.herdr = herdr
         self.clock = clock
         self.sleeper = sleeper
+        self._monotonic = monotonic
         self.store = StateStore(paths, clock)
         self._live_names: dict[str, str] = {}
         self.native_roots: dict[str, Path] | None = None  # tests inject; None = configured/default provider roots
@@ -178,33 +192,176 @@ class Supervisor(SupervisorV2Mixin):
         """Read-only provider CLI probe; tests may replace this method, never a model session."""
         return probe_model_flag(self.config["session_start"]["provider_commands"][provider])
 
+    def approval_mode_supported(self, provider: str, mode: str) -> bool:
+        """Read-only provider CLI probe of a closed approval mode; tests may replace this method, never a model session."""
+        return probe_approval_capability(self.config["session_start"]["provider_commands"][provider], provider, mode)
+
+    PROBE_TTL_SECONDS = 300
+    READINESS_TTL_SECONDS = 5
+
     def codex_thread_contract(self) -> dict[str, bool]:
-        """Read-only, per-process cached probe of the Codex app-server/thread/resume chain; tests replace it."""
+        """Read-only, time-bounded cached probe of the Codex app-server/thread/resume chain; tests replace it."""
+        now = self.clock()
         cached = getattr(self, "_codex_thread_contract", None)
-        if cached is None:
+        if cached is None or now - getattr(self, "_codex_thread_contract_at", now) > self.PROBE_TTL_SECONDS:
             cached = probe_codex_thread_contract(self.config["session_start"]["provider_commands"]["codex"])
-            self._codex_thread_contract = cached
+            self._codex_thread_contract, self._codex_thread_contract_at = cached, now
         return cached
+
+    def startup_codex_contract(self) -> dict[str, bool]:
+        """Uncached read-only probe of the Codex app-server/thread/resume chain for a post-handling continuation (an update may have just changed the CLI);
+        it refreshes the cache that `codex_thread_contract` serves. Tests replace it like the cached probe."""
+        fresh = probe_codex_thread_contract(self.config["session_start"]["provider_commands"]["codex"])
+        self._codex_thread_contract, self._codex_thread_contract_at = fresh, self.clock()
+        return fresh
+
+    def codex_direct_contract(self) -> dict[str, bool]:
+        """Read-only, time-bounded cached probe of the top-level Codex CLI facts a DIRECT fresh launch needs (pane-local server, the configured approval flag); tests replace it."""
+        now = self.clock()
+        cached = getattr(self, "_codex_direct_contract", None)
+        if cached is None or now - getattr(self, "_codex_direct_contract_at", now) > self.PROBE_TTL_SECONDS:
+            return self.startup_codex_direct_contract()
+        return cached
+
+    def startup_codex_direct_contract(self) -> dict[str, bool]:
+        """Uncached read-only probe of the same facts for a post-handling continuation (an update may have just changed the CLI); it refreshes the cache. Tests replace it."""
+        fresh = probe_codex_direct_contract(self.config["session_start"]["provider_commands"]["codex"], approval_mode(self.config, "codex"))
+        self._codex_direct_contract, self._codex_direct_contract_at = fresh, self.clock()
+        return fresh
+
+    def helper_context(self, working_directory: str | None = None) -> dict[str, Any]:
+        """The validated descriptor this producer binds into a thread/start request (see herdr_helper_context)."""
+        try:
+            return hctx.build_context(self.paths.codex_reset_dir, working_directory or str(self.config["project_root"]), config=self.config)
+        except hctx.ContextError as error:
+            raise SupervisorError(f"helper context unavailable: {error}") from error
+
+    launch_executable_check = staticmethod(hctx.is_native_elf)  # production: native ELF only; tests replace it explicitly
+    launch_chdir_probe = staticmethod(hctx.env_supports_chdir)
+
+    def input_policy(self) -> str:
+        """The configured Codex input policy for NEW preparations (absent = strict `require-empty-proof`)."""
+        return str(self.config["session_start"].get("codex_input_policy", "require-empty-proof"))
+
+    def monotonic_now(self) -> float:
+        """Injectable monotonic time for the guarded submission window (never wall-clock sleeps in tests)."""
+        return self._monotonic()
+
+    def launch_method(self) -> str:
+        """The configured Codex launch method for NEW preparations (absent = agent-start; a journaled one wins)."""
+        return str(self.config["session_start"].get("codex_launch_method", "agent-start"))
+
+    def helper_readiness(self, method: str | None = None, policy: str | None = None) -> dict[str, Any]:
+        """The one shared read-only helper readiness report (doctor, Telegram availability, execution) for the
+        configured launch method, or for the method a journaled preparation recorded."""
+        method = method or self.launch_method()
+        policy = policy or self.input_policy()
+        key = f"{method}/{policy}"
+        now = self.clock()
+        cache: dict[str, tuple[float, dict[str, Any]]] = getattr(self, "_helper_readiness_cache", None) or {}
+        self._helper_readiness_cache = cache
+        cached = cache.get(key)
+        if cached is None or now - cached[0] > self.READINESS_TTL_SECONDS:
+            report = hctx.helper_readiness(self.paths.codex_reset_dir, self.config, launch_context=getattr(self.herdr, "pane_launch_context", None),
+                                           launch_method=method, launch_capabilities=getattr(self.herdr, "launch_capability_report", None), input_policy=policy,
+                                           executable_check=self.launch_executable_check, chdir_probe=self.launch_chdir_probe)
+            cached = cache[key] = (now, report)
+        return cached[1]
+
+    def direct_launch_readiness(self, policy: str | None = None) -> dict[str, Any]:
+        """The read-only readiness of the DIRECT fresh-Codex launch (recipe + Herdr capabilities; no helper journal or unit), shared by doctor, the Telegram predicate and execution."""
+        policy = policy or self.input_policy()
+        key = f"direct/{policy}"
+        now = self.clock()
+        cache: dict[str, tuple[float, dict[str, Any]]] = getattr(self, "_helper_readiness_cache", None) or {}
+        self._helper_readiness_cache = cache
+        cached = cache.get(key)
+        if cached is None or now - cached[0] > self.READINESS_TTL_SECONDS:
+            report = hctx.direct_launch_readiness(self.paths.codex_reset_dir, self.config, launch_capabilities=getattr(self.herdr, "launch_capability_report", None), input_policy=policy,
+                                                  executable_check=self.launch_executable_check, chdir_probe=self.launch_chdir_probe)
+            cached = cache[key] = (now, report)
+        return cached[1]
+
+    def direct_launch_recipe(self, model: str | None) -> dict[str, Any]:
+        """The journaled explicit recipe of a NEW direct Codex launch (same constructor as readiness)."""
+        try:
+            return hctx.build_direct_launch_recipe(self.helper_context(), model, executable_check=self.launch_executable_check, chdir_probe=self.launch_chdir_probe,
+                                                   approval_mode=approval_mode(self.config, "codex"))
+        except hctx.ContextError as error:
+            raise SupervisorError(f"explicit Codex launch recipe unavailable: {error}") from error
+
+    def launch_recipe(self, thread_id: str) -> dict[str, Any]:
+        """The journaled explicit launch recipe for the exact helper-created thread (same constructor as readiness)."""
+        try:
+            return hctx.build_launch_recipe(self.helper_context(), thread_id, executable_check=self.launch_executable_check, chdir_probe=self.launch_chdir_probe,
+                                            approval_mode=approval_mode(self.config, "codex"))
+        except hctx.ContextError as error:
+            raise SupervisorError(f"explicit Codex launch recipe unavailable: {error}") from error
+
+    def launch_env_utility(self) -> str | None:
+        """The supported env resolver: the only authority for the recipe's env utility path."""
+        return hctx.resolve_env_utility()
+
+    def revalidate_launch_recipe(self, recipe: dict[str, Any], thread_id: str | None, cwd: str, model: str | None = None) -> str | None:
+        """Authority (helper context + exact thread + supported env resolver) before any probe, then the original byte identities."""
+        try:
+            context = self.helper_context(cwd)
+        except SupervisorError as error:
+            return str(error)
+        return hctx.revalidate_launch_recipe(recipe, context=context, thread_id=thread_id, env_utility=self.launch_env_utility(), model=model,
+                                             executable_check=self.launch_executable_check, chdir_probe=self.launch_chdir_probe, approval_mode=approval_mode(self.config, "codex"))
+
+    def helper_context_report(self, render_dir: str | None = None) -> dict[str, Any]:
+        """Read-only: descriptor, shared readiness and explicit operator steps. `render_dir` receives inactive
+        unit text for review; the live user unit directory is refused so nothing is installed or enabled here."""
+        readiness = self.helper_readiness()
+        context = readiness["context"] or self.helper_context()
+        path_unit, service_unit, is_global = hctx.unit_names(context)
+        report: dict[str, Any] = {"context": context, "fingerprint": hctx.fingerprint(context), "readiness": readiness,
+                                  "units": {"path": path_unit, "service": service_unit, "global": is_global}, "rendered": [], "next_steps": []}
+        root = context["journal_root"]
+        # Every operator-visible argument is shell-quoted: a legal path may hold spaces, apostrophes or metacharacters.
+        steps = ["mkdir -p -m 0700 " + " ".join(shlex.quote(f"{root}/{name}") for name in ("pending", "processing", "results"))]
+        review = "<review-directory>"
+        if not is_global:
+            if render_dir is None:
+                steps.append("herdr-supervisor helper-context --render-dir <review-directory>   # writes inactive unit text only")
+            else:
+                target = Path(render_dir).resolve()
+                if target == (Path.home() / ".config/systemd/user").resolve():
+                    raise SupervisorError("refusing to render into the live user unit directory; review the files, then install them explicitly")
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                review = shlex.quote(str(target))
+                for name, text in hctx.render_units(context).items():
+                    (target / name).write_text(text)
+                    report["rendered"].append(str(target / name))
+            steps += [f"install -m 0644 {review}/{path_unit} {review}/{service_unit} ~/.config/systemd/user/",
+                      f"systemd-analyze --user verify ~/.config/systemd/user/{path_unit} ~/.config/systemd/user/{service_unit}"]
+        steps += ["systemctl --user daemon-reload", f"systemctl --user enable --now {path_unit}   # explicit operator step; pending requests are then processed",
+                  "herdr-supervisor doctor   # structural readiness; a real task start is a separate, approved acceptance"]
+        report["next_steps"] = steps
+        return report
 
     def fresh_policy_supported(self, policy: str) -> bool:
         probe = getattr(self.herdr, "capability_report", None)
         report = probe() if callable(probe) else None
-        return fresh_policy_supported(self.config, policy, report, self.codex_thread_contract() if policy in ("fresh-codex", "fresh-all") else None)
+        needs_codex = policy in ("fresh-codex", "fresh-all")
+        return fresh_policy_supported(self.config, policy, report, self.codex_direct_contract() if needs_codex else None, self.direct_launch_readiness() if needs_codex else None)
 
-    def create_codex_thread(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+    def create_codex_thread(self, payload: dict[str, Any], request_id: str, context_fingerprint: str | None = None) -> dict[str, Any]:
         """One durable thread via the helper journal. A timeout or helper failure is reported as unresolved;
         the caller has already persisted the intent and never repeats the request."""
         try:
-            return self.reset_gateway.thread_start(payload, request_id)
+            return self.reset_gateway.thread_start(payload, request_id, context_fingerprint)
         except hcr.ResetError as error:
             raise SupervisorError(str(error)) from error
 
-    def settled_codex_thread(self, payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+    def settled_codex_thread(self, payload: dict[str, Any], request_id: str, context_fingerprint: str | None = None) -> dict[str, Any] | None:
         """Reconcile an earlier thread-start whose outcome was unknown: adopt a settled successful result for
         the exact request, report None while unknown, and treat a recorded failure as unresolved (the
         operator decides; nothing is resent)."""
         try:
-            value = self.reset_gateway.result_if_present("thread_start", payload, request_id)
+            value = self.reset_gateway.result_if_present("thread_start", payload, request_id, context_fingerprint)
         except hcr.ResetError as error:
             raise SupervisorError(str(error)) from error
         if value is None:
@@ -274,7 +431,21 @@ class Supervisor(SupervisorV2Mixin):
             raise SupervisorError("this preparation cannot be abandoned; inspect ownership and use explicit rebind if needed")
         record.update({"status":"ABANDONED","abandoned_at":iso_utc(self.clock())})
         atomic_write_json(path,record)
+        for wait in hst.list_waits(self.paths, preparation_id=preparation_id, statuses=hst.OPEN_STATUSES):
+            hst.close_wait(wait, "CANCELLED", self.clock(), "preparation abandoned")
+            hst.write_wait(self.paths, wait)
         return {"abandoned":True,"preparation_id":preparation_id,"note":"all created panes and sessions were preserved"}
+
+    # ----- human-handled startup waits (the consumers behind the startup_continue / startup_cancel commands; the worker lock is held by the caller)
+
+    def continue_startup(self, wait_id: str, *, actor: str) -> dict[str, Any]:
+        return continue_startup_wait(self, wait_id, actor=actor)
+
+    def cancel_startup(self, wait_id: str, *, actor: str) -> dict[str, Any]:
+        return cancel_startup_wait(self, wait_id, actor=actor)
+
+    def sweep_startup_waits(self) -> list[str]:
+        return [*sweep_startup_waits(self), *self.sweep_run_startup_waits()]
 
     def codex_reset_inventory(self, request_id: str) -> hcr.ResetInventory:
         if not self.config["codex_reset"]["enabled"]:
@@ -977,6 +1148,8 @@ class Supervisor(SupervisorV2Mixin):
         as an actionable wait with its checkpoint; any other failure is the plain wait it always was."""
         if isinstance(error, OwnerRecoveryNeeded):
             return self.enter_owner_recovery(state, error)
+        if isinstance(error, StartupNotReady) and error.provider is not None:
+            return self.enter_startup_wait(state, error)
         return self.set_wait_user(state, reason)
 
     def set_wait_user(self, state: dict[str, Any], reason: str, *, requires_action: bool = False) -> str:
@@ -1865,6 +2038,7 @@ class Supervisor(SupervisorV2Mixin):
             return record
         if record.get("status") != "OWNERSHIP_BOUND":
             raise SupervisorError("session preparation was not ownership-bound before task start")
+        assert_recorded_approval_modes(self.config, record)  # a bound preparation is accepted for dispatch only under the mode it was authorized with
         record.update({"status":"TASK_STARTED","started_run_id":preparation_id,"task_started_at":iso_utc(self.clock())})
         atomic_write_json(path,record)
         return record
@@ -2163,7 +2337,9 @@ class Supervisor(SupervisorV2Mixin):
         pane_split = bool(contract and (contract.get("optional") or {}).get(pane_split_name))
         agent_start = bool(contract and (contract.get("required") or {}).get("agent start (--kind/--pane)"))
         fresh_available = session_contract_supported(self.config,contract)
-        codex_components = fresh_codex_components(self.config, contract, self.codex_thread_contract())
+        helper = self.helper_readiness()
+        launch_ready = self.direct_launch_readiness()
+        codex_components = fresh_codex_direct_components(self.config, contract, self.codex_direct_contract(), launch_ready)
         report["session_start"] = {
             "enabled": bool(self.config["session_start"]["enabled"]),
             "pane_split": pane_split,
@@ -2172,13 +2348,23 @@ class Supervisor(SupervisorV2Mixin):
             "fresh_claude_available": fresh_available,
             "fresh_codex_available": all(codex_components.values()),
             "fresh_codex_components": codex_components,
+            "fresh_codex_launch": "direct-cli",
+            "codex_launch_method": self.launch_method(),
+            "codex_input_policy": self.input_policy(),
+            "helper": {"ready": helper["ready"], "fingerprint": helper["fingerprint"], "reasons": list(helper["reasons"]), "units": helper["units"], "activation": helper["activation"], "evidence": helper["evidence"],
+                       "input_policy": helper.get("input_policy"), "empty_input_proof": helper.get("empty_input_proof", "unavailable"), "notes": list(helper.get("notes") or [])},
             "model_flag": {p: self.model_flag_supported(p) for p in PROVIDERS},
             "profiles": {p: list(self.config["session_start"]["model_profiles"][p]) for p in PROVIDERS},
         }
+        if any(approval_mode(self.config, p) != "inherit" for p in PROVIDERS):
+            report["session_start"]["approval_modes"] = {p: approval_mode(self.config, p) for p in PROVIDERS}  # shown only when a non-default mode is configured
         if self.config["session_start"]["enabled"] and not fresh_available:
             report["warnings"].append("fresh task sessions unavailable: the compatible Herdr pane-split and agent-start contract was not verified")
         elif self.config["session_start"]["enabled"] and not all(codex_components.values()):
             report["warnings"].append("fresh Codex unavailable: unverified capability " + ", ".join(name for name, ok in codex_components.items() if not ok))
+            report["warnings"].extend(f"fresh Codex launch: {reason}" for reason in launch_ready["reasons"])
+            if not codex_components.get("codex_launch_method_selected", True):
+                report["warnings"].append(f"fresh Codex launch: a new fresh Codex is launched directly through the explicit pane-run recipe; session_start.codex_launch_method is {self.launch_method()}, so new fresh Codex starts are unavailable until it is explicit-pane-run")
         report["ok"] = not report["errors"]
         try:
             report["session_catalog"] = self.sessions_report(live=live_agents)
@@ -2306,6 +2492,7 @@ class Supervisor(SupervisorV2Mixin):
             "native_sessions_abbrev": {k: str(v)[:8] for k, v in (state.get("native_sessions") or {}).items()} if state else None,
             "session_selection": state.get("session_selection") if state else None,
             "session_preparation": state.get("session_preparation") if state else None,
+            "startup_waits": [],
             "agents": {},
             "quota": {},
             "query_session": self.query_report(),
@@ -2322,6 +2509,10 @@ class Supervisor(SupervisorV2Mixin):
                         break
             except (OSError,SupervisorError) as error:
                 report["errors"].append(f"session preparation state is unreadable: {error}")
+        try:
+            report["startup_waits"] = startup_wait_views(self)
+        except (OSError, SupervisorError) as error:
+            report["errors"].append(f"startup wait records are unreadable: {error}")
         owners: dict[str, Any] | None = None
         try:
             owners = self.owners()

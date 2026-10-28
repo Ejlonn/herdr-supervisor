@@ -41,6 +41,7 @@ class FakeClock:
 _RESUMED = object()
 
 import herdr_codex_reset as hcr  # noqa: E402
+import herdr_helper_context as hctx  # noqa: E402
 
 
 class FakeThreadJournal:
@@ -57,6 +58,7 @@ class FakeThreadJournal:
         self.created = 0
         self.mode = "ok"  # ok | timeout | malformed | error | timeout_then_settled
         self.model_reported: str | None = None  # override the returned model (mismatch tests)
+        self.contexts: dict[str, str | None] = {}  # request id -> bound helper-context fingerprint
 
     def inventory(self, request_id: str):
         return self.real.inventory(request_id)
@@ -71,8 +73,9 @@ class FakeThreadJournal:
         return {"thread_id": thread_id, "model": self.model_reported or payload.get("model") or "gpt-5-codex", "model_provider": "openai",
                 "cwd": payload["cwd"], "cli_version": "0.154.0", "created_at": int(self.case.clock.current)}
 
-    def thread_start(self, payload: dict, request_id: str) -> dict:
+    def thread_start(self, payload: dict, request_id: str, context_fingerprint: str | None = None) -> dict:
         self.requests.append((request_id, dict(payload)))
+        self.contexts[request_id] = context_fingerprint
         if self.mode == "error":
             self.results[request_id] = {"request_id": request_id, "ok": False, "error": "helper failed"}
             raise hcr.ResetError("helper failed")
@@ -86,8 +89,8 @@ class FakeThreadJournal:
         self.results[request_id] = {"request_id": request_id, "ok": True, "thread": thread}
         return thread
 
-    def result_if_present(self, operation: str, payload: dict, request_id: str) -> dict | None:
-        hcr.make_request(operation, payload, request_id)
+    def result_if_present(self, operation: str, payload: dict, request_id: str, context_fingerprint: str | None = None) -> dict | None:
+        hcr.make_request(operation, payload, request_id, context_fingerprint)
         return self.results.get(request_id)
 
 
@@ -134,6 +137,43 @@ class FakeHerdr:
         self.explain_error: Exception | None = None
         self.on_explain = None  # callable(fake, target) run before each verdict (script indicators, advance a clock, ...)
         self.explain_raw: dict | None = None  # a raw `agent explain` payload that is run through the real adapter reducer (may raise HerdrError)
+        # Issue 5: a provider that reports its native identity only after a first turn, and pane labels.
+        self.hold_identity = False  # start_agent withholds agent_session until a bootstrap prompt arrives
+        self.bootstrap_mode = "ok"  # ok | stall | reject | swallow | wrong | duplicate
+        self.bootstrap_prompts: list[tuple[str, str]] = []
+        self._held: dict[str, str] = {}
+        self.pane_labels: dict[str, str] = {}
+        self.renames: list[tuple[str, str]] = []
+        self.rename_mode = "ok"  # ok | error | nolabel | mismatch | late
+        self.pane_cwd: dict[str, str] = {}
+        # Explicit Codex launch (`pane run`) simulation. run_mode: ok | late | lost | dropped | swallowed | wrong | busy
+        self.run_mode = "ok"
+        self.late_polls = 2
+        self.pane_runs: list[tuple[str, str]] = []
+        self.launch_env: dict[str, dict] = {}  # pane -> {"argv","cwd","CODEX_HOME","marker"} actually derived from the command
+        self.rename_agent_mode = "ok"  # ok | error | noop
+        self.agent_renames: list[tuple[str, str]] = []
+        # The fixture models an adapter that HAS an empty-input contract (the real one has none: see test_explicit_launch).
+        self.launch_caps: dict[str, bool] = {"pane run": True, "pane process-info (--pane)": True, "agent rename": True, "pane empty interactive input proof": True}
+        self.input_empty_mode = "empty"  # empty | pending | unknown
+        # Exact pane metadata for the guarded profile. metadata_mode: ok | foreign | string_bool | missing | agent | other_cwd | error
+        self.metadata_mode = "ok"
+        self.pane_focused: dict[str, bool] = {}
+        self.metadata_reads: list[str] = []
+        self.on_metadata = None
+        self.input_checks: list[str] = []
+        self._pending_spawn: dict[str, tuple[str, int]] = {}
+        self.inherited_marker = "HERDR_PANE_MARKER=inherited"
+        # Human-handled startup prompt fixtures (additive): scripted visible screens, a provider that starts but is not ready, and an undetected explicit launch.
+        self.screens: dict[str, str] = {}
+        self.pane_reads: list[str] = []
+        self.pane_read_mode = "ok"  # ok | error | none
+        self.startup_block: str | None = None  # None | "start_error" | "blocked_agent" | "undetected"
+        self.startup_block_for = "-run-"  # agent-name fragment the block applies to
+        self.start_error_code = "agent_not_ready"
+        self._undetected: dict[str, tuple[str, dict]] = {}
+        self.processes: dict[str, dict] = {}  # pane -> `pane process-info` result, recorded when an agent starts there
+        self._pid = 9000
 
     @staticmethod
     def agent(provider: str, name: str, pane: str, session: str, status: str = "idle") -> dict:
@@ -252,7 +292,159 @@ class FakeHerdr:
         self.help_probes += 1
         return self.ack_supported
 
+    def _bootstrap_prompt(self, name: str, text: str) -> dict:
+        self.bootstrap_prompts.append((name, text))
+        agent = self.agents[name]
+        if self.bootstrap_mode == "reject":
+            raise hs.HerdrError("blocked", code="agent_blocked")
+        if self.bootstrap_mode == "stall":
+            raise hs.HerdrError("stalled", code="agent_prompt_stalled")
+        held = self._held.get(name)
+        if self.bootstrap_mode == "wrong":
+            held = "99999999-9999-4999-8999-999999999999"
+        if self.bootstrap_mode == "duplicate":
+            held = CLAUDE_SESSION
+        if self.bootstrap_mode != "swallow" and held:
+            agent["agent_session"] = {"value": held}
+        return {"result": {"agent": {**agent, "agent_status": "working"}}}
+
+    def process_info(self, pane: str) -> dict:
+        if pane in self._pending_spawn:
+            command, remaining = self._pending_spawn[pane]
+            if remaining <= 0:
+                del self._pending_spawn[pane]
+                self._spawn(pane, command)
+            else:
+                self._pending_spawn[pane] = (command, remaining - 1)
+        if pane not in self.processes:
+            raise hs.HerdrError("pane process contract unavailable")
+        return json.loads(json.dumps(self.processes[pane]))
+
+    def launch_capability_report(self) -> dict:
+        return dict(self.launch_caps)
+
+    def pane_metadata(self, pane: str) -> dict:
+        self.metadata_reads.append(pane)
+        if self.on_metadata is not None:
+            self.on_metadata(self, pane)
+        mode = self.metadata_mode
+        if mode == "error":
+            raise hs.HerdrError("pane get failed", code="pane_not_found")
+        detected = next((a["agent"] for a in self.agents.values() if a.get("pane_id") == pane), None)
+        meta = {"pane_id": pane, "focused": self.pane_focused.get(pane, False), "agent": detected,
+                "cwd": "/elsewhere" if mode == "other_cwd" else self.pane_cwd.get(pane)}
+        if mode == "foreign":
+            meta["pane_id"] = "w3:p2"
+        if mode == "string_bool":
+            meta["focused"] = "false"
+        if mode == "missing":
+            del meta["focused"]
+        return meta
+
+    def pane_input_empty(self, pane: str) -> bool | None:
+        self.input_checks.append(pane)
+        return {"empty": True, "pending": False, "unknown": None}[self.input_empty_mode]
+
+    def _spawn(self, pane: str, command: str, *, wrong: bool = False) -> None:
+        """What the shell would do with the submitted command: `env --chdir DIR NAME=VALUE... PROGRAM ARGS...`."""
+        import shlex
+        tokens = shlex.split(command)
+        assert tokens[1] == "--chdir", tokens
+        cwd, rest = tokens[2], tokens[3:]
+        env = {}
+        while rest and "=" in rest[0] and not rest[0].startswith("/"):
+            name, value = rest.pop(0).split("=", 1)
+            env[name] = value
+        program, args = rest[0], rest[1:]
+        shell_pid = self.processes[pane]["shell_pid"]
+        self._pid += 1
+        argv = [program, *args] if not wrong else [program, "resume", "99999999-9999-4999-8999-999999999999", "--no-daemon"]
+        self.processes[pane] = {"pane_id": pane, "shell_pid": shell_pid, "foreground_process_group_id": self._pid,
+                                "foreground_processes": [{"argv": argv, "cmdline": " ".join(argv), "cwd": cwd, "name": "codex", "pid": self._pid}]}
+        self.launch_env[pane] = {"argv": argv, "cwd": cwd, "CODEX_HOME": env.get("CODEX_HOME"), "marker": self.inherited_marker}
+        # A legacy `codex resume <thread>` launch reports exactly that thread; a DIRECT launch (no `resume`) creates a NEW native session whose id the fixture scripts in `next_sessions`.
+        thread = args[1] if args[:1] == ["resume"] and len(args) > 1 else self.next_sessions["codex"]
+        name = f"codex-detected-{pane.replace(':', '-')}"
+        agent = self.agent("codex", name, pane, thread)
+        if self.hold_identity:
+            self._held[name] = thread
+            agent.pop("agent_session", None)
+        elif self.resume_reports is not _RESUMED:
+            if self.resume_reports is None:
+                agent.pop("agent_session", None)
+            else:
+                agent["agent_session"] = {"value": self.resume_reports}
+        if self.startup_block == "blocked_agent" and ("codex" in self.startup_block_for or "-run-" in self.startup_block_for):
+            agent["agent_status"] = "blocked"  # the provider process runs and Herdr detects it, but it is waiting at a startup screen
+        if self.startup_block == "undetected":
+            self._undetected[pane] = (name, agent)  # the provider process runs but Herdr has not detected an agent yet (a startup prompt is up)
+            return
+        self.agents[name] = agent
+
+    def pane_read(self, pane: str, *, lines: int = 60) -> str:
+        self.pane_reads.append(pane)
+        if self.pane_read_mode == "error":
+            raise hs.HerdrError("pane read failed", code="command_error")
+        return self.screens.get(pane, "")
+
+    def unblock(self, pane: str, status: str = "idle") -> None:
+        """The human handled the startup prompt in the pane: the agent is detected/ready and the prompt is no longer on screen."""
+        if pane in self._undetected:
+            name, agent = self._undetected.pop(pane)
+            if self.hold_identity:
+                self._held[name] = agent["agent_session"]["value"]
+                agent.pop("agent_session", None)
+            self.agents[name] = agent
+        for agent in self.agents.values():
+            if agent.get("pane_id") == pane:
+                agent["agent_status"] = status
+        self.screens.pop(pane, None)
+        self.startup_block = None
+
+    def pane_run(self, pane: str, command: str) -> dict:
+        self.pane_runs.append((pane, command))
+        mode = self.run_mode
+        if mode == "dropped":
+            raise hs.HerdrError("pane run failed", code="command_error")
+        if mode == "late":
+            self._pending_spawn[pane] = (command, self.late_polls)
+        elif mode in ("ok", "lost", "wrong"):
+            self._spawn(pane, command, wrong=(mode == "wrong"))
+        if mode == "lost":
+            raise hs.HerdrError("pane run exceeded the local timeout", code="timeout")
+        return {}
+
+    def rename_agent(self, target: str, name: str) -> dict:
+        self.agent_renames.append((target, name))
+        if self.rename_agent_mode == "error":
+            raise hs.HerdrError("rename failed", code="agent_not_found")
+        if self.rename_agent_mode == "noop":
+            return {}
+        for key, agent in list(self.agents.items()):
+            if agent.get("pane_id") == target and key not in ("codex-main", "claude-main"):
+                agent["name"] = name
+                self.agents.pop(key)
+                self.agents[name] = agent
+                if key in self._held:
+                    self._held[name] = self._held.pop(key)
+                return {}
+        raise hs.HerdrError("no agent in pane", code="agent_not_found")
+
+    def rename_pane(self, pane_id: str, label: str) -> None:
+        self.renames.append((pane_id, label))
+        if self.rename_mode == "error":
+            raise hs.HerdrError("rename failed", code="pane_not_found")
+        if self.rename_mode == "mismatch":
+            self.pane_labels[pane_id] = "something else"
+        elif self.rename_mode not in ("nolabel", "late"):
+            self.pane_labels[pane_id] = label
+
+    def pane_label(self, pane_id: str) -> str | None:
+        return self.pane_labels.get(pane_id)
+
     def prompt_ack(self, name: str, text: str, *, timeout_ms: int) -> dict:
+        if name in self._held:
+            return self._bootstrap_prompt(name, text)
         """Same scripted submission as prompt(); the acknowledgement reports the observed lifecycle
         (response key `ack_status`, default working) instead of the settled state."""
         self.ack_calls.append((name, timeout_ms))
@@ -291,16 +483,30 @@ class FakeHerdr:
             session = args[1] if self.resume_reports is _RESUMED else self.resume_reports
         else:
             session = self.next_sessions[kind] if "-run-" in name else {"codex":CODEX_SESSION,"claude":CLAUDE_SESSION}[kind]
+        self._pid += 1
+        self.processes[pane_id] = {"pane_id": pane_id, "shell_pid": self._pid, "foreground_process_group_id": self._pid + 1,
+                                   "foreground_processes": [{"argv": [kind, *args], "cmdline": " ".join([kind, *args]), "cwd": self.pane_cwd.get(pane_id, "/"), "name": kind, "pid": self._pid + 1}]}
         self.agents[name] = self.agent(kind, name, pane_id, session)
         if session is None:
             self.agents[name].pop("agent_session", None)
+        elif self.hold_identity and "-run-" in name:
+            self._held[name] = session
+            self.agents[name].pop("agent_session", None)
+        if self.startup_block in ("start_error", "blocked_agent") and self.startup_block_for in name:
+            self.agents[name]["agent_status"] = "blocked"
+            if self.startup_block == "start_error":
+                raise hs.HerdrError(f"agent {name} is blocked during startup", code=self.start_error_code)
         return {}
 
     def split_pane(self, pane_id: str, *, direction: str, ratio: float, cwd: str) -> str | None:
         self.splits.append((pane_id,direction,ratio,cwd))
         pane=self.next_pane
+        self.pane_cwd[pane]=cwd
         self.next_pane=f"w9:p{len(self.splits)+1}"
         self.available_panes.add(pane)
+        self._pid += 1
+        self.processes[pane] = {"pane_id": pane, "shell_pid": self._pid, "foreground_process_group_id": self._pid,
+                                "foreground_processes": [{"argv": ["bash"], "cmdline": "bash", "cwd": cwd, "name": "bash", "pid": self._pid}]}
         return pane
 
     def pane_available(self, pane_id: str) -> bool:
@@ -359,6 +565,9 @@ class V2Case(unittest.TestCase):
         self.product_repo.mkdir()
         self.paths = hs.Paths(config_file=root / "config.json", state_dir=self.state_dir)
         self.config = hs.resolve_config_defaults(hs.deep_merge(hs.DEFAULT_CONFIG, {
+            # A NEW fresh Codex is launched directly through the explicit pane-run recipe, so the fixture's default is that method. The fake adapter models an empty-input contract, so the default input
+            # policy stays the strict one; the guarded profile is exercised by test_guarded_pane.
+            "session_start": {"codex_launch_method": "explicit-pane-run"},
             "project_root": str(self.project_root),
             "quota_dir": str(self.quota_dir),
             "review_root": str(self.review_root),
@@ -376,7 +585,52 @@ class V2Case(unittest.TestCase):
         self.head = SHA_A
         self.head_resolver = lambda repo: self.head
         self.thread_journal = FakeThreadJournal(self)
+        self.helper_report = {"ready": True, "reasons": [], "context": None, "fingerprint": "ab" * 32,
+                              "units": {"path": "herdr-codex-reset-worker.path", "service": "herdr-codex-reset-worker.service", "directory": "/unit-dir"},
+                              "activation": {"unit_file_state": "enabled", "active_state": "active", "sub_state": "waiting"},
+                              "evidence": "structural-read-only", "checks": {}}
+        self.helper_codex_home = "/home/test/.codex"
+        fake_bin = root / "fake-bin"
+        fake_bin.mkdir()
+        self.fake_codex = str(fake_bin / "codex")
+        Path(self.fake_codex).write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(self.fake_codex, 0o755)
         self.sup = self.make_supervisor()
+
+    def seed_legacy_preparation(self, prep: str, *, phase: str = "THREAD_CREATING", method: str = "explicit-pane-run", policy: str | None = None, fingerprint: str | None = "auto",
+                                settle: bool = False) -> dict:
+        """Journal a fresh-Codex preparation EXACTLY as the earlier (pre-created-thread) library wrote it at `phase`: thread fields, no direct-launch marker. Used to prove that such a
+        journal is still read and reconciled by the legacy path and is never converted into a direct launch. `settle` also records the helper's settled thread result."""
+        import herdr_sessions as sessions
+
+        selection = sessions.validate_selection(self.config, {"policy": "fresh-codex", "profiles": {"codex": "default", "claude": "default"}})
+        payload = {"cwd": str(self.project_root), "model": None, "ephemeral": False}
+        item: dict = {"status": phase, "old_pane_id": self.owners["codex"]["pane_id"], "old_session_id": self.owners["codex"]["session_id"], "profile": "default", "preparation_id": prep}
+        if method == "explicit-pane-run":
+            item.update(launch_method="explicit-pane-run", input_policy=policy or "require-empty-proof")
+        configured_mode = (self.config["session_start"].get("approval_modes") or {}).get("codex", "inherit")
+        if configured_mode != "inherit":
+            item["approval_mode"] = configured_mode
+        if phase in ("THREAD_CREATING", "THREAD_CREATED"):
+            item.update(thread_request_id=f"thread-{prep}-codex", thread_payload=payload)
+            if fingerprint == "auto":
+                item["helper_context_fingerprint"] = hctx.fingerprint(self.helper_descriptor(payload["cwd"]))
+            elif fingerprint is not None:
+                item["helper_context_fingerprint"] = fingerprint
+        if phase == "THREAD_CREATED":
+            item.update(thread_id="44444444-4444-4444-8444-444444444444", thread_model="gpt-5-codex", thread_provider="openai")
+        record = {"schema_version": 2, "preparation_id": prep, "status": "SESSION_SELECTION_AUTHORIZED", "selection": selection, "created_at": hs.iso_utc(self.clock.current), "origin": "supervisor",
+                  "request_binding": None, "request_envelope": None, "owners_before": {p: dict(self.owners[p]) for p in self.owners}, "providers": {"codex": item}}
+        self.paths.session_preparations_dir.mkdir(parents=True, exist_ok=True)
+        hs.atomic_write_json(self.paths.session_preparations_dir / f"{prep}.json", record)
+        if settle:
+            self.thread_journal.results[f"thread-{prep}-codex"] = {"request_id": f"thread-{prep}-codex", "ok": True, "thread": self.thread_journal._make(payload)}
+        return record
+
+    def helper_descriptor(self, cwd: str) -> dict:
+        root = str(self.paths.codex_reset_dir)
+        return {"version": 1, "instance": hctx.instance_id(root), "journal_root": root, "codex_bin": self.fake_codex,
+                "codex_home": self.helper_codex_home, "working_directory": cwd}
 
     def reset_fixture(self) -> None:
         """Replace this test's temporary fixture without leaking the previous TemporaryDirectory."""
@@ -389,7 +643,20 @@ class V2Case(unittest.TestCase):
         # Fresh Codex fixtures: the thread journal is shared across supervisors of one case (restart tests)
         # and the read-only Codex thread contract is verified unless a test says otherwise.
         sup.reset_gateway = self.thread_journal
+        # The shared helper report and descriptor are injected like the Codex contract: fixtures never read the
+        # real systemd user manager or the real home directory. Tests mutate `helper_report` to refuse.
+        sup.helper_readiness = lambda method=None, policy=None: json.loads(json.dumps(self.helper_report))
+        sup._monotonic = self.clock.time  # injectable monotonic time: the fake clock, never wall-clock sleeps
+        # Explicit launch: production refuses scripts; this fixture's provider IS a script, so the executable check is a
+        # test-only seam on the Supervisor instance (never a config or request value).
+        sup.launch_executable_check = lambda path: True
+        sup.helper_context = lambda cwd=None: self.helper_descriptor(cwd or str(self.config["project_root"]))
         sup._codex_thread_contract = dict(getattr(self, "codex_contract", {"codex_app_server": True, "codex_thread_start": True, "codex_resume_session_id": True, "codex_pane_local_server": True}))
+        # The DIRECT fresh-Codex launch has its own read-only facts: the top-level CLI help (pane-local server, approval flag) and the launch readiness. Fixtures never run the real CLI;
+        # `direct_contract` and `direct_report` are mutable per test (defaults: verified / ready).
+        sup._codex_direct_contract = dict(getattr(self, "direct_contract", {"codex_pane_local_server": True, "codex_approval_flag": True}))
+        sup.direct_launch_readiness = lambda policy=None: json.loads(json.dumps(getattr(self, "direct_report", {"ready": True, "reasons": []})))
+        sup.startup_codex_direct_contract = lambda: dict(sup._codex_direct_contract)  # the uncached post-handling probe: a fixture value, never the host CLI
         return sup
 
     def tearDown(self) -> None:
