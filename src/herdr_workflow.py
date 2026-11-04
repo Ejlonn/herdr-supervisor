@@ -1388,11 +1388,11 @@ class SupervisorV2Mixin:
         self._log(state, "guidance", actor=actor)
         return {"ok": True, "message": f"guidance recorded; {state['active_agent']} will continue in the same session", "gate_id": None}
 
-    def answer_gate(self, state: dict[str, Any], *, run_id: str, gate_id: str, actor: str, answer: str, chat_id: Any = None, expected_state: str | None = None) -> dict[str, Any]:
+    def answer_gate(self, state: dict[str, Any], *, run_id: str, gate_id: str, actor: str, answer: str, chat_id: Any = None, expected_state: str | None = None, custom: bool = False) -> dict[str, Any]:
         gate = self._load_pending_gate(state, run_id, gate_id, expected_state=expected_state, gate_types=("generic_question",))
         payload = gate["payload"]
         answer = _bounded_str(answer, "answer", max_len=int(payload["max_answer_chars"]))
-        if payload["answer_mode"] == "choice" and answer not in payload["choices"]:
+        if payload["answer_mode"] == "choice" and not custom and answer not in payload["choices"]:
             raise SupervisorError("answer must be one of the allowlisted choices")
         self._finish_gate(state, gate, "answered", actor=actor, chat_id=chat_id, note=answer)
         state["continuation"] = {"kind": "answer", "gate_id": gate_id, "note": answer}
@@ -2565,7 +2565,7 @@ class SupervisorV2Mixin:
         if action == "revise":
             return self.revise_gate(state, run_id=run_id, gate_id=gate_id, actor=actor, chat_id=chat_id, expected_state=expected_state, note=str(command.get("note") or ""))
         if action == "answer":
-            return self.answer_gate(state, run_id=run_id, gate_id=gate_id, actor=actor, chat_id=chat_id, expected_state=expected_state, answer=str(command.get("answer") or ""))
+            return self.answer_gate(state, run_id=run_id, gate_id=gate_id, actor=actor, chat_id=chat_id, expected_state=expected_state, answer=str(command.get("answer") or ""), custom=command.get("custom_answer") is True)
         raise SupervisorError(f"unsupported action {action!r}")
 
     def _mark_upload_started(self, command: dict[str, Any], run_id: str) -> None:

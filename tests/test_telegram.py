@@ -401,12 +401,81 @@ class CallbackTests(TelegramCase):
         self.bridge.deliver_outbox()
         card = self.api.sent[-1]
         buttons = {b["text"]: b["callback_data"] for row in card["reply_markup"]["inline_keyboard"] for b in row}
-        self.assertIn("enum", buttons)
-        self.bridge.handle_update(callback(60, buttons["enum"]))
+        self.assertIn("1. enum", card["text"]); self.assertIn("2. text", card["text"])
+        self.assertTrue({"1", "2", "Custom answer", "Request Revision", "Ask agent"} <= set(buttons))
+        self.bridge.handle_update(callback(60, buttons["1"]))
         command = self.pending_inbox()[-1]
         self.assertEqual((command["action"], command["answer"]), ("answer", "enum"))
+        self.assertNotIn("custom_answer", command)
         self.sup.process_inbox()
         self.assertEqual(self.state()["continuation"]["note"], "enum")
+
+    def long_choice_question(self, count: int = 10) -> list[str]:
+        choices = [f"Option {number}: " + "very long recommended answer text " * 2 + f"ends-{number}" for number in range(1, count + 1)]
+        choices = [choice[:80] for choice in choices]
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "generic_question", str(self.question_payload(choices=choices, max_answer_chars=100)))}])
+        self.bridge.deliver_outbox()
+        return choices
+
+    def test_question_card_shows_every_choice_in_full_and_offers_a_button_for_each(self) -> None:
+        choices = self.long_choice_question(10)
+        card = self.api.sent[-1]
+        for number, choice in enumerate(choices, 1):
+            self.assertIn(f"{number}. {choice}", card["text"], "full option text is readable in the message body")
+        rows = card["reply_markup"]["inline_keyboard"]
+        labels = [b["text"] for row in rows for b in row]
+        self.assertEqual([label for label in labels if label.isdigit()], [str(n) for n in range(1, 11)], "all options are offered, not only the first four")
+        self.assertTrue(all(len(row) <= 4 for row in rows))
+        self.assertIn("Custom answer", labels)
+        tapped = {b["text"]: b["callback_data"] for row in rows for b in row}
+        self.bridge.handle_update(callback(61, tapped["10"]))
+        self.assertEqual(self.pending_inbox()[-1]["answer"], choices[9], "the tenth button answers with the tenth option")
+        self.assertEqual(self.sup.process_inbox()[-1]["ok"], True)
+
+    def test_custom_answer_button_answers_the_question_without_the_revise_path(self) -> None:
+        self.long_choice_question(3)
+        buttons = {b["text"]: b["callback_data"] for row in self.api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        result = self.bridge.handle_update(callback(62, buttons["Custom answer"]))
+        self.assertEqual(result["callback"], "answer_custom_intent")
+        self.assertIn("does not revise", self.texts()[-1])
+        self.assertEqual(self.pending_inbox(), [], "tapping alone queues nothing")
+        self.bridge.handle_update(message(63, "Use text, but add an index on the foreign key"))
+        command = self.pending_inbox()[-1]
+        self.assertEqual((command["action"], command["answer"], command["custom_answer"]), ("answer", "Use text, but add an index on the foreign key", True))
+        self.assertTrue(self.sup.process_inbox()[-1]["ok"])
+        state = self.state()
+        self.assertEqual(state["continuation"], {"kind": "answer", "gate_id": command["gate_id"], "note": "Use text, but add an index on the foreign key"})
+        self.assertNotEqual((state.get("pending_gate") or {}).get("status"), "pending", "the question is answered, not revised")
+        self.bridge.handle_update(message(64, "second plain message"))
+        self.assertEqual(self.pending_inbox(), [], "the reply intent is one-time; the second message queues nothing")
+        self.assertIn("rejected", self.bridge.handle_update(callback(65, buttons["Custom answer"])), "the button is one-time")
+
+    def test_free_text_is_accepted_for_a_choice_question_only_with_the_explicit_custom_flag(self) -> None:
+        self.long_choice_question(3)
+        state = self.state(); gate = state["pending_gate"]
+        base = {"action": "answer", "run_id": state["run_id"], "gate_id": gate["gate_id"], "expected_state": state["supervisor_state"], "actor": "cli", "answer": "my own answer"}
+        for name, extra in (("plain", {}), ("string flag", {"custom_answer": "true"}), ("integer flag", {"custom_answer": 1})):
+            with self.subTest(name):
+                self.sup.enqueue_command({**base, "request_id": f"req-free-{name.replace(' ', '')}", **extra})
+                self.assertFalse(self.sup.process_inbox()[-1]["ok"])
+                self.assertEqual(self.state()["pending_gate"]["status"], "pending")
+        self.sup.enqueue_command({**base, "request_id": "req-free-too-long", "answer": "x" * 101, "custom_answer": True})
+        self.assertFalse(self.sup.process_inbox()[-1]["ok"], "the answer length bound still applies")
+        self.sup.enqueue_command({**base, "request_id": "req-free-stale", "gate_id": "not-the-gate", "custom_answer": True})
+        self.assertFalse(self.sup.process_inbox()[-1]["ok"], "the gate binding still applies")
+        self.sup.enqueue_command({**base, "request_id": "req-free-ok", "custom_answer": True})
+        self.assertTrue(self.sup.process_inbox()[-1]["ok"])
+        self.assertEqual(self.state()["continuation"]["note"], "my own answer")
+
+    def test_text_mode_question_also_offers_the_custom_answer_button(self) -> None:
+        self.write_plan()
+        self.start_gated([{"v2": ("plan", "human", "generic_question", str(self.question_payload(answer_mode="text")))}])
+        self.bridge.deliver_outbox()
+        card = self.api.sent[-1]
+        labels = [b["text"] for row in card["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual(labels, ["Custom answer", "Request Revision", "Ask agent"])
+        self.assertIn("tap Custom answer", card["text"])
 
 
 class ApprovalPrecheckTests(TelegramCase):
