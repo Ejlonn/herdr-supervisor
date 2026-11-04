@@ -1218,6 +1218,8 @@ class Bridge:
         action = "revise" if intent.get("kind") == "revise" else "answer"
         command = {"request_id": self.request_id_for(update_id), "action": action, "run_id": intent.get("run_id"), "gate_id": intent.get("gate_id"), "expected_state": intent.get("expected_state"), "actor": f"telegram:{user_id}", "chat_id": chat_id, "source": "telegram", "created_at": hs.iso_utc(self.clock())}
         command["note" if action == "revise" else "answer"] = text
+        if action == "answer" and intent.get("custom") is True:
+            command["custom_answer"] = True  # explicit owner free text for a choice-mode question; plain choices stay allowlisted
         return self._enqueue_or_shadow(command, chat_id, f"{action} via reply")
 
     # ----- callbacks (opaque one-time tokens)
@@ -1367,6 +1369,12 @@ class Bridge:
             self._ack(callback_id, "Reply with the revision note.")
             self.safe_send(chat_id, "Reply with the revision note (one message), or /revise <note>. This voids the current result; the agent must produce a replacement.")
             return {"callback": "revise_intent"}
+        if action == "answer_custom":
+            self._consume(record_path, record)
+            self._set_intent(chat_id, {"kind": "answer", "custom": True, "run_id": record["run_id"], "gate_id": record["gate_id"], "expected_state": record["expected_state"]})
+            self._ack(callback_id, "Reply with your answer.")
+            self.safe_send(chat_id, "Reply with your custom answer (one message). It answers the pending question as written; it does not revise or void anything.")
+            return {"callback": "answer_custom_intent"}
         if action == "ask_agent":
             self._consume(record_path, record)
             binding = self._followup_binding(self._state())
@@ -1510,7 +1518,7 @@ class Bridge:
             if record.get("action") == "retry_followup_response" and (followup.get("reread_attempts") or not followup.get("delivery_uncertain")):
                 return "The one-time reread is not available; return to the decision or request a revision."
             return None
-        if followup is not None and record.get("action") in ("approve", "reject", "answer", "revise", "done", "defer_handoff", "retry_routing_result", "repair_gate", "ask_agent"):
+        if followup is not None and record.get("action") in ("approve", "reject", "answer", "answer_custom", "revise", "done", "defer_handoff", "retry_routing_result", "repair_gate", "ask_agent"):
             return "A question to the agent is in flight; wait for the answer or return to the decision."
         if record.get("action") in ("owner_recovery_preview", "owner_recovery_apply"):
             recovery = state.get("owner_recovery")

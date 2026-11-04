@@ -499,11 +499,16 @@ def render_question(gate: dict[str, Any], tz: str) -> Rendered:
         lines += ["", esc(f.get("context"), limit=400)]
     keyboard: list[list[tuple[str, str, dict[str, Any]]]] = []
     if f.get("answer_mode") == "choice":
-        keyboard = [[(str(choice)[:40], "answer", {"choice": choice})] for choice in (f.get("choices") or [])[:4]]
-        lines.append("")
-        lines.append("Pick one below. The task waits until you answer.")
+        # A button shows only a few words, so every option is listed in full in the message body and the
+        # buttons are compact numbers; all options (at most 10, each at most 80 characters) are offered.
+        choices = [str(choice) for choice in (f.get("choices") or [])]
+        lines += ["", "Options:"] + [f"{number}. {esc(choice, limit=80)}" for number, choice in enumerate(choices, 1)]
+        numbered = [(str(number), "answer", {"choice": choice}) for number, choice in enumerate(choices, 1)]
+        keyboard = [numbered[start:start + 4] for start in range(0, len(numbered), 4)]
+        lines += ["", "Pick one below, or tap Custom answer to write your own. The task waits until you answer."]
     else:
-        lines += ["", f"Reply with /answer &lt;text&gt; (max {esc(f.get('max_answer_chars'))} chars). The task waits until you answer."]
+        lines += ["", f"Reply with /answer &lt;text&gt; (max {esc(f.get('max_answer_chars'))} chars), or tap Custom answer and reply. The task waits until you answer."]
+    keyboard.append([("Custom answer", "answer_custom", {})])
     keyboard.append([("Request Revision", "revise", {}), ("Ask agent", "ask_agent", {"decision_id": gate.get("gate_id")})])
     return Rendered("\n".join(lines), keyboard=keyboard)
 
