@@ -388,6 +388,32 @@ class ConfirmationTests(UploadCase):
         self.bridge.deliver_outbox()
         self.assertIn("Task start accepted", "\n".join(self.texts()))
 
+    def test_immediate_worker_interleaving_keeps_upload_receipt_and_final_status(self) -> None:
+        upload_id = self.upload(145)["upload_id"]
+        buttons = self.buttons()
+        self.bridge.handle_update(callback(146, buttons["Start Task"]))
+        original = self.bridge.enqueuer.enqueue_command
+        results: list[dict] = []
+        seen: list[str] = []
+
+        def publish(command):
+            seen.append(self.meta(upload_id)["status"])  # receipt is durable before the command is visible
+            path = original(command)
+            results.extend(self.sup.process_inbox())
+            return path
+
+        self.bridge.enqueuer.enqueue_command = publish
+        self.write_plan()
+        self.herdr.responses = [{"v2": ("plan", "human", "plan_approval", str(self.plan_payload()))}]
+        result = self.choose_reset_budget(147)
+        self.assertEqual(result["result"], "enqueued")
+        self.assertEqual(seen, ["start_enqueued"])
+        self.assertTrue(results[0]["ok"], results[0])
+        meta = self.meta(upload_id)
+        self.assertEqual(meta["status"], "started", "the bridge must not downgrade the worker's final status")
+        self.assertEqual(meta["run_id"], results[0]["run_id"])
+        self.assertEqual(self.pending_inbox(), [])
+
     def test_task_file_command_with_wrong_hash_or_outside_inbox_is_refused_by_worker(self) -> None:
         upload_id = self.upload(150)["upload_id"]
         path = str(self.paths.task_files_dir / f"{upload_id}.md")
