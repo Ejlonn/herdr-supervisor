@@ -8,6 +8,11 @@ The current candidate version is **0.3.0-beta.1**. Beta status does not relax au
 
 ## Capabilities
 
+Optional [shared Claude/Codex helpers](docs/SUBAGENTS.md) support both application
+repositories and Supervisor tasks through an explicit verified checkout. Their
+definitions and opt-in sync tool are included; setup preserves native sessions
+and does not enable delegation globally.
+
 - Durable Claude/Codex workflows with native session preservation
 - Deterministic lifecycle orchestration and token-free quota waiting
 - Five-hour and weekly quota handling with safe, periodic non-LLM rechecks
@@ -88,14 +93,14 @@ editing configuration or restarting never changes an active run's meaning. Two p
   report or direct task is not forced through it), and `done` is accepted once nothing pending — no
   gate, no uncertain delivery, no quota/reset recovery, no declared runtime/push obligation — blocks it.
   A voluntary plan gate accepts any safe Markdown artifact below the review root, not only `CODEX_PLAN.md`.
-- **`gated_v2`** — Prospera's strict procedure, unchanged: Codex starts, an unchanged `CODEX_PLAN.md`
+- **`gated_v2`** — the strict gated procedure: Codex starts, an unchanged `CODEX_PLAN.md`
   must be approved before Claude implements or the task completes, and every rule below is exactly as
   documented for it today.
 
 Both use the same typed-gate protocol, session-identity, delivery-certainty, quota/reset-recovery, and
 one-time-callback safety machinery; only the workflow procedure differs. `--policy` selects it explicitly;
 without it the CLI uses `default_workflow_policy` from configuration (`supervised_v2` unless a workspace
-sets it otherwise — Prospera's local configuration sets `gated_v2`). Telegram's task-start card shows a
+sets it otherwise, for example by selecting `gated_v2`). Telegram's task-start card shows a
 **Workflow: Supervised / Plan approval** choice bound to that pending task before Start; a stale or
 mismatched selection fails closed.
 
