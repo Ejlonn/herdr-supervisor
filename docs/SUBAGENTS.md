@@ -7,7 +7,8 @@ verified checkout and any context/changelog paths for each task.
 
 | Provider | Role | Model | Purpose |
 |---|---|---|---|
-| Codex | `repository_explorer` | `gpt-6-luna`, high | Read-only code/architecture evidence |
+| Codex | `repository_explorer` | `gpt-6-luna`, max | Read-only code/architecture evidence |
+| Codex | `repository_reviewer` | `gpt-6.1-sol`, high | Optional second pass over a stable scoped diff |
 | Claude | `repository-tracer` | Haiku | Read-only code-path tracing |
 | Claude | `repository-test-runner` | Haiku | Run exactly the supplied bounded test commands |
 | Claude | `repository-diff-auditor` | Sonnet | Reconcile the diff with the supplied task changelog |
@@ -39,7 +40,7 @@ restart anything. Wheel installation alone does not install these definitions.
 The script requires Bash, GNU `realpath`/`mv` and Python 3.11+ for Codex TOML
 parsing. Defaults are relative to the script, independent of the caller's cwd.
 `--src` can select another reviewed inventory. Codex requires an explicit
-destination and accepts only `repository_explorer`. The script checks source
+destination and accepts only `repository_explorer` and `repository_reviewer`. The script checks source
 names/metadata, conflicts, `..` components, symlink ancestry and non-regular
 targets before any write. Publication is atomic per file; this is not a
 multi-file filesystem transaction. Dry-run creates nothing, unrelated files are
@@ -72,9 +73,16 @@ catalog; never restart or replace another conversation automatically. Repository
 and human delegation policy remains authoritative. These files do not enable
 delegation globally or change a model's sandbox/permissions.
 
-An authorized Codex parent selects `agent_type=repository_explorer` with
-`fork_turns=none` and no model override. The role fixes its model/effort. Await
+An authorized Codex parent selects `agent_type=repository_explorer` for tracing
+or `agent_type=repository_reviewer` for a useful independent review question,
+with `fork_turns=none` and no model override. Each role fixes its model/effort. Await
 the exact child's successful completion and final handback before routing.
+
+Use the reviewer only after the supplied diff is stable and a concrete second
+perspective can affect the outcome. It returns bounded findings with evidence,
+not an approval or a substitute for the parent's verification. Do not edit the
+reviewed checkout while it is running. Explorer Max increases the available
+reasoning effort; it does not guarantee a better answer on every task.
 
 Controller-specific role inventories, concurrency/spend limits and lifecycle
 evidence requirements remain authoritative. An installed controller may refuse

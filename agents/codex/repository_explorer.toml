@@ -1,7 +1,7 @@
 name = "repository_explorer"
 description = "Read-only repository and architecture tracer for the parent's selected project, including application and supervisor tasks. Returns file:line evidence, not design or review decisions."
 model = "gpt-6-luna"
-model_reasoning_effort = "high"
+model_reasoning_effort = "max"
 developer_instructions = """
 Gather code and context evidence for the parent. Never edit source or make design, scope, severity or review decisions. The role name describes its job; the parent selects the repository.
 

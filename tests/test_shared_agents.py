@@ -166,7 +166,11 @@ class SharedAgentTests(unittest.TestCase):
 
     def test_names_models_and_checkout_contract_are_stable_and_repository_neutral(self) -> None:
         role = tomllib.loads((ROOT / "agents/codex/repository_explorer.toml").read_text())
-        self.assertEqual((role["name"], role["model"], role["model_reasoning_effort"]), ("repository_explorer", "gpt-6-luna", "high"))
+        self.assertEqual((role["name"], role["model"], role["model_reasoning_effort"]), ("repository_explorer", "gpt-6-luna", "max"))
+        reviewer = tomllib.loads((ROOT / "agents/codex/repository_reviewer.toml").read_text())
+        self.assertEqual((reviewer["name"], reviewer["model"], reviewer["model_reasoning_effort"]), ("repository_reviewer", "gpt-6.1-sol", "high"))
+        self.assertIn("CHECKOUT=<absolute path>", reviewer["developer_instructions"])
+        self.assertIn("never claim the code is approved", reviewer["developer_instructions"])
         models = {"repository-tracer": "haiku", "repository-test-runner": "haiku", "repository-diff-auditor": "sonnet"}
         for path in (ROOT / "agents/claude").glob("*.md"):
             text = path.read_text()

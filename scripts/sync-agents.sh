@@ -5,7 +5,7 @@
 # Dry-run writes nothing. Changed installed bytes require --update. Never deletes roles.
 # Symlink ancestry/targets and non-regular targets refuse for both providers.
 # All source validation/conflict checks precede writes; publication is atomic per file.
-# Codex selects only repository_explorer and requires an explicit destination.
+# Codex selects only the explicit helper inventory and requires a destination.
 set -euo pipefail
 
 package_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -26,7 +26,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-approved_codex_roles="repository_explorer"      # the approved initial inventory; adding a role is a separate, reviewed decision
+approved_codex_roles="repository_explorer repository_reviewer"
 case "$provider" in
     claude)
         [ -n "$src" ] || src="$package_root/agents/claude"
