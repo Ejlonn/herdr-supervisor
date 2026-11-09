@@ -98,10 +98,16 @@ jobs:
         run: |
           python -m venv /tmp/wheelenv
           /tmp/wheelenv/bin/pip install --no-cache-dir dist/*.whl
-          for ep in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker herdr-quota-dependency; do HOME="$(mktemp -d)" /tmp/wheelenv/bin/$ep --help > /dev/null; done
+          for ep in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker herdr-quota-dependency herdr-setup; do HOME="$(mktemp -d)" /tmp/wheelenv/bin/$ep --help > /dev/null; done
       - name: Installer dry run in an isolated HOME
         run: |
           export HOME="$(mktemp -d)"; mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/herdr"; chmod +x "$HOME/.local/bin/herdr"
           ./install.sh --dry-run
+      - name: Real systemd-analyze verification of the shipped units (isolated runtime directory)
+        run: |
+          export HOME="$(mktemp -d)"; export XDG_RUNTIME_DIR="$(mktemp -d)"; chmod 700 "$XDG_RUNTIME_DIR"
+          mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
+          cp bin/* "$HOME/.local/bin/"; printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/herdr"; chmod +x "$HOME/.local/bin/"*
+          systemd-analyze --user verify systemd/*
       - name: Fixture privacy, version consistency, and secret markers
         run: HOME="$(mktemp -d)" PYTHONPATH=src:tests python -m unittest tests.test_release_checks tests.test_herdr_contract.FixturePrivacyTests tests.test_distribution -v

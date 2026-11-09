@@ -66,6 +66,8 @@ supports `--no-daemon`. Use that option for manual resumes too. Where supported,
 append it to `agents.codex.native_resume_args` in Supervisor's configuration so
 Supervisor-managed recovery uses the same mode.
 
+The launcher `~/.local/bin/herdr-native-identity` resolves the active program generation, so the hook keeps working across updates. A hook that was configured earlier with the old program-directory path (`~/.local/lib/herdr-supervisor/herdr_native_identity.py`) keeps working too: `herdr-setup` maintains that path as a link to the active generation.
+
 To opt in, back up `~/.codex/hooks.json` and merge a single SessionStart command
 into its existing structure (preserve unrelated hooks):
 
@@ -75,7 +77,7 @@ into its existing structure (preserve unrelated hooks):
     "SessionStart": [{
       "hooks": [{
         "type": "command",
-        "command": "python3 \"$HOME/.local/lib/herdr-supervisor/herdr_native_identity.py\"",
+        "command": "\"$HOME/.local/bin/herdr-native-identity\"",
         "timeout": 10
       }]
     }]

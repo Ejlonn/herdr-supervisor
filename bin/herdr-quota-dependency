@@ -1,5 +1,17 @@
 #!/bin/sh
-# Launcher for the explicit herdr-agent-quota dependency check/bootstrap (read-only unless `bootstrap --apply`).
+# herdr-quota-dependency launcher (user-scoped): quota dependency check/bootstrap (read-only unless `bootstrap --apply`).
 set -eu
 LIB="${HERDR_SUPERVISOR_LIB:-$HOME/.local/lib/herdr-supervisor}"
-exec python3 "$LIB/herdr_quota_dependency.py" "$@"
+# Resolve exactly one program generation, once. `active` is the atomic pointer the installer switches with a single
+# rename; a legacy flat layout (no pointer) or an explicit source directory is used as it is.
+if [ -L "$LIB/active" ]; then
+    GEN=$(readlink "$LIB/active")
+    case "$GEN" in
+        *..*|/*|generations/*/*) echo "herdr launcher: the active pointer ($GEN) is not a managed generation" >&2; exit 70 ;;
+        generations/?*) DIR="$LIB/$GEN" ;;
+        *) echo "herdr launcher: the active pointer ($GEN) is not a managed generation" >&2; exit 70 ;;
+    esac
+else
+    DIR="$LIB"
+fi
+exec python3 "$DIR/herdr_quota_dependency.py" "$@"

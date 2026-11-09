@@ -26,7 +26,7 @@ It is not another AI agent, an API-model router, a provider-quota bypass, or a t
 
 - Linux with Python 3.11 or newer; release validation is performed on Python 3.13
 - Herdr 0.9.0 or newer installed user-scoped with its executable at `~/.local/bin/herdr`; the installer checks this before writing anything, and the headless server unit runs that path. 0.9.0 is the minimum tested CLI contract; `herdr-supervisor doctor` reports the detected version and probes the required commands/options read-only, so a newer version passes only while that contract holds
-- The Herdr plugin [`herdr-agent-quota`](https://github.com/Ejlonn/herdr-agent-quota), pinned to one exact revision (manifest 1.5.4; MIT, originally by Levi Qiao and now maintained upstream at `praxstack/herdr-agent-quota`): it writes the five-hour, weekly, and context quota snapshots the supervisor reads, and provides the non-LLM `refresh` action used to recheck model quota without waking a model. A fresh machine checks it with `herdr-quota-dependency check` and stages it with `herdr-quota-dependency bootstrap` (a dry run unless `--apply`); the supervisor installer never installs, links, or configures it, and the pinned source can be verified from a local recovery archive when the repository is unreachable. See [Quota plugin dependency](docs/QUOTA_DEPENDENCY.md)
+- The Herdr plugin [`herdr-agent-quota`](https://github.com/Ejlonn/herdr-agent-quota), pinned to one exact revision (manifest 1.5.4; MIT, originally by Levi Qiao and now maintained upstream at `praxstack/herdr-agent-quota`): it writes the five-hour, weekly, and context quota snapshots the supervisor reads, and provides the non-LLM `refresh` action used to recheck model quota without waking a model. A fresh machine checks it with `herdr-quota-dependency check` and stages it with `herdr-quota-dependency bootstrap` (a dry run unless `--apply`); the minimal installer never installs, links, or configures it (the opt-in full profile of `herdr-setup` stages, links and enables the exact pinned revision after a preview and your approval, and never runs the plugin's hook-editing `configure` action), and the pinned source can be verified from a local recovery archive when the repository is unreachable. See [Quota plugin dependency](docs/QUOTA_DEPENDENCY.md)
 - Codex and Claude CLIs with persistent sessions managed through Herdr; the optional Codex banked-reset feature additionally uses Codex's supported app-server reset-credit interface, which is separate from the quota plugin
 - User systemd for detached workers and optional services
 - Per feature, optional: outbound HTTPS to `api.telegram.org:443` (Telegram control), `git` (Git recovery assessment), `ssh` and `rsync` (SSH snapshot backups)
@@ -48,7 +48,7 @@ herdr plugin log list --plugin ejlonn.herdr-supervisor
 herdr-supervisor doctor
 ```
 
-The first command registers the plugin and its actions. The explicit, asynchronous `setup` action then runs the same reviewed, user-scoped installer described below; check its command log before running `doctor`. It copies files and installs disabled unit definitions, but does not enable, start, reload, or restart services. After a marketplace update, invoke `setup` again to update the installed Supervisor files.
+The first command registers the plugin and its actions. The explicit, asynchronous `setup` action then runs the same reviewed, user-scoped **minimal** installer described below; check its command log before running `doctor`. It installs the program files and disabled unit definitions, but does not enable, start, reload, or restart services, and it refuses (instead of overwriting) an existing different or legacy installation. Asynchronous actions cannot prompt for secrets, so Telegram and the other guided steps are not part of `setup`: the read-only `setup-preview` and `update-preview` actions show what `herdr-setup` would do (including which steps remain yours), and credential entry stays in the protected `herdr-setup`/`herdr-telegram` command-line flow. After a marketplace update, invoke `update-preview`, review it, then apply it from a terminal with `herdr-setup update --payload <the updated plugin checkout>` (see [Installation](docs/INSTALL.md)).
 
 To remove a marketplace installation, first invoke `ejlonn.herdr-supervisor.uninstall` so the guarded uninstaller can verify that services are inactive and preserve configuration and state; then run `herdr plugin uninstall ejlonn.herdr-supervisor` to unregister the plugin checkout.
 
@@ -62,7 +62,18 @@ cd herdr-supervisor
 herdr-supervisor doctor
 ```
 
-The installer copies reviewed files into user-scoped paths, creates restrictive directories, and installs disabled unit definitions. It does not enable, start, reload, or restart services. Existing config, tokens, and state are preserved.
+The installer publishes the reviewed program files as one immutable generation behind a single atomic pointer, installs launchers, documents and disabled unit definitions in user-scoped paths, and creates restrictive directories. It does not enable, start, reload, or restart services. Existing config, tokens, and state are preserved, and an existing different or legacy installation is refused rather than overwritten.
+
+For guided setup, safe updates and rollback use `herdr-setup` (every operation previews first, writes nothing until you apply an approval hash that is bound to the exact candidate, options, target and files it would change):
+
+```sh
+herdr-setup status                                   # what is installed, what is active now, what remains for you
+herdr-setup setup --profile full                     # preview the guided setup (Telegram, quota plugin, optional services)
+herdr-setup update --payload /path/to/new/checkout   # preview an update; --apply --plan FILE --approve HASH to apply
+herdr-setup rollback                                 # preview undoing the last operation
+```
+
+Platform prerequisites stay yours and are guided, not performed: Linux, Python 3.11+, Herdr, the Codex and Claude CLIs and their logins, a Telegram bot token, and your choice of existing sessions. See [Installation, update and rollback](docs/INSTALL.md).
 
 Before the first task, confirm the quota plugin the supervisor depends on. The check is read-only and works for any project, not only the one the supervisor was developed in:
 
