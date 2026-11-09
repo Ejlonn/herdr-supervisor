@@ -128,22 +128,59 @@ class FullApplyTests(FullCase):
         self.assertGreaterEqual(len(self.quota.calls), quota_calls)
         self.assertIn(code, (0, hi.EXIT_ACTION))
 
-    def test_everything_installed_and_present_reports_ready_only_when_every_check_passes(self) -> None:
-        self.host.agents = [{"name": "codex-main", "agent": "codex"}, {"name": "claude-main", "agent": "claude"}]
+    def ready_fixture(self, *, server_unit: bool = True, linger: str = "yes", enabled: str = "enabled") -> None:
+        """A system where everything a full setup configures is genuinely in place: exact live identities, running watcher and bridge."""
+        codex, claude = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+        self.host.agents = [{"name": "codex-main", "agent": "codex", "pane_id": "w1:p1", "agent_session": {"value": codex}},
+                            {"name": "claude-main", "agent": "claude", "pane_id": "w1:p2", "agent_session": {"value": claude}}]
         self.quota.state = {"state": "pinned", "detail": "installed at the locked revision", "enabled": True, "action": "none"}
         self.quota.fresh = True
         owners = self.layout.paths.owners_file
         owners.parent.mkdir(parents=True, exist_ok=True)
-        owners.write_text(json.dumps({"codex": {"pane_id": "w1:p1", "session_id": "s"}, "claude": {"pane_id": "w1:p2", "session_id": "t"}}))
-        self.host.linger = "yes"
+        owners.write_text(json.dumps({"codex": {"pane_id": "w1:p1", "session_id": codex}, "claude": {"pane_id": "w1:p2", "session_id": claude}}))
+        self.host.linger = linger
         code, out, err = self.full(*self.selected(), "--project-root", str(self.project), "--services", "worker,telegram", apply=True)
+        self.assertIn(code, (0, hi.EXIT_ACTION), out + err)
         for unit in ("herdr-supervisor-worker.path", "herdr-telegram.service"):
             self.assertEqual(self.host.active.get(unit), "active")
-        self.assertEqual(code, 0, out + err)
-        self.assertIn("Status: READY", out)
-        self.assertIn("[OK] reboot-persistence", out)
-        self.assertIn("[NOT_VERIFIED] telegram-network", out, "READY covers local checks only; the unproven network health is listed, not hidden")
+            self.host.enabled_units[unit] = enabled
+        if server_unit:
+            self.host.enabled_units["herdr-server.service"] = "enabled"
+
+    def status(self) -> dict[str, Any]:
+        return json.loads(self.run_tool("--json", "status", adapters=self.adapters(self.quota))[1])  # type: ignore[no-any-return]
+
+    def test_everything_installed_and_present_reports_ready_only_when_every_check_passes(self) -> None:
+        self.ready_fixture()
+        report = self.status()
+        items = {item["id"]: item["status"] for item in report["items"]}
+        self.assertEqual(report["overall"], "READY", items)
+        self.assertEqual((items["sessions"], items["herdr-server"], items["service-chain"], items["reboot-persistence"], items["telegram-network"]), ("OK", "OK", "OK", "OK", "NOT_VERIFIED"),
+                         "READY covers local checks only; the unproven network health is listed, not hidden")
         self.assertFalse([call for call in self.host.calls if Path(call[0]).name == "herdr" and call[1:2] == ["plugin"] and call[2:3] == ["action"]])
+
+    def test_an_interactive_only_server_is_ready_now_but_not_reboot_persistent(self) -> None:
+        self.ready_fixture(server_unit=False)
+        report = self.status()
+        self.assertEqual(report["overall"], "READY_NOW")
+        item = next(item for item in report["items"] if item["id"] == "reboot-persistence")
+        self.assertEqual(item["status"], "ACTION_REQUIRED")
+        self.assertIn("headless Herdr server unit enabled: False", item["detail"])
+        self.assertIn("interactive Herdr is usable now but is not reboot-persistent", item["action"])
+        self.assertFalse([call for call in self.host.service_calls() if call[2] == "start" and "server" in call[3]], "status never starts another server")
+
+    def test_runtime_only_enablement_is_not_persistence(self) -> None:
+        self.ready_fixture(enabled="enabled-runtime")
+        report = self.status()
+        self.assertEqual(report["overall"], "READY_NOW")
+        self.assertFalse(report["boot"]["enabled_units"])
+
+    def test_missing_boot_dependencies_are_each_reported(self) -> None:
+        self.ready_fixture(linger="no")
+        report = self.status()
+        item = next(item for item in report["items"] if item["id"] == "reboot-persistence")
+        self.assertEqual((report["overall"], item["status"]), ("READY_NOW", "ACTION_REQUIRED"))
+        self.assertIn("linger: disabled", item["detail"])
 
     def test_missing_platform_prerequisites_are_guided_not_installed(self) -> None:
         self.host.present.clear()
@@ -545,6 +582,16 @@ class RealQuotaAdapterTests(FullCase):
         self.qenv = QuotaEnv(self)
         self.herdr_fixture = str(self.qenv.fake_bin / "herdr")
         os.environ["PATH"] = f"{self.qenv.fake_bin}:/usr/bin:/bin"
+        self.host.plugin_hook = self.follow_inventory
+
+    def follow_inventory(self, verb: str, argv: list[str]) -> None:
+        """The fixture inventory follows the plugin commands the way a real Herdr's would (link --disabled, then enable)."""
+        if verb == "link":
+            self.qenv.set_inventory(mutate=lambda plugins: plugins[0].update(source={"kind": "local"}, plugin_root=argv[-1], enabled=False, version="1.5.4", plugin_id="herdr-agent-quota"))
+        else:
+            data = json.loads(self.qenv.inventory.read_text())
+            data["result"]["plugins"][0]["enabled"] = True
+            self.qenv.inventory.write_text(json.dumps(data))
 
     def real_adapters(self) -> hsetup.Adapters:
         options = {"quota": {"lock": str(self.qenv.lock_path), "archive": str(self.qenv.archive_path)}}
@@ -563,7 +610,7 @@ class RealQuotaAdapterTests(FullCase):
         self.assertIn(code, (0, hi.EXIT_ACTION), out + err)
         staged = stage / f"herdr-agent-quota-{self.qenv.revision[:12]}"
         self.assertTrue(staged.is_dir() and (stage / "BOOTSTRAP_RECEIPT.json").is_file())
-        plugin = [call[1:] for call in self.host.calls if Path(call[0]).name == "herdr"]
+        plugin = [call[1:] for call in self.host.calls if Path(call[0]).name == "herdr" and call[1:2] == ["plugin"]]
         self.assertEqual(plugin, [["plugin", "link", "--disabled", str(staged)], ["plugin", "enable", "herdr-agent-quota"]], "exactly the two supported commands, in order")
         calls = self.qenv.calls()
         self.assertTrue(all(line.startswith(("herdr plugin list --json", "cargo", "rustc", "rustup")) for line in calls), calls)

@@ -24,6 +24,7 @@ from herdr_installation import (
     COMPAT_LINKS,
     EXIT_ACTION,
     EXIT_REFUSED,
+    STEP_STATES,
     UNIT_FOR_SERVICE,
     Asset,
     DeployLock,
@@ -46,16 +47,20 @@ from herdr_installation import (
     ensure_private_dir,
     fsync_dir,
     inspect_install,
+    is_int,
     load_payload,
+    managed_unit_names,
     publish_generation,
     read_active,
     read_bytes_nofollow,
     read_receipt,
     remove_compat_link,
     run_steps,
+    sha256_bytes,
     state_schema_on_disk,
     switch_active,
     tool_identity,
+    validate_backup_manifest,
     verify_generation,
     verify_units,
     version_key,
@@ -63,6 +68,7 @@ from herdr_installation import (
     workload_problems,
     write_file_atomic,
 )
+from herdr_validation import StateStore
 
 PLAN_SCHEMA = 1
 KINDS = ("setup", "update", "rollback")
@@ -126,12 +132,18 @@ def plan_notes_for_directories(env: Env) -> list[str]:
     return notes
 
 
-def _service_plan(env: Env, kind: str, installed_units: set[str], candidate_units: set[str], unit_changes: bool) -> tuple[dict[str, Any], list[str]]:
+def restartable(unit: str) -> bool:
+    """Triggers (path/timer units) and the Telegram long-poll bridge can be stopped and started again without losing work. Any other
+    service (the supervisor, query, reset or backup worker) that is running is executing a bounded job: it is waited for, never killed."""
+    return unit.endswith((".path", ".timer")) or unit == "herdr-telegram.service"
+
+
+def _service_plan(env: Env, kind: str, installed_units: set[str], candidate_units: set[str], unit_changes: bool, *, existing: bool = True) -> tuple[dict[str, Any], list[str]]:
     """Which active units are stopped and restored around a replacement, and whether the manager must be reloaded.
     The headless server unit is never stopped: it hosts the user's native sessions and does not run program files."""
     layout = env.layout
     plan: dict[str, Any] = {"stop": [], "restore": [], "reload": False, "systemd": "not_needed"}
-    if kind == "setup":
+    if kind == "setup" and not existing:
         return plan, []
     present = sorted(unit for unit in installed_units | candidate_units if os.path.lexists(layout.unit / unit))
     if not present:
@@ -146,7 +158,10 @@ def _service_plan(env: Env, kind: str, installed_units: set[str], candidate_unit
         if state in ("activating", "deactivating", "reloading", "refreshing", "unknown"):
             blockers.append(f"{unit} is {state}; wait for it to settle (or establish its state) and retry")
         elif state == "active" and unit != SERVER_UNIT:
-            active.append(unit)
+            if restartable(unit):
+                active.append(unit)
+            else:
+                blockers.append(f"{unit} is running a job; it is not stopped or restarted, so wait for it to finish and retry")
     stoppable = sorted(active, key=lambda unit: (not unit.endswith((".path", ".timer")), unit))  # triggers first, then services
     plan.update(stop=stoppable, restore=list(reversed(stoppable)), reload=unit_changes, systemd="available")
     return plan, blockers
@@ -237,7 +252,8 @@ def plan_installation(env: Env, kind: str, payload: Payload, options: dict[str, 
             if manifest.get("program_id") != payload.program_id:
                 blockers.append(f"version {manifest.get('version')} is already installed; use `herdr-setup update` (setup never replaces an installed release)")
             recorded = _recorded_assets(installed.receipt)
-            previous = {"kind": "generation", "generation_id": installed.active_generation, "version": manifest.get("version"), "state_schema_version": manifest.get("state_schema_version")}
+            previous = {"kind": "generation", "generation_id": installed.active_generation, "program_id": manifest.get("program_id"), "version": manifest.get("version"),
+                        "state_schema_version": manifest.get("state_schema_version")}
         elif installed.layout == "legacy":
             blockers.append("a legacy (flat) installation exists; setup will not copy over it. Preview `herdr-setup update --adopt-legacy-from DIR` with the reviewed tree it was installed from")
         elif installed.layout != "absent":
@@ -248,7 +264,8 @@ def plan_installation(env: Env, kind: str, payload: Payload, options: dict[str, 
         elif installed.layout == "managed":
             recorded = _recorded_assets(installed.receipt)
             manifest = installed.manifest or {}
-            previous = {"kind": "generation", "generation_id": installed.active_generation, "version": manifest.get("version"), "state_schema_version": manifest.get("state_schema_version")}
+            previous = {"kind": "generation", "generation_id": installed.active_generation, "program_id": manifest.get("program_id"), "version": manifest.get("version"),
+                        "state_schema_version": manifest.get("state_schema_version")}
             if version_key(payload.version) < version_key(str(manifest.get("version"))):
                 blockers.append(f"the candidate {payload.version} is older than the installed {manifest.get('version')}; use `herdr-setup rollback` to return to a previous release")
         elif installed.layout == "legacy":
@@ -282,7 +299,8 @@ def plan_installation(env: Env, kind: str, payload: Payload, options: dict[str, 
     unit_changes = any(asset_state(asset) != "applied" for asset in assets if asset.role == "unit") or any(item.get("role") == "unit" for item in removals)
     compat_missing = any(compat_link_state(layout, name) != "ours" for name in COMPAT_LINKS if f"program/{name}" in {item.key for item in payload.files})
     already = installed.layout == "managed" and bool(installed.manifest) and (installed.manifest or {}).get("program_id") == payload.program_id and not changes and not removals and not compat_missing
-    if kind != "setup" and not already:
+    existing = installed.layout == "managed"
+    if (kind != "setup" or existing) and not already:  # one safety rule for every operation that would change an installed system
         blockers += [f"not at a quiet point: {problem}" for problem in workload_problems(layout, probe_lock=not env.worker_lock_held)]
         schema = state_schema_on_disk(layout)
         if schema == -1:
@@ -290,8 +308,10 @@ def plan_installation(env: Env, kind: str, payload: Payload, options: dict[str, 
         elif schema is not None and schema > payload.state_schema_version:
             blockers.append(f"task state has schema {schema}, newer than the candidate supports ({payload.state_schema_version}); it is never downgraded")
     installed_units = {Path(dest).name for dest, item in recorded.items() if item.get("role") == "unit"}
-    services, service_blockers = _service_plan(env, kind, installed_units, unit_assets, unit_changes)
-    if not already:
+    if already:  # a pure no-op asks the user manager nothing
+        services: dict[str, Any] = {"stop": [], "restore": [], "reload": False, "systemd": "not_needed"}
+    else:
+        services, service_blockers = _service_plan(env, kind, installed_units, unit_assets, unit_changes, existing=existing)
         blockers += service_blockers
     notes += plan_notes_for_directories(env)
     sections = {
@@ -318,25 +338,28 @@ def plan_rollback(env: Env, options: dict[str, Any]) -> tuple[dict[str, Any], li
     if not isinstance(previous, dict) or not isinstance(backup_name, str) or not re.fullmatch(r"[0-9a-f]{32}", backup_name):
         blockers.append("the last operation recorded no previous installation to return to")
         return sections, blockers, notes
-    manifest = load_backup_manifest(layout, backup_name)
+    manifest, problem = load_backup_checked(layout, backup_name)
     if manifest is None:
-        blockers.append(f"the backup record for the last operation ({backup_name[:8]}) is missing or unreadable; nothing can be restored safely")
+        blockers.append(f"the backup record for the last operation ({backup_name[:8]}) cannot be used: {problem}; nothing can be restored safely")
         return sections, blockers, notes
+    problems = verify_backup_files(layout, backup_name, manifest)
+    if problems:
+        blockers += problems
+        return sections, blockers, notes
+    sections["backup_identity"] = backup_identity(layout, backup_name, manifest)
     preimages: dict[str, Any] = {}
     target: dict[str, Any] = {"kind": previous.get("kind"), "version": previous.get("version"), "state_schema_version": previous.get("state_schema_version")}
     if previous.get("kind") == "generation":
         gid = previous.get("generation_id")
-        gen_manifest, problems = verify_generation(layout.generations / str(gid), expect_id=str(gid))
+        gen_manifest, problems = verify_generation(layout.generations / str(gid), expect_id=str(gid), expect_program_id=previous.get("program_id"))
         if gen_manifest is None or problems:
             blockers.append(f"the previous generation {gid} is missing or does not verify: {'; '.join(problems)}")
         else:
             target.update(generation_id=gid, program_id=gen_manifest.get("program_id"), version=gen_manifest.get("version"), state_schema_version=gen_manifest.get("state_schema_version"))
     elif previous.get("kind") == "legacy":
         legacy = manifest.get("legacy_lib") or {}
-        problems = verify_backup_files(layout, backup_name, manifest)
         if not legacy.get("files"):
             blockers.append("the backup holds no legacy program files")
-        blockers += problems
         target["legacy_files"] = legacy.get("files")
     else:
         blockers.append("the recorded previous installation is of an unknown kind")
@@ -364,9 +387,12 @@ def plan_rollback(env: Env, options: dict[str, Any]) -> tuple[dict[str, Any], li
     unit_dests = {entry["dest"] for entry in manifest.get("entries", []) if entry.get("role") == "unit"}
     units_now = {Path(dest).name for dest in unit_dests}
     services, service_blockers = _service_plan(env, "rollback", units_now, set(), bool(units_now))
+    if previous.get("kind") == "generation" and not is_hex_id(previous.get("program_id")):
+        blockers.append("the receipt records no program identity for the previous generation, so it cannot be anchored")
     blockers += service_blockers
     sections.update(candidate=target, backup=backup_name, preimages=preimages, services=services, previous={"kind": "generation", "generation_id": installed.active_generation,
-                    "version": (installed.manifest or {}).get("version"), "state_schema_version": (installed.manifest or {}).get("state_schema_version")},
+                    "program_id": (installed.manifest or {}).get("program_id"), "version": (installed.manifest or {}).get("version"),
+                    "state_schema_version": (installed.manifest or {}).get("state_schema_version")},
                     assets=[], removals=[], legacy_program_files=None)
     return sections, blockers, notes
 
@@ -374,22 +400,38 @@ def plan_rollback(env: Env, options: dict[str, Any]) -> tuple[dict[str, Any], li
 # ------------------------------------------------------------------------------------------------ backups
 
 
-def load_backup_manifest(layout: Layout, name: str) -> dict[str, Any] | None:
+def is_hex_id(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def load_backup_checked(layout: Layout, name: str) -> tuple[dict[str, Any] | None, str]:
+    """The backup record with its exact-type schema enforced, or (None, why). The directory and the record must be real, not links."""
+    base = layout.backups / name
     try:
-        value = json.loads(read_bytes_nofollow(layout.backups / name / "manifest.json", 8 * 1024 * 1024))
-    except (OSError, ValueError):
-        return None
-    return value if isinstance(value, dict) and isinstance(value.get("entries"), list) else None
+        info = os.lstat(base)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return None, "the backup directory is not a real directory"
+        value = json.loads(read_bytes_nofollow(base / "manifest.json", 8 * 1024 * 1024))
+        return validate_backup_manifest(layout, name, value), ""
+    except (OSError, ValueError) as error:
+        return None, f"unreadable ({error})"
+    except InstallError as error:
+        return None, str(error)
+
+
+def load_backup_manifest(layout: Layout, name: str) -> dict[str, Any] | None:
+    return load_backup_checked(layout, name)[0]
 
 
 def verify_backup_files(layout: Layout, name: str, manifest: dict[str, Any]) -> list[str]:
+    """Every stored copy is a regular no-follow file at its canonical location beneath THIS backup, and matches its recorded hash."""
     problems: list[str] = []
     base = layout.backups / name
     for entry in manifest.get("entries", []):
-        before = entry.get("before") or {}
-        if before.get("state") == "file":
-            state = describe(base / str(entry.get("file")))
-            if state["state"] != "file" or state["sha256"] != before.get("sha256"):
+        before = entry["before"]
+        if before["state"] == "file":
+            state = describe(base / entry["file"])
+            if state["state"] != "file" or state["sha256"] != before["sha256"]:
                 problems.append(f"backup copy of {entry['dest']} is missing or altered")
     legacy = manifest.get("legacy_lib") or {}
     for fname, digest in (legacy.get("files") or {}).items():
@@ -397,6 +439,12 @@ def verify_backup_files(layout: Layout, name: str, manifest: dict[str, Any]) -> 
         if state["state"] != "file" or state["sha256"] != digest:
             problems.append(f"backup copy of legacy {fname} is missing or altered")
     return problems
+
+
+def backup_identity(layout: Layout, name: str, manifest: dict[str, Any]) -> str:
+    """Hash of the validated backup record together with the content hash of every stored copy: what a rollback approval binds."""
+    copies = {entry["file"]: entry["before"]["sha256"] for entry in manifest["entries"] if entry["before"]["state"] == "file"}
+    return canonical_hash({"manifest": {k: v for k, v in manifest.items() if k != "previous_receipt"}, "copies": copies, "legacy": (manifest.get("legacy_lib") or {}).get("files")})
 
 
 # ------------------------------------------------------------------------------------------------ operation context
@@ -501,7 +549,25 @@ def step_quiesce(ctx: Ctx) -> str:
     return f"stopped {', '.join(stop)}"
 
 
+@contextlib.contextmanager
+def critical(ctx: Ctx) -> Any:
+    """The short window in which files, the pointer or the receipt change. The controller's transaction lock is held and the whole
+    quiet-point predicate is re-evaluated INSIDE it, so work that arrived after planning (a command, a decision, a started job)
+    stops the mutation instead of being overtaken by it. Nothing in the window waits on anything slow."""
+    with StateStore(ctx.layout.paths, ctx.env.clock).transaction():
+        if (ctx.plan.get("installed") or {}).get("layout") != "absent":
+            problems = workload_problems(ctx.layout, probe_lock=False)
+            if problems:
+                raise InstallError("not at a quiet point (work arrived after the plan was approved): " + "; ".join(problems), code=EXIT_REFUSED)
+        yield
+
+
 def step_assets(ctx: Ctx) -> str:
+    with critical(ctx):
+        return _write_assets(ctx)
+
+
+def _write_assets(ctx: Ctx) -> str:
     """Apply every enumerated auxiliary asset. Each is either at its approved preimage or already applied; anything else is drift."""
     changed = 0
     for item in ctx.plan.get("assets", []):
@@ -541,6 +607,11 @@ def step_initial_config(ctx: Ctx) -> str:
 
 
 def step_retire_legacy(ctx: Ctx) -> str:
+    with critical(ctx):
+        return _retire_legacy(ctx)
+
+
+def _retire_legacy(ctx: Ctx) -> str:
     """Remove the legacy flat program files after the generation is active; each must still be exactly the backed-up bytes."""
     removed = 0
     for name, digest in sorted((ctx.plan.get("legacy_program_files") or {}).items()):
@@ -569,7 +640,8 @@ def step_reload(ctx: Ctx) -> str:
 
 def step_switch(ctx: Ctx) -> str:
     gid = ctx.plan["candidate"]["generation_id"]
-    switch_active(ctx.env, gid, ctx.operation_id[:12])
+    with critical(ctx):
+        switch_active(ctx.env, gid, ctx.operation_id[:12])
     return f"active generation {gid}"
 
 
@@ -580,7 +652,7 @@ def build_receipt(ctx: Ctx) -> dict[str, Any]:
         "version": candidate.get("version"), "generation_id": candidate.get("generation_id"), "program_id": candidate.get("program_id"), "payload_id": candidate.get("payload_id"),
         "state_schema_version": candidate.get("state_schema_version"), "source": candidate.get("source"), "previous": ctx.plan.get("previous"),
         "assets": ctx.plan.get("receipt_assets", ctx.plan.get("assets", [])), "services": {"stopped": ctx.plan["services"]["stop"], "restored": ctx.plan["services"]["restore"]},
-        "backup": ctx.operation_id, "options": ctx.plan.get("options"),
+        "backup": ctx.operation_id, "options": ctx.plan.get("options"), "payload_root": ctx.plan.get("payload_root"),
     }
 
 
@@ -669,7 +741,10 @@ def restore_entries(ctx: Ctx, backup_name: str, manifest: dict[str, Any]) -> int
         at_result = (current["state"] == "absent") if after is None else (current["state"] == "file" and current["sha256"] == after["sha256"])
         if not at_result:
             raise InstallError(f"{dest} changed; the restore stopped without overwriting it", code=EXIT_REFUSED)
-        write_file_atomic(dest, read_bytes_nofollow(base / str(entry["file"])), int(before["mode"]))
+        data = read_bytes_nofollow(base / entry["file"])
+        if sha256_bytes(data) != before["sha256"]:
+            raise InstallError(f"the backup copy of {dest} no longer matches its recorded hash; it was not written", code=EXIT_REFUSED)
+        write_file_atomic(dest, data, int(before["mode"]))
         restored += 1
     return restored
 
@@ -682,10 +757,18 @@ def step_restore_assets(ctx: Ctx) -> str:
     problems = verify_backup_files(ctx.layout, name, manifest)
     if problems:
         raise InstallError("; ".join(problems))
-    return f"{restore_entries(ctx, name, manifest)} assets restored"
+    if backup_identity(ctx.layout, name, manifest) != ctx.plan.get("backup_identity"):
+        raise InstallError("the backup changed after the rollback was approved; nothing was restored", code=EXIT_REFUSED)
+    with critical(ctx):
+        return f"{restore_entries(ctx, name, manifest)} assets restored"
 
 
 def step_restore_pointer(ctx: Ctx) -> str:
+    with critical(ctx):
+        return _restore_pointer(ctx)
+
+
+def _restore_pointer(ctx: Ctx) -> str:
     target = ctx.plan["candidate"]
     if target.get("kind") == "legacy":
         for name in COMPAT_LINKS:
@@ -724,15 +807,17 @@ def step_rollback_receipt(ctx: Ctx) -> str:
 def step_verify_rollback(ctx: Ctx) -> str:
     target = ctx.plan["candidate"]
     if target.get("kind") != "legacy":
-        manifest, problems = verify_generation(ctx.layout.generations / str(target["generation_id"]), expect_id=str(target["generation_id"]))
+        manifest, problems = verify_generation(ctx.layout.generations / str(target["generation_id"]), expect_id=str(target["generation_id"]), expect_program_id=target.get("program_id"))
         if manifest is None or problems:
             raise InstallError("the previous generation does not verify: " + "; ".join(problems))
-    backup = load_backup_manifest(ctx.layout, ctx.plan["backup"])
+    backup, why = load_backup_checked(ctx.layout, ctx.plan["backup"])
     if backup is None:
-        raise InstallError("the backup record is missing")
+        raise InstallError(f"the backup record cannot be used: {why}")
     problems = verify_backup_files(ctx.layout, ctx.plan["backup"], backup)
     if problems:
         raise InstallError("; ".join(problems))
+    if backup_identity(ctx.layout, ctx.plan["backup"], backup) != ctx.plan.get("backup_identity"):
+        raise InstallError("the backup changed after the rollback was approved", code=EXIT_REFUSED)
     return "previous release and backups verified"
 
 
@@ -746,10 +831,11 @@ def step_rollback_backup(ctx: Ctx) -> str:
     assert old is not None
     for directory in (ctx.layout.backups, base, base / "files"):
         ensure_private_dir(directory)
-    entries = []
-    for index, entry in enumerate(old["entries"]):
+    entries: list[dict[str, Any]] = []
+    for entry in old["entries"]:
         if entry.get("role") == "config":
             continue
+        index = len(entries)
         before = describe(Path(entry["dest"]))
         file_name = None
         if before["state"] == "file":
@@ -853,7 +939,7 @@ def revert_failed_update(ctx: Ctx) -> str | None:
                 core.atomic_write_json(ctx.layout.receipt, prior, mode=0o600)
         else:
             plan = {"candidate": {"kind": "legacy", "legacy_files": (manifest.get("legacy_lib") or {}).get("files")}, "backup": ctx.operation_id}
-            step_restore_pointer(dataclasses.replace(ctx, plan=plan))
+            _restore_pointer(dataclasses.replace(ctx, plan=plan))
         if ctx.plan["services"]["reload"]:
             Systemd(ctx.env.host).act("daemon-reload")
         for unit in ctx.plan["services"]["restore"]:
@@ -889,6 +975,92 @@ def archive_reverted(layout: Layout, operation_id: str, clock: Callable[[], floa
             os.rename(path, path.with_name(path.name + suffix))
 
 
+def _journal_binding_problem(journal: Journal, operation_id: str, kind: str, approval_hash: str, *, complete: bool = False) -> str | None:
+    """A journal is authority only when it is bound to exactly this approval: identity, kind, plan hash, and a well-formed step list.
+    A completion marker is trusted only when every step is recorded DONE."""
+    data = journal.data
+    if not is_int(data.get("schema")) or data["schema"] != 1:
+        return "an unsupported schema"
+    if data.get("operation_id") != operation_id or data.get("kind") != kind or data.get("approval_hash") != approval_hash:
+        return "another operation's identity"
+    plan = data.get("plan")
+    if not isinstance(plan, dict) or canonical_hash(plan) != approval_hash:
+        return "a plan that does not match the approval"
+    steps = data.get("steps")
+    if not isinstance(steps, list) or not steps or any(not isinstance(item, dict) or not isinstance(item.get("id"), str) or item.get("status") not in STEP_STATES for item in steps):
+        return "a malformed step list"
+    if len({item["id"] for item in steps}) != len(steps):
+        return "duplicate steps"
+    if complete and (data.get("status") != "COMPLETE" or any(item["status"] != "DONE" for item in steps)):
+        return "a completion marker without every step recorded done"
+    return None
+
+
+_IMMUTABLE_KEYS = ("kind", "tool", "target", "options", "payload_root", "candidate", "dependency")
+
+
+def _resume_problems(env: Env, kind: str, plan_data: dict[str, Any], current: Plan, operation_id: str) -> list[str]:
+    """Why an interrupted operation may not simply continue. The enforcing tool, target, options, candidate and dependency are the
+    approved ones and cannot move; what the operation itself already changed (its own assets, pointer, receipt) is accepted only
+    when it matches its recorded preimage or planned result; any other drift, a newly running unit, or newly arrived work refuses
+    before another side effect."""
+    layout = env.layout
+    problems: list[str] = []
+    keys = ("kind", "tool", "target", "options") if kind == "rollback" else _IMMUTABLE_KEYS
+    for key in keys:
+        if current.data.get(key) != plan_data.get(key):
+            problems.append(f"{key} changed since the approval")
+    preimages = plan_data.get("preimages") or {}
+    for item in plan_data.get("assets") or []:
+        found = describe(Path(item["dest"]))
+        applied = found.get("state") == "file" and found.get("sha256") == item["sha256"] and found.get("mode") == item["mode"]
+        if not applied and found != preimages.get(item["dest"], {"state": "absent"}):
+            problems.append(f"{item['dest']} was changed outside this operation")
+    for item in plan_data.get("removals") or []:
+        found = describe(Path(item["dest"]))
+        if found.get("state") != "absent" and found != preimages.get(item["dest"]):
+            problems.append(f"{item['dest']} was changed outside this operation")
+    if kind == "rollback":
+        backup, why = load_backup_checked(layout, str(plan_data.get("backup")))
+        if backup is None:
+            problems.append(f"the backup cannot be used: {why}")
+        else:
+            for entry in backup["entries"]:
+                if entry["role"] == "config":
+                    continue
+                found = describe(Path(entry["dest"]))
+                restored = found == entry["before"] or (found.get("state") == "file" and entry["before"].get("state") == "file" and found.get("sha256") == entry["before"]["sha256"])
+                if not restored and found != preimages.get(entry["dest"]):
+                    problems.append(f"{entry['dest']} was changed outside this operation")
+    previous = plan_data.get("previous") or {}
+    allowed = {previous.get("generation_id"), (plan_data.get("candidate") or {}).get("generation_id")}
+    try:
+        if read_active(layout) not in allowed:
+            problems.append("the active pointer names a release this operation does not involve")
+        receipt = read_receipt(layout)
+        installed_receipt = (plan_data.get("installed") or {}).get("receipt")
+        if receipt is not None and receipt.get("operation_id") != operation_id and canonical_hash(receipt) != installed_receipt:
+            problems.append("the installation receipt was replaced by another operation")
+    except InstallError as error:
+        problems.append(str(error))
+    present = managed_unit_names(layout)
+    if present:
+        systemd = Systemd(env.host)
+        if not systemd.available():
+            problems.append("the user systemd manager cannot be reached, so unit states cannot be established")
+        else:
+            planned = set(plan_data["services"]["stop"]) | set((plan_data.get("components") or {}).get("activate") or [])
+            for unit in present:
+                state = systemd.state(unit)
+                if state in ("activating", "deactivating", "reloading", "refreshing", "unknown"):
+                    problems.append(f"{unit} is {state}")
+                elif state == "active" and unit != SERVER_UNIT and unit not in planned:
+                    problems.append(f"{unit} became active outside this operation")
+    if (plan_data.get("installed") or {}).get("layout") != "absent":
+        problems += [f"not at a quiet point: {item}" for item in workload_problems(layout, probe_lock=False)]
+    return problems
+
+
 def apply_operation(
     env: Env, kind: str, approved: dict[str, Any], approval_hash: str, *, rebuild: Callable[[], Plan], make_steps: Callable[[Ctx, Payload | None], list[Step]],
 ) -> ApplyResult:
@@ -908,8 +1080,14 @@ def apply_operation(
         ensure_private_dir(directory)
     with DeployLock(layout.deploy_lock, wait=env.lock_wait):
         journal_path = layout.ops / f"{operation_id}.json"
-        journal = Journal.load(journal_path, env.clock)
+        try:
+            journal = Journal.load(journal_path, env.clock)
+        except InstallError as error:
+            return ApplyResult("RECONCILING", str(error), operation_id=operation_id)
         if journal is not None and journal.data.get("status") == "COMPLETE":
+            bad = _journal_binding_problem(journal, operation_id, kind, approval_hash, complete=True)
+            if bad is not None:
+                return ApplyResult("REFUSED", f"the completed-operation record is not trusted: it has {bad}", operation_id=operation_id)
             return ApplyResult("ALREADY_APPLIED", "this approved plan was already applied; nothing was repeated", operation_id=operation_id, steps=journal.data["steps"])
         try:
             with worker_quiesced(layout):
@@ -936,19 +1114,20 @@ def _fresh_refusal(approved: dict[str, Any], current: Plan, operation_id: str) -
 def _apply_locked(env: Env, kind: str, approved: dict[str, Any], approval_hash: str, operation_id: str, journal: Journal | None, rebuild: Callable[[], Plan],
                   make_steps: Callable[[Ctx, Payload | None], list[Step]]) -> ApplyResult:
     layout = env.layout
-    current = rebuild()
+    try:
+        current = rebuild()
+    except InstallError as error:
+        return ApplyResult("REFUSED", f"the plan can no longer be evaluated: {error}", operation_id=operation_id)
     if journal is None:
         refused = _fresh_refusal(approved, current, operation_id)
         if refused is not None:
             return refused
         plan_data = current.data
     else:
+        bad = _journal_binding_problem(journal, operation_id, kind, approval_hash)
+        if bad is not None:
+            return ApplyResult("REFUSED", f"the interrupted operation's record is not trusted: it has {bad}", operation_id=operation_id)
         plan_data = journal.data["plan"]
-        if canonical_hash(plan_data) != approval_hash:
-            return ApplyResult("REFUSED", "the journal for this operation does not match the approval", operation_id=operation_id)
-        quiet = [problem for problem in current.blockers if problem.startswith("not at a quiet point")]
-        if quiet:
-            return ApplyResult("REFUSED", "; ".join(quiet), operation_id=operation_id)
     payload: Payload | None = None
     if kind != "rollback":
         payload = load_payload(Path(plan_data["payload_root"]))
@@ -956,7 +1135,13 @@ def _apply_locked(env: Env, kind: str, approved: dict[str, Any], approval_hash: 
             return ApplyResult("REFUSED", "the candidate payload changed after the plan was approved", operation_id=operation_id)
     ctx = Ctx(env, kind, plan_data, payload, operation_id, approval_hash)
     steps = make_steps(ctx, payload)
-    if journal is None:
+    if journal is not None:
+        if [item["id"] for item in journal.data["steps"]] != [step.id for step in steps]:
+            return ApplyResult("REFUSED", "the interrupted operation's step list does not match the approved plan", operation_id=operation_id)
+        resume = _resume_problems(env, kind, plan_data, current, operation_id)
+        if resume:
+            return ApplyResult("REFUSED", "this interrupted operation cannot continue: " + "; ".join(resume), operation_id=operation_id)
+    else:
         journal = Journal.create(layout.ops / f"{operation_id}.json", operation_id=operation_id, kind=kind, approval_hash=approval_hash, plan=plan_data,
                                  step_ids=[step.id for step in steps], clock=env.clock)
     outcome = run_steps(env, journal, steps)

@@ -81,6 +81,7 @@ class FakeHost(hi.Host):
         self.fail: dict[tuple[str, ...], hi.CmdResult] = {}
         self.present = {"systemctl", "systemd-analyze", "loginctl", "codex", "claude"}
         self.plugin_log: list[list[str]] = []
+        self.plugin_hook: Any = None  # called as hook(verb, argv) after a plugin link/enable, so a fixture inventory can follow
 
     def which(self, name: str) -> str | None:
         return f"/fake/bin/{name}" if name in self.present else None
@@ -146,6 +147,8 @@ class FakeHost(hi.Host):
             return hi.CmdResult(0, json.dumps({"result": {"agents": self.agents}}))
         if argv[1] == "plugin" and argv[2] in ("link", "enable"):
             self.plugin_log.append(argv[2:])
+            if self.plugin_hook is not None:
+                self.plugin_hook(argv[2], argv)
             return hi.CmdResult(0, "{}")
         raise AssertionError(f"unexpected herdr command {argv}")
 
@@ -256,6 +259,28 @@ class FakeQuota:
         self.stage_code = 0
         self.fail_link = False
         self.fail_enable = False
+        self.root: str | None = None  # where the plugin is linked from (None: installed by someone else)
+        self.lock_sha256: str | None = None
+        self.stage_tamper = False
+
+    def bind_lock(self, data: bytes) -> dict[str, Any]:
+        import hashlib
+
+        from herdr_quota_dependency import validate_lock
+
+        self.lock_sha256 = hashlib.sha256(data).hexdigest()
+        return validate_lock(json.loads(data))
+
+    def verify_stage(self, stage_dir: str) -> str:
+        stage = Path(stage_dir)
+        if not stage.exists() or not any(stage.iterdir()):
+            return "absent"
+        if self.stage_tamper:
+            return "unverified"
+        return "verified" if (stage / "herdr-agent-quota-809749e58548").is_dir() and (stage / "BOOTSTRAP_RECEIPT.json").is_file() else "unverified"
+
+    def plugin_state(self) -> dict[str, Any]:
+        return {"state": self.state.get("state"), "enabled": self.state.get("enabled"), "root": self.root}
 
     def check(self) -> tuple[int, dict[str, Any]]:
         self.calls.append(("check",))
@@ -278,6 +303,7 @@ class FakeQuota:
         if self.fail_link:
             raise hi.InstallError("`herdr plugin link` failed (exit 1)")
         self.state = {"state": "pinned", "detail": "installed", "enabled": False, "action": "none"}
+        self.root = directory
 
     def enable(self) -> None:
         self.calls.append(("enable",))

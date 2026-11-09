@@ -579,8 +579,34 @@ def _generation_manifest(payload: Payload, operation_id: str) -> dict[str, Any]:
     }
 
 
-def verify_generation(directory: Path, *, expect_id: str | None = None) -> tuple[dict[str, Any] | None, list[str]]:
-    """Check a generation directory against its own manifest: exact file set, hashes, modes, no links."""
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_ASSET_ROLES = ("launcher", "unit", "doc", "example")
+
+
+def is_int(value: Any) -> bool:
+    return type(value) is int
+
+
+def is_hex(value: Any, length: int) -> bool:
+    return isinstance(value, str) and re.fullmatch(f"[0-9a-f]{{{length}}}", value) is not None
+
+
+def asset_name_ok(role: str, name: str) -> bool:
+    if role == "launcher":
+        return _LAUNCHER_RE.fullmatch(name) is not None
+    if role == "unit":
+        return _UNIT_RE.fullmatch(name) is not None
+    if role == "doc":
+        return _DOC_RE.fullmatch(name) is not None or name in ROOT_DOCS
+    if role == "example":
+        return _EXAMPLE_RE.fullmatch(name) is not None
+    return False
+
+
+def verify_generation(directory: Path, *, expect_id: str | None = None, expect_program_id: str | None = None) -> tuple[dict[str, Any] | None, list[str]]:
+    """Check a generation directory against its own manifest AND against the identity it is named by: exact manifest types, the
+    label `<version>-<program id prefix>` must follow from the recomputed program id (so rewriting a module and its own
+    manifest cannot keep the old name), exact file set and hashes, and the read-only modes the publisher set."""
     problems: list[str] = []
     try:
         info = os.lstat(directory)
@@ -588,20 +614,34 @@ def verify_generation(directory: Path, *, expect_id: str | None = None) -> tuple
         return None, [f"generation directory {directory.name} is missing"]
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return None, [f"generation {directory.name} is not a real directory"]
+    if stat.S_IMODE(info.st_mode) != 0o555:
+        problems.append(f"generation {directory.name} is not read-only (mode {oct(stat.S_IMODE(info.st_mode))})")
     try:
         manifest = json.loads(read_bytes_nofollow(directory / "GENERATION.json", MAX_JSON_BYTES))
     except (OSError, ValueError) as error:
         return None, [f"generation {directory.name} has no readable GENERATION.json ({error})"]
-    if not isinstance(manifest, dict) or manifest.get("schema") != MANAGER_SCHEMA or not isinstance(manifest.get("files"), list):
+    if not isinstance(manifest, dict) or not is_int(manifest.get("schema")) or manifest["schema"] != MANAGER_SCHEMA or not isinstance(manifest.get("files"), list):
         return None, [f"generation {directory.name} has an unsupported manifest"]
+    version, schema_version, program_claim = manifest.get("version"), manifest.get("state_schema_version"), manifest.get("program_id")
+    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version) or not is_int(schema_version) or not is_hex(program_claim, 64):
+        return None, [f"generation {directory.name} manifest has invalid identity fields"]
+    expected: dict[str, dict[str, Any]] = {}
+    for item in manifest["files"]:
+        if (not isinstance(item, dict) or set(item) != {"name", "sha256", "size", "mode"} or not isinstance(item["name"], str) or item["name"] in expected
+                or not (_MODULE_RE.fullmatch(item["name"]) or item["name"] == QUOTA_LOCK) or not is_hex(item["sha256"], 64) or not is_int(item["size"]) or not is_int(item["mode"])):
+            return None, [f"generation {directory.name} manifest lists an invalid file entry"]
+        expected[item["name"]] = item
     gid = manifest.get("generation_id")
     if gid != directory.name or (expect_id is not None and gid != expect_id):
         problems.append(f"generation manifest names {gid!r}, not {expect_id or directory.name}")
-    expected: dict[str, dict[str, Any]] = {}
-    for item in manifest["files"]:
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or item["name"] in expected or not (_MODULE_RE.fullmatch(item["name"]) or item["name"] == QUOTA_LOCK):
-            return None, [f"generation {directory.name} manifest lists an invalid file entry"]
-        expected[item["name"]] = item
+    program_id = canonical_hash({"version": version, "state_schema_version": schema_version,
+                                 "files": [{"role": "program", "name": i["name"], "sha256": i["sha256"], "size": i["size"], "mode": i["mode"]} for i in sorted(expected.values(), key=lambda x: x["name"])]})
+    if program_id != program_claim:
+        problems.append(f"generation {directory.name} manifest does not match its own program identity")
+    if directory.name != f"{version}-{program_id[:16]}":
+        problems.append(f"generation directory name {directory.name} does not follow from its recomputed program identity")
+    if expect_program_id is not None and program_id != expect_program_id:
+        problems.append(f"generation {directory.name} is not the program identity recorded for it")
     with os.scandir(directory) as entries:
         actual = {entry.name for entry in entries}
     for extra in sorted(actual - set(expected) - {"GENERATION.json"}):
@@ -610,12 +650,13 @@ def verify_generation(directory: Path, *, expect_id: str | None = None) -> tuple
         state = describe(directory / name)
         if state["state"] != "file":
             problems.append(f"generation file {name} is {state.get('kind') or 'missing'}")
-        elif state["sha256"] != item.get("sha256"):
+        elif state["sha256"] != item["sha256"]:
             problems.append(f"generation file {name} differs from its recorded hash")
-    program_id = canonical_hash({"version": manifest.get("version"), "state_schema_version": manifest.get("state_schema_version"),
-                                 "files": [{"role": "program", "name": i["name"], "sha256": i["sha256"], "size": i["size"], "mode": i["mode"]} for i in sorted(expected.values(), key=lambda x: x["name"])]})
-    if program_id != manifest.get("program_id"):
-        problems.append(f"generation {directory.name} manifest does not match its own program identity")
+        elif state["mode"] != 0o444:
+            problems.append(f"generation file {name} is not read-only (mode {oct(state['mode'])})")
+    state = describe(directory / "GENERATION.json")
+    if state["state"] == "file" and state["mode"] != 0o444:
+        problems.append(f"generation manifest is not read-only (mode {oct(state['mode'])})")
     return manifest, problems
 
 
@@ -733,6 +774,14 @@ def switch_active(env: Env, generation_id: str, token: str) -> None:
     fsync_dir(layout.lib)
 
 
+def managed_unit_names(layout: Layout) -> list[str]:
+    """Every herdr-* unit file present in the user unit directory (workers and watchers alike), by name."""
+    try:
+        return sorted(entry.name for entry in os.scandir(layout.unit) if _UNIT_RE.fullmatch(entry.name) and entry.is_file(follow_symlinks=False))
+    except OSError:
+        return []
+
+
 def compat_link_state(layout: Layout, name: str) -> str:
     """absent | ours (the exact link to the active generation) | other (a file, directory or different link)."""
     path = layout.lib / name
@@ -782,6 +831,44 @@ class InstallState:
         return {"layout": self.layout, "problems": sorted(self.problems)}
 
 
+def validate_receipt(layout: Layout, value: Any) -> dict[str, Any]:
+    """Exact-type schema for a persisted receipt; every asset must be a canonical destination for this layout, so a receipt
+    can never be used to address (and delete or replace) a file the manager does not own."""
+    if not isinstance(value, dict) or not is_int(value.get("schema")) or value["schema"] != MANAGER_SCHEMA:
+        raise InstallError("installation receipt has an unsupported schema")
+    if not is_hex(value.get("operation_id"), 32) or value.get("kind") not in ("setup", "update", "rollback"):
+        raise InstallError("installation receipt has an invalid operation identity")
+    for key in ("generation_id", "version"):
+        if value.get(key) is not None and not isinstance(value[key], str):
+            raise InstallError(f"installation receipt field {key} has an invalid type")
+    if value.get("generation_id") is not None and not _GENERATION_RE.fullmatch(value["generation_id"]):
+        raise InstallError("installation receipt names an invalid generation")
+    if value.get("program_id") is not None and not is_hex(value["program_id"], 64):
+        raise InstallError("installation receipt has an invalid program identity")
+    if value.get("backup") is not None and not is_hex(value["backup"], 32):
+        raise InstallError("installation receipt names an invalid backup")
+    assets = value.get("assets")
+    if not isinstance(assets, list):
+        raise InstallError("installation receipt assets are not a list")
+    seen: set[str] = set()
+    for item in assets:
+        if not isinstance(item, dict) or set(item) != {"role", "dest", "sha256", "mode"} or item["role"] not in _ASSET_ROLES or not isinstance(item["dest"], str):
+            raise InstallError("installation receipt lists a malformed asset")
+        name = Path(item["dest"]).name
+        if not asset_name_ok(item["role"], name) or item["dest"] != str(layout.destination(item["role"], name)) or item["dest"] in seen:
+            raise InstallError(f"installation receipt lists {item['dest']!r}, which is not a canonical managed destination (it is not owned by this installation)")
+        if not is_hex(item["sha256"], 64) or not is_int(item["mode"]):
+            raise InstallError("installation receipt lists an asset with invalid hash or mode")
+        seen.add(item["dest"])
+    previous = value.get("previous")
+    if previous is not None:
+        if not isinstance(previous, dict) or previous.get("kind") not in ("generation", "legacy"):
+            raise InstallError("installation receipt has an invalid previous-release record")
+        if previous["kind"] == "generation" and not (isinstance(previous.get("generation_id"), str) and _GENERATION_RE.fullmatch(previous["generation_id"])):
+            raise InstallError("installation receipt names an invalid previous generation")
+    return value
+
+
 def read_receipt(layout: Layout) -> dict[str, Any] | None:
     try:
         value = json.loads(read_bytes_nofollow(layout.receipt, MAX_JSON_BYTES))
@@ -789,8 +876,49 @@ def read_receipt(layout: Layout) -> dict[str, Any] | None:
         return None
     except (OSError, ValueError) as error:
         raise InstallError(f"installation receipt {layout.receipt} is unreadable ({error})", action="leave it in place and report it; do not delete installation records") from error
-    if not isinstance(value, dict) or value.get("schema") != MANAGER_SCHEMA:
-        raise InstallError("installation receipt has an unsupported schema")
+    return validate_receipt(layout, value)
+
+
+def validate_backup_manifest(layout: Layout, name: str, value: Any) -> dict[str, Any]:
+    """Exact-type schema for a backup record. Every restored path must be a canonical managed destination (or one of the three
+    configuration files), and every stored copy is addressed only as `files/<n>` or `legacy-lib/<module>` beneath this
+    operation's own backup directory, never by a recorded absolute or relative path."""
+    if not is_hex(name, 32):
+        raise InstallError("invalid backup name")
+    if not isinstance(value, dict) or not is_int(value.get("schema")) or value["schema"] != 1 or value.get("operation_id") != name or not isinstance(value.get("entries"), list):
+        raise InstallError("backup record has an unsupported shape")
+    configs = {str(layout.sup_config), str(layout.tg_config), str(layout.backup_config)}
+    seen: set[str] = set()
+    for index, entry in enumerate(value["entries"]):
+        if not isinstance(entry, dict) or set(entry) != {"dest", "role", "before", "file", "after"} or not isinstance(entry["dest"], str) or entry["dest"] in seen:
+            raise InstallError("backup record has a malformed or duplicate entry")
+        role, dest = entry["role"], entry["dest"]
+        if role == "config":
+            if dest not in configs:
+                raise InstallError(f"backup record names {dest!r}, which is not a configuration file of this installation")
+        elif role in _ASSET_ROLES:
+            if not asset_name_ok(role, Path(dest).name) or dest != str(layout.destination(role, Path(dest).name)):
+                raise InstallError(f"backup record names {dest!r}, which is not a canonical managed destination")
+        else:
+            raise InstallError("backup record has an unknown role")
+        before, after = entry["before"], entry["after"]
+        if not isinstance(before, dict) or before.get("state") not in ("absent", "file"):
+            raise InstallError("backup record has an invalid preimage")
+        if before["state"] == "file":
+            if set(before) != {"state", "sha256", "mode"} or not is_hex(before["sha256"], 64) or not is_int(before["mode"]) or entry["file"] != f"files/{index}":
+                raise InstallError("backup record has an invalid stored-copy reference")
+        elif set(before) != {"state"} or entry["file"] is not None:
+            raise InstallError("backup record has an invalid absent preimage")
+        if after is not None and (not isinstance(after, dict) or set(after) != {"sha256", "mode"} or not is_hex(after["sha256"], 64) or not is_int(after["mode"])):
+            raise InstallError("backup record has an invalid result record")
+        seen.add(dest)
+    legacy = value.get("legacy_lib")
+    if legacy is not None:
+        files = legacy.get("files") if isinstance(legacy, dict) else None
+        if not isinstance(files, dict) or any(not isinstance(k, str) or not (_MODULE_RE.fullmatch(k) or k == QUOTA_LOCK) or not is_hex(v, 64) for k, v in files.items()):
+            raise InstallError("backup record has an invalid legacy program listing")
+    if value.get("previous_receipt") is not None:
+        validate_receipt(layout, value["previous_receipt"])
     return value
 
 
@@ -842,6 +970,9 @@ def inspect_install(layout: Layout) -> InstallState:
     if receipt is None or receipt.get("generation_id") != active:
         return InstallState("inconsistent", active_generation=active, manifest=manifest, receipt=receipt,
                             problems=["the installation receipt does not name the active generation (an interrupted operation needs reconciling)"])
+    if receipt.get("program_id") != manifest.get("program_id") or receipt.get("version") != manifest.get("version"):
+        return InstallState("inconsistent", active_generation=active, manifest=manifest, receipt=receipt,
+                            problems=["the installation receipt's program identity does not match the active generation (the generation was changed after it was recorded)"])
     return InstallState("managed", active_generation=active, manifest=manifest, receipt=receipt)
 
 

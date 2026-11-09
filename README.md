@@ -68,7 +68,7 @@ For guided setup, safe updates and rollback use `herdr-setup` (every operation p
 
 ```sh
 herdr-setup status                                   # what is installed, what is active now, what remains for you
-herdr-setup setup --profile full                     # preview the guided setup (Telegram, quota plugin, optional services)
+herdr-setup setup --profile full --payload "$PWD"   # preview the guided setup (Telegram, quota plugin, optional services)
 herdr-setup update --payload /path/to/new/checkout   # preview an update; --apply --plan FILE --approve HASH to apply
 herdr-setup rollback                                 # preview undoing the last operation
 ```
