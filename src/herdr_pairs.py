@@ -287,7 +287,7 @@ def load_registry(paths: Any) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise SupervisorError("pair registry must be a regular file")
     doc = load_json(path, label="named pair registry")
-    if not isinstance(doc, dict) or set(doc) != {"schema_version", "revision", "entries", "reservations"} or doc["schema_version"] != REGISTRY_SCHEMA:
+    if not isinstance(doc, dict) or set(doc) != {"schema_version", "revision", "entries", "reservations"} or type(doc["schema_version"]) is not int or doc["schema_version"] != REGISTRY_SCHEMA:
         raise SupervisorError("named pair registry has an unsupported shape")
     if type(doc["revision"]) is not int or doc["revision"] < 0 or not isinstance(doc["entries"], dict) or not isinstance(doc["reservations"], dict):
         raise SupervisorError("named pair registry has an unsupported shape")
@@ -531,7 +531,7 @@ def foreign_sessions(paths: Any, *, helpers: bool = True) -> set[str]:
     taken = set(known_sessions(paths))
     if paths.query_registry_file.exists():
         value = load_json(paths.query_registry_file, label="query provider registry")
-        providers = value.get("providers") if isinstance(value, dict) and value.get("schema_version") == 1 else None
+        providers = value.get("providers") if isinstance(value, dict) and type(value.get("schema_version")) is int and value.get("schema_version") == 1 else None
         if not isinstance(providers, dict) or any(key not in PROVIDERS for key in providers):
             raise SupervisorError("the query provider registry is malformed; ownership is unknown")
         taken.update(_ownership_record(entry, "query provider") for entry in providers.values())
@@ -541,7 +541,7 @@ def foreign_sessions(paths: Any, *, helpers: bool = True) -> set[str]:
     registry = paths.state_dir / "helpers" / "registry.json"
     if helpers and registry.exists():
         value = load_json(registry, label="helper registry")
-        workers = value.get("workers") if isinstance(value, dict) and value.get("schema_version") == 1 else None
+        workers = value.get("workers") if isinstance(value, dict) and type(value.get("schema_version")) is int and value.get("schema_version") == 1 else None
         if not isinstance(workers, dict):
             raise SupervisorError("the helper registry is malformed; ownership is unknown")
         taken.update(_ownership_record(entry, "helper worker") for entry in workers.values())

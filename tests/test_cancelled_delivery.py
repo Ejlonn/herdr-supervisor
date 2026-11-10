@@ -7,7 +7,9 @@ import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from v2_fixtures import V2Case, hs
+import herdr_pairs as hpair
+from pair_fixtures import ALPHA, BETA, PairCase
+from v2_fixtures import FakeHerdr, V2Case, hs
 
 
 class CancelledDeliveryTests(V2Case):
@@ -155,7 +157,8 @@ class CancelledDeliveryTests(V2Case):
     def test_frozen_pair_drift_refused(self):
         self.st['session_pair'] = {'identities': copy.deepcopy(self.owners)}
         self.st['session_pair']['identities']['codex']['pane_id'] = 'w9:p9'
-        self.assert_refused('original ownership')
+        # a hand-built, incomplete snapshot is no valid frozen binding: refused before any identity is consulted
+        self.assert_refused('binding is invalid')
 
     def test_change_during_guard_refused(self):
         def guard(state, provider, purpose, **kwargs):
@@ -187,3 +190,107 @@ class CancelledDeliveryTests(V2Case):
         self.assertEqual(len(self.calls), count)
         stored = json.loads(self.paths.state_file.read_text())
         self.assertEqual(stored['delivery']['status'], 'cancelled')
+
+
+class CancelledNamedPairTests(PairCase):
+    """A cancelled NAMED run settles through its own frozen pair, never through the global owners its released binding would resolve.
+    The legacy pair (codex-main/claude-main) stays live next to the named pairs and must play no part."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.entry = self.register("Alpha", ALPHA)
+        self.assertTrue(self.start(self.saved(self.entry))["ok"])
+        state = self.state()
+        state["delivery"] = {"turn_id": "original-turn", "agent": "codex", "status": "accepted", "prompt_sha256": "a" * 64, "accepted_at": "original"}
+        self.sup.store.write_state(state)
+        with self.sup.store.transaction():
+            self.sup.apply_command(state, {"action": "cancel", "run_id": state["run_id"], "actor": "operator"})
+        self.cancelled = self.state()
+        self.assertEqual(self.cancelled["supervisor_state"], "CANCELLED")
+        self.seen: list = []
+        self.guard_owners: list = []
+        self.sup.settle_guard = self.guard
+        self.command = {"action": "cancel", "run_id": self.cancelled["run_id"], "turn_id": "original-turn", "settle_delivery": True, "actor": "operator"}
+        self.owners_before = self.paths.owners_file.read_bytes()
+
+    def guard(self, state, provider, purpose, **kwargs):
+        self.seen.append((provider, purpose, kwargs.get("control")))
+        self.guard_owners.append(self.sup.owners())
+        return SimpleNamespace(kind="clear", detail="fixture settled")
+
+    def settle(self) -> dict:
+        with self.sup.store.transaction():
+            return self.sup.apply_command(self.state(), self.command)
+
+    def assert_refused(self, text: str) -> None:
+        disk, registry = self.paths.state_file.read_bytes(), hpair.registry_path(self.paths).read_bytes()
+        with self.assertRaises(hs.SupervisorError) as caught:
+            self.settle()
+        self.assertIn(text, str(caught.exception))
+        self.assertEqual(self.paths.state_file.read_bytes(), disk, "a refusal rewrites nothing")
+        self.assertEqual(hpair.registry_path(self.paths).read_bytes(), registry)
+        self.assertEqual(self.paths.owners_file.read_bytes(), self.owners_before)
+        self.assertEqual(self.herdr.prompts, [])
+
+    def frozen_ids(self) -> dict:
+        return {provider: dict(self.cancelled["session_pair"]["identities"][provider]) for provider in ("claude", "codex")}
+
+    def test_the_released_binding_resolves_global_owners_but_the_recovery_uses_the_frozen_pair(self) -> None:
+        legacy = self.sup.owners()
+        self.assertNotEqual({p: legacy[p]["session_id"] for p in legacy}, {p: v["session_id"] for p, v in self.frozen_ids().items()}, "setup: the global owners are another pair")
+        self.assertTrue(self.settle()["ok"])
+        after = self.state()
+        self.assertEqual(after["supervisor_state"], "CANCELLED")
+        self.assertEqual(after["delivery"]["status"], "cancelled")
+        self.assertEqual(after["delivery"]["cancellation_settlement"]["identities"], {p: {"session_id": v["session_id"], "pane_id": v["pane_id"]} for p, v in self.frozen_ids().items()})
+        self.assertEqual(sorted(provider for provider, _, _ in self.seen), ["claude", "codex"], "both frozen sessions were guarded")
+        self.assertTrue(all(owners == self.frozen_ids() for owners in self.guard_owners), "inside the recovery every owner lookup is the frozen pair")
+        self.assertEqual(self.paths.owners_file.read_bytes(), self.owners_before, "the global owners are neither adopted nor rewritten")
+        self.assertEqual(self.herdr.prompts, [])
+        self.assertEqual(self.sup.owners(), legacy, "outside the recovery the released binding still resolves the legacy owners")
+
+    def test_repeating_the_settlement_is_idempotent_and_sends_nothing(self) -> None:
+        self.assertTrue(self.settle()["ok"])
+        calls = len(self.seen)
+        again = self.settle()
+        self.assertIn("already settled", again["message"])
+        self.assertEqual(len(self.seen), calls)
+
+    def test_registry_changes_cannot_retarget_a_frozen_run(self) -> None:
+        hpair.registry_path(self.paths).write_text("{not json")
+        self.assertTrue(self.settle()["ok"], "the run's own snapshot is authority, not the mutable registry")
+        self.assertTrue(all(owners == self.frozen_ids() for owners in self.guard_owners))
+
+    def test_a_missing_changed_duplicate_or_busy_original_session_is_refused_before_any_guard(self) -> None:
+        name = "alpha-codex"
+        original = dict(self.herdr.agents[name])
+        cases = {
+            "missing": (lambda: self.herdr.agents.pop(name), "original session is missing"),
+            "changed session": (lambda: self.herdr.agents.update({name: FakeHerdr.agent("codex", name, original["pane_id"], "99999999-9999-4999-8999-999999999999")}), "original session is missing"),
+            "moved pane": (lambda: self.herdr.agents.update({name: FakeHerdr.agent("codex", name, "w9:p9", ALPHA["codex"][1])}), "original session is missing"),
+            "busy": (lambda: self.herdr.agents.update({name: FakeHerdr.agent("codex", name, original["pane_id"], ALPHA["codex"][1], "working")}), "not settled"),
+            "duplicate carrier": (lambda: self.herdr.agents.update({"alpha-codex-copy": FakeHerdr.agent("codex", "alpha-codex-copy", "w8:p8", ALPHA["codex"][1])}), "original session is missing"),
+        }
+        for label, (mutate, text) in cases.items():
+            with self.subTest(label):
+                self.herdr.agents[name] = dict(original)
+                self.herdr.agents.pop("alpha-codex-copy", None)
+                mutate()
+                self.assert_refused(text)
+                self.assertEqual(self.seen, [], "no child guard is consulted for an unproven identity")
+
+    def test_a_guard_that_does_not_clear_refuses_and_changes_nothing(self) -> None:
+        self.sup.settle_guard = lambda *args, **kwargs: SimpleNamespace(kind="hold", detail="a helper is still running")
+        self.assert_refused("child settlement did not clear")
+
+    def test_a_snapshot_that_disagrees_with_the_recorded_native_sessions_is_refused(self) -> None:
+        state = self.state()
+        state["native_sessions"]["codex"] = BETA["codex"][1]
+        self.sup.store.write_state(state)
+        self.assert_refused("original ownership cannot be verified")
+        self.assertEqual(self.seen, [])
+
+    def test_another_pairs_live_sessions_cannot_stand_in_for_the_frozen_ones(self) -> None:
+        self.herdr.agents.pop("alpha-codex")
+        self.assert_refused("original session is missing")
+        self.assertIn("beta-codex", self.herdr.agents, "the other pair is live and idle but is never adopted")

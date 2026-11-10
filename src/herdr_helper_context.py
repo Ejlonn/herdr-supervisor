@@ -716,31 +716,48 @@ def inspect_loaded_units(context: Mapping[str, Any], unit_dir: Path, home: Path 
     return problems, facts
 
 
-def installed_library(home: Path | str | None) -> Path:
-    """The directory the installed launcher executes: the managed program generation the `active` pointer names (exactly one level,
-    `generations/<name>`), else the flat legacy library. Read-only; any other pointer value is not followed."""
+def pointer_problem(target: str) -> str | None:
+    """The launcher's own `case` on the `active` pointer value, mirrored exactly: a managed generation is `generations/<name>`, one level,
+    no traversal and not absolute. Anything else makes the current launcher exit 70 instead of falling back to the flat library."""
+    if ".." in target or target.startswith("/") or target.count("/") != 1 or not target.startswith("generations/") or target == "generations/":
+        return f"the active pointer ({target}) is not a managed generation, so the launcher refuses to run (exit 70)"
+    return None
+
+
+def worker_library(home: Path | str | None, launcher_sha256: str | None) -> tuple[Path | None, str | None]:
+    """(library the INSTALLED launcher variant would execute, problem). The earlier launcher always executes the flat library; the current
+    launcher executes the generation `active` names, the flat library when there is no pointer, and refuses a malformed pointer.
+    Read-only; the checked layout is the one the exact launcher bytes would use, never a layout it would not."""
     base = _home(home) / ".local/lib/herdr-supervisor"
+    if launcher_sha256 == LEGACY_WORKER_LAUNCHER_SHA256:
+        return base, None
     pointer = base / "active"
+    if not pointer.is_symlink():
+        return base, None
     try:
-        target = os.readlink(pointer) if pointer.is_symlink() else None
-    except OSError:
-        target = None
-    if target is not None and re.fullmatch(r"generations/[A-Za-z0-9._+-]+", target) and ".." not in target:
-        return base / target
-    return base
+        target = os.readlink(pointer)
+    except OSError as error:
+        return None, f"the active pointer cannot be read ({error.strerror}); the launcher cannot resolve a program generation"
+    problem = pointer_problem(target)
+    return (None, problem) if problem else (base / target, None)
 
 
 def inspect_worker_runtime(home: Path | str | None) -> list[str]:
-    """The supported launcher and the installed library it executes (read-only file facts)."""
+    """The supported launcher and the installed library that exact launcher executes (read-only file facts)."""
     problems: list[str] = []
     worker = _home(home) / WORKER_COMMAND_SUBPATH
+    digest: str | None = None
     try:
-        launcher_ok = worker.is_file() and os.access(worker, os.X_OK) and hashlib.sha256(worker.read_bytes()).hexdigest() in SUPPORTED_WORKER_LAUNCHERS
+        if worker.is_file() and os.access(worker, os.X_OK):
+            digest = hashlib.sha256(worker.read_bytes()).hexdigest()
     except OSError:
-        launcher_ok = False
-    if not launcher_ok:
+        digest = None
+    if digest not in SUPPORTED_WORKER_LAUNCHERS:
         problems.append(f"{worker} is missing, not executable, or not the supported worker launcher; reinstall the reviewed version")
-    library = installed_library(home)
+    library, layout_problem = worker_library(home, digest)
+    if library is None:
+        problems.append(str(layout_problem))
+        return problems
     try:
         module_text = (library / "herdr_codex_reset.py").read_text()
     except OSError:

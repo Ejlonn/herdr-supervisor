@@ -652,9 +652,10 @@ def default_quota_dir() -> Path:
     return Path(state) / "herdr" / "plugins" / "herdr-agent-usage"  # the supervisor default (herdr_core); the locked plugin writes here
 
 
-def telemetry_report(quota_dir: Path, max_age: float, now: float | None = None) -> dict[str, Any]:
+def telemetry_report(quota_dir: Path, max_age: float, now: float | None = None, *, plugin_id: str) -> dict[str, Any]:
     """Presence and age of the snapshot files only. Values are never read into the report; identity (session
-    binding) is judged by the supervisor itself (`herdr-supervisor doctor`). Missing or stale means UNKNOWN."""
+    binding) is judged by the supervisor itself (`herdr-supervisor doctor`). Missing or stale means UNKNOWN. The recovery actions name
+    `plugin_id`, the plugin the bound lock checks, never a constant."""
     moment = time.time() if now is None else now
     providers: dict[str, Any] = {}
     for provider, name in DEFAULT_SNAPSHOT_FILES.items():
@@ -662,7 +663,7 @@ def telemetry_report(quota_dir: Path, max_age: float, now: float | None = None) 
         try:
             stat_result = path.stat()
         except OSError:
-            providers[provider] = {"state": "MISSING", "usage": "UNKNOWN", "action": "start a session so the plugin writes a snapshot, then run `herdr plugin action invoke refresh --plugin herdr-agent-quota` (a non-LLM action)"}
+            providers[provider] = {"state": "MISSING", "usage": "UNKNOWN", "action": f"start a session so the plugin writes a snapshot, then run `herdr plugin action invoke refresh --plugin {plugin_id}` (a non-LLM action)"}
             continue
         try:
             json.loads(path.read_text(encoding="utf-8"))
@@ -751,7 +752,7 @@ def command_check(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "lock": {"plugin_id": lock["plugin_id"], "repository": lock["repository"]["url"], "revision": lock["revision"], "manifest_version": lock["manifest_version"]},
         "herdr": {"path": herdr, "available": herdr is not None},
         "dependency": dependency,
-        "telemetry": telemetry_report(quota_dir, float(args.max_age)),
+        "telemetry": telemetry_report(quota_dir, float(args.max_age), plugin_id=lock["plugin_id"]),
         "toolchain": toolchain_report(lock, build_env(args, lock)),
     }
     state = dependency["state"]

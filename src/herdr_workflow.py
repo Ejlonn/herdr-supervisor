@@ -2493,7 +2493,17 @@ class SupervisorV2Mixin:
 
         Called only by the run-bound durable cancel command with settle_delivery=True.
         This records cancellation, never completion, a routing result or an approval.
+
+        A terminal run releases its pair binding for later flows, so every owner lookup of this recovery is resolved through the run's OWN
+        frozen `session_pair` snapshot (validated, never the registry, aliases or the global owners); an unnamed run keeps the legacy owners.
         """
+        pair = state.get("session_pair")
+        if pair is not None and not isinstance(pair, dict):
+            raise SupervisorError("the cancelled run's pair snapshot is not valid; nothing changed")
+        with (self.pair_scope(pair) if pair is not None else contextlib.nullcontext()):
+            return self._settle_cancelled_delivery(state, turn_id=turn_id, actor=actor)
+
+    def _settle_cancelled_delivery(self, state: dict[str, Any], *, turn_id: Any, actor: str) -> dict[str, Any]:
         if state.get("supervisor_state") != "CANCELLED":
             raise SupervisorError("delivery settlement requires an already CANCELLED run")
         delivery = state.get("delivery")
