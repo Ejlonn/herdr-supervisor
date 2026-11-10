@@ -852,13 +852,13 @@ def validate_receipt(layout: Layout, value: Any) -> dict[str, Any]:
         raise InstallError("installation receipt assets are not a list")
     seen: set[str] = set()
     for item in assets:
-        if not isinstance(item, dict) or set(item) != {"role", "dest", "sha256", "mode"} or item["role"] not in _ASSET_ROLES or not isinstance(item["dest"], str):
+        if not isinstance(item, dict) or set(item) != {"role", "dest", "sha256", "mode", "size"} or item["role"] not in _ASSET_ROLES or not isinstance(item["dest"], str):
             raise InstallError("installation receipt lists a malformed asset")
         name = Path(item["dest"]).name
         if not asset_name_ok(item["role"], name) or item["dest"] != str(layout.destination(item["role"], name)) or item["dest"] in seen:
             raise InstallError(f"installation receipt lists {item['dest']!r}, which is not a canonical managed destination (it is not owned by this installation)")
-        if not is_hex(item["sha256"], 64) or not is_int(item["mode"]):
-            raise InstallError("installation receipt lists an asset with invalid hash or mode")
+        if not is_hex(item["sha256"], 64) or not is_int(item["mode"]) or not is_int(item["size"]) or item["size"] < 0:
+            raise InstallError("installation receipt lists an asset with invalid hash, mode or size")
         seen.add(item["dest"])
     previous = value.get("previous")
     if previous is not None:
@@ -867,6 +867,40 @@ def validate_receipt(layout: Layout, value: Any) -> dict[str, Any]:
         if previous["kind"] == "generation" and not (isinstance(previous.get("generation_id"), str) and _GENERATION_RE.fullmatch(previous["generation_id"])):
             raise InstallError("installation receipt names an invalid previous generation")
     return value
+
+
+def release_inventory_id(manifest: dict[str, Any], assets: list[dict[str, Any]]) -> str:
+    """The payload identity a release's complete file inventory hashes to: the verified generation's program files plus the receipt's
+    assets, in the order the payload loader defines. A receipt that lists any file the release did not ship (or omits one it did)
+    cannot reproduce the payload identity it records."""
+    files = [{"role": "program", "name": item["name"], "sha256": item["sha256"], "size": item["size"], "mode": item["mode"]} for item in sorted(manifest["files"], key=lambda x: x["name"])]
+    owned = [{"role": item["role"], "name": Path(item["dest"]).name, "sha256": item["sha256"], "size": item["size"], "mode": item["mode"]} for item in assets]
+    owned.sort(key=lambda item: (ROLES.index(item["role"]), item["name"]))
+    return canonical_hash({"version": manifest["version"], "files": files + owned})
+
+
+def receipt_release_problem(layout: Layout, receipt: dict[str, Any], manifest: dict[str, Any]) -> str | None:
+    """Ownership is not a file name pattern. The receipt's exact role/name/hash/size/mode inventory must reproduce the payload identity
+    it records, over the program files of the independently verified generation; and, for an operation that wrote it from an
+    approved plan, must equal the inventory that plan (hash-bound to its approval) enumerated."""
+    claimed = receipt.get("payload_id")
+    if not is_hex(claimed, 64):
+        return "the installation receipt records no payload identity, so the files it claims to own cannot be proven"
+    if receipt.get("generation_id") != manifest.get("generation_id") or receipt.get("version") != manifest.get("version"):
+        return "the installation receipt names a different release than the verified generation"
+    if release_inventory_id(manifest, receipt["assets"]) != claimed:
+        return "the installation receipt's asset inventory does not reproduce the payload identity it records (it lists, omits or alters files the release did not ship)"
+    if receipt.get("kind") in ("setup", "update"):
+        try:
+            journal = json.loads(read_bytes_nofollow(layout.ops / f"{receipt['operation_id']}.json", MAX_JSON_BYTES))
+        except (OSError, ValueError):
+            return "the approved plan of the operation that wrote this receipt is not available, so the files it claims to own cannot be proven"
+        plan = journal.get("plan") if isinstance(journal, dict) else None
+        if (not isinstance(plan, dict) or journal.get("operation_id") != receipt["operation_id"] or journal.get("approval_hash") != receipt.get("approval_hash")
+                or canonical_hash(plan) != receipt.get("approval_hash") or (plan.get("candidate") or {}).get("payload_id") != claimed
+                or plan.get("receipt_assets", plan.get("assets")) != receipt["assets"]):
+            return "the installation receipt's asset inventory is not the one its approved plan enumerated"
+    return None
 
 
 def read_receipt(layout: Layout) -> dict[str, Any] | None:
@@ -973,6 +1007,9 @@ def inspect_install(layout: Layout) -> InstallState:
     if receipt.get("program_id") != manifest.get("program_id") or receipt.get("version") != manifest.get("version"):
         return InstallState("inconsistent", active_generation=active, manifest=manifest, receipt=receipt,
                             problems=["the installation receipt's program identity does not match the active generation (the generation was changed after it was recorded)"])
+    unproven = receipt_release_problem(layout, receipt, manifest)
+    if unproven is not None:
+        return InstallState("inconsistent", active_generation=active, manifest=manifest, receipt=receipt, problems=[unproven])
     return InstallState("managed", active_generation=active, manifest=manifest, receipt=receipt)
 
 
@@ -989,7 +1026,7 @@ class Asset:
     size: int
 
     def entry(self) -> dict[str, Any]:
-        return {"role": self.role, "dest": str(self.dest), "sha256": self.sha256, "mode": self.mode}
+        return {"role": self.role, "dest": str(self.dest), "sha256": self.sha256, "mode": self.mode, "size": self.size}
 
 
 def assets_for(payload: Payload, layout: Layout) -> list[Asset]:
@@ -1046,19 +1083,29 @@ class DeployLock:
             self.handle = None
 
 
+def worker_lock_paths(layout: Layout) -> list[tuple[str, Path]]:
+    """Every worker that serializes itself with a lock of its own, as (label, lock file): the controller's task worker, the
+    read-only query worker and the Codex reset worker. These are the workers' real start/exclusion mechanisms, so holding them
+    keeps a late start from running while files change, and finding one held means bounded work is running."""
+    paths = layout.paths
+    return [("a supervisor worker", paths.lock_file), ("a read-only query worker", paths.query_lock_file), ("a Codex reset worker", paths.codex_reset_dir / "worker.lock")]
+
+
 @contextlib.contextmanager
 def worker_quiesced(layout: Layout) -> Iterator[None]:
-    """Hold the controller's own worker lock, so no worker can start while program files change. Refuses if one runs."""
+    """Hold every worker's own lock for the whole operation, so no worker can start (or be running) while program files change.
+    Refuses, and never stops anything, if a worker already holds its lock."""
     ensure_private_dir(layout.state)
-    lock = core.WorkerLock(layout.paths.lock_file)
-    try:
-        lock.acquire()
-    except core.SupervisorError as error:
-        raise InstallError("a supervisor worker is running or holds the worker lock", action="let the task settle (or finish it), then retry") from error
-    try:
+    with contextlib.ExitStack() as stack:
+        for label, path in worker_lock_paths(layout):
+            ensure_private_dir(path.parent)
+            lock = core.WorkerLock(path)
+            try:
+                lock.acquire()
+            except core.SupervisorError as error:
+                raise InstallError(f"{label} is running or holds its worker lock", action="let the running work finish, then retry; it is never stopped") from error
+            stack.callback(lock.release)
         yield
-    finally:
-        lock.release()
 
 
 STEP_STATES = ("PENDING", "RUNNING", "DONE", "FAILED", "UNKNOWN")
@@ -1216,11 +1263,12 @@ def workload_problems(layout: Layout, *, probe_lock: bool = True) -> list[str]:
     problems: list[str] = []
     paths = layout.paths
     if probe_lock:
-        try:
-            if core.WorkerLock.is_held(paths.lock_file):
-                problems.append("a supervisor worker holds the worker lock")
-        except OSError as error:
-            problems.append(f"the worker lock cannot be inspected ({error.strerror})")
+        for label, lock_path in worker_lock_paths(layout):
+            try:
+                if core.WorkerLock.is_held(lock_path):
+                    problems.append(f"{label} holds its worker lock")
+            except OSError as error:
+                problems.append(f"the {label} lock cannot be inspected ({error.strerror})")
     try:
         state = StateStore(paths, time.time).read_state(required=False)
     except (core.SupervisorError, OSError) as error:

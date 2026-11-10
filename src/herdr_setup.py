@@ -840,14 +840,14 @@ def readiness(env: Env, adapters: Adapters) -> dict[str, Any]:
     now_ok = all(units.get(name, {}).get("active") == "active" for name in required)
     add("service-chain", "OK" if units and now_ok else "ACTION_REQUIRED", ", ".join(f"{n}:{i['active']}/{i['enabled']}" for n, i in units.items()) or "no managed unit is active",
         "enable the worker watcher and the Telegram bridge with `herdr-setup setup --profile full --services worker,telegram`" if not (units and now_ok) else "")
-    durable = {"enabled", "linked"}  # enabled-runtime (and anything else) does not survive a reboot
+    durable = {"enabled"}  # only boot-target enablement survives a reboot: enabled-runtime is transient, and `linked` merely makes an external unit file discoverable
     units_durable = bool(units) and all(units.get(name, {}).get("enabled") in durable for name in required)
     server_durable = units.get("server", {}).get("enabled") in durable
     linger = systemd.linger(user_name()) if units else "unknown"
     persistent = units_durable and server_durable and linger == "enabled"
     add("reboot-persistence", "OK" if persistent else "ACTION_REQUIRED",
         f"watcher/bridge enabled durably: {units_durable}; headless Herdr server unit enabled: {server_durable}; linger: {linger}",
-        "" if persistent else "to survive a reboot: enable the units durably (not enabled-runtime), have an administrator run `sudo loginctl enable-linger YOUR_USER` once (Supervisor never does), "
+        "" if persistent else "to survive a reboot: enable the units durably (`enabled`; `enabled-runtime` and `linked` do not survive a reboot), have an administrator run `sudo loginctl enable-linger YOUR_USER` once (Supervisor never does), "
                               "and start Herdr at boot (enable the headless herdr-server.service deliberately, never beside an interactive server). A manually opened interactive Herdr is usable now but is not reboot-persistent. "
                               "Telegram online does not prove Herdr is running after a reboot")
     boot = {"enabled_units": units_durable, "headless_server_enabled": server_durable, "linger": linger}

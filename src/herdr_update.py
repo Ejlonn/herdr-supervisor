@@ -54,6 +54,7 @@ from herdr_installation import (
     read_active,
     read_bytes_nofollow,
     read_receipt,
+    receipt_release_problem,
     remove_compat_link,
     run_steps,
     sha256_bytes,
@@ -356,6 +357,11 @@ def plan_rollback(env: Env, options: dict[str, Any]) -> tuple[dict[str, Any], li
             blockers.append(f"the previous generation {gid} is missing or does not verify: {'; '.join(problems)}")
         else:
             target.update(generation_id=gid, program_id=gen_manifest.get("program_id"), version=gen_manifest.get("version"), state_schema_version=gen_manifest.get("state_schema_version"))
+            prior = manifest.get("previous_receipt")
+            if prior is not None:
+                unproven = receipt_release_problem(layout, prior, gen_manifest)
+                if unproven is not None:
+                    blockers.append(f"the previous receipt the backup would reinstate is not trusted: {unproven}")
     elif previous.get("kind") == "legacy":
         legacy = manifest.get("legacy_lib") or {}
         if not legacy.get("files"):
@@ -442,9 +448,10 @@ def verify_backup_files(layout: Layout, name: str, manifest: dict[str, Any]) -> 
 
 
 def backup_identity(layout: Layout, name: str, manifest: dict[str, Any]) -> str:
-    """Hash of the validated backup record together with the content hash of every stored copy: what a rollback approval binds."""
+    """Hash of the validated backup record (including the previous receipt a rollback would reinstate, which decides what the manager
+    owns afterwards) together with the content hash of every stored copy: what a rollback approval binds."""
     copies = {entry["file"]: entry["before"]["sha256"] for entry in manifest["entries"] if entry["before"]["state"] == "file"}
-    return canonical_hash({"manifest": {k: v for k, v in manifest.items() if k != "previous_receipt"}, "copies": copies, "legacy": (manifest.get("legacy_lib") or {}).get("files")})
+    return canonical_hash({"manifest": manifest, "copies": copies, "legacy": (manifest.get("legacy_lib") or {}).get("files")})
 
 
 # ------------------------------------------------------------------------------------------------ operation context
@@ -556,7 +563,9 @@ def critical(ctx: Ctx) -> Any:
     stops the mutation instead of being overtaken by it. Nothing in the window waits on anything slow."""
     with StateStore(ctx.layout.paths, ctx.env.clock).transaction():
         if (ctx.plan.get("installed") or {}).get("layout") != "absent":
-            problems = workload_problems(ctx.layout, probe_lock=False)
+            # Every worker's own lock is held for the whole operation (worker_quiesced), so none can start inside this window; what
+            # remains to establish is that none was already running as a unit, and that no work or command arrived.
+            problems = workload_problems(ctx.layout, probe_lock=False) + unit_problems(ctx.env, set())
             if problems:
                 raise InstallError("not at a quiet point (work arrived after the plan was approved): " + "; ".join(problems), code=EXIT_REFUSED)
         yield
@@ -793,6 +802,8 @@ def step_rollback_receipt(ctx: Ctx) -> str:
     """The receipt after a rollback describes the restored release (its own earlier receipt) plus this operation."""
     target = ctx.plan["candidate"]
     old = load_backup_manifest(ctx.layout, ctx.plan["backup"]) or {}
+    if backup_identity(ctx.layout, ctx.plan["backup"], old) != ctx.plan.get("backup_identity"):
+        raise InstallError("the backup changed after the rollback was approved; the receipt was not written", code=EXIT_REFUSED)
     prior = old.get("previous_receipt") or {}
     receipt = {
         **prior, "schema": 1, "operation_id": ctx.operation_id, "kind": "rollback", "approval_hash": ctx.approval_hash, "completed_at": core.iso_utc(ctx.env.clock()),
@@ -996,7 +1007,38 @@ def _journal_binding_problem(journal: Journal, operation_id: str, kind: str, app
     return None
 
 
+def _step_set_problem(env: Env, kind: str, journal: Journal, operation_id: str, approval_hash: str, make_steps: Callable[[Ctx, Payload | None], list[Step]]) -> str | None:
+    """The recorded steps must be exactly the ordered list this approved plan defines. The list is derived from the journal's own
+    plan, which is hash-bound to the approval, so a truncated, reordered or padded record never counts as the operation having
+    happened. Building the list runs no step (and needs no payload), so a genuinely completed operation stays idempotent."""
+    plan_data = journal.data["plan"]
+    expected = [step.id for step in make_steps(Ctx(env, kind, plan_data, None, operation_id, approval_hash), None)]
+    if [item["id"] for item in journal.data["steps"]] != expected:
+        return "a step list that does not match the approved plan"
+    return None
+
+
 _IMMUTABLE_KEYS = ("kind", "tool", "target", "options", "payload_root", "candidate", "dependency")
+
+
+def unit_problems(env: Env, planned: set[str]) -> list[str]:
+    """Why the managed units are not in a state the operation can proceed in: the manager is unreachable, a unit is mid-transition, or a
+    unit other than the headless server and the operation's own planned units is running (a job that started after planning). Read-only;
+    a running job is a reason to refuse, never something to stop."""
+    present = managed_unit_names(env.layout)
+    if not present:
+        return []
+    systemd = Systemd(env.host)
+    if not systemd.available():
+        return ["the user systemd manager cannot be reached, so unit states cannot be established"]
+    problems: list[str] = []
+    for unit in present:
+        state = systemd.state(unit)
+        if state in ("activating", "deactivating", "reloading", "refreshing", "unknown"):
+            problems.append(f"{unit} is {state}")
+        elif state == "active" and unit != SERVER_UNIT and unit not in planned:
+            problems.append(f"{unit} became active outside this operation")
+    return problems
 
 
 def _resume_problems(env: Env, kind: str, plan_data: dict[str, Any], current: Plan, operation_id: str) -> list[str]:
@@ -1043,19 +1085,7 @@ def _resume_problems(env: Env, kind: str, plan_data: dict[str, Any], current: Pl
             problems.append("the installation receipt was replaced by another operation")
     except InstallError as error:
         problems.append(str(error))
-    present = managed_unit_names(layout)
-    if present:
-        systemd = Systemd(env.host)
-        if not systemd.available():
-            problems.append("the user systemd manager cannot be reached, so unit states cannot be established")
-        else:
-            planned = set(plan_data["services"]["stop"]) | set((plan_data.get("components") or {}).get("activate") or [])
-            for unit in present:
-                state = systemd.state(unit)
-                if state in ("activating", "deactivating", "reloading", "refreshing", "unknown"):
-                    problems.append(f"{unit} is {state}")
-                elif state == "active" and unit != SERVER_UNIT and unit not in planned:
-                    problems.append(f"{unit} became active outside this operation")
+    problems += unit_problems(env, set(plan_data["services"]["stop"]) | set((plan_data.get("components") or {}).get("activate") or []))
     if (plan_data.get("installed") or {}).get("layout") != "absent":
         problems += [f"not at a quiet point: {item}" for item in workload_problems(layout, probe_lock=False)]
     return problems
@@ -1086,6 +1116,8 @@ def apply_operation(
             return ApplyResult("RECONCILING", str(error), operation_id=operation_id)
         if journal is not None and journal.data.get("status") == "COMPLETE":
             bad = _journal_binding_problem(journal, operation_id, kind, approval_hash, complete=True)
+            if bad is None:
+                bad = _step_set_problem(env, kind, journal, operation_id, approval_hash, make_steps)
             if bad is not None:
                 return ApplyResult("REFUSED", f"the completed-operation record is not trusted: it has {bad}", operation_id=operation_id)
             return ApplyResult("ALREADY_APPLIED", "this approved plan was already applied; nothing was repeated", operation_id=operation_id, steps=journal.data["steps"])

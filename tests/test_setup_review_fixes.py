@@ -679,7 +679,7 @@ class ReadinessIdentityTests(FullCase):
 
     def test_only_durable_enablement_counts_as_persistence(self) -> None:
         self.ready()
-        for state, expected in (("enabled-runtime", False), ("disabled", False), ("static", False), ("linked", True), ("enabled", True)):
+        for state, expected in (("enabled-runtime", False), ("disabled", False), ("static", False), ("linked", False), ("linked-runtime", False), ("alias", False), ("enabled", True)):
             with self.subTest(state):
                 self.host.enabled_units["herdr-telegram.service"] = state
                 self.assertEqual(self.status()["boot"]["enabled_units"], expected)
