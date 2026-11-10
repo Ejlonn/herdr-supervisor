@@ -4,7 +4,7 @@
 
 This repository is an independent community companion project. It is not an official Herdr component and is not affiliated with or endorsed by Herdr, Anthropic, OpenAI, or Telegram.
 
-The current candidate version is **0.3.0-beta.1**. Beta status does not relax authorization, redaction, callback replay, prompt-delivery, state-integrity, or approval-hash guarantees.
+The current candidate version is **0.4.0-beta.1**. Beta status does not relax authorization, redaction, callback replay, prompt-delivery, state-integrity, or approval-hash guarantees.
 
 ## Capabilities
 

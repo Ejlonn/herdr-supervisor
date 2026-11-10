@@ -57,7 +57,7 @@ class DistributionTests(unittest.TestCase):
             "systemd/herdr-backup.service", "systemd/herdr-backup.timer", "bin/herdr-backup",
         ):
             self.assertTrue((ROOT / path).is_file(), path)
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "0.3.0-beta.1")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "0.4.0-beta.1")
         self.assertIn("Apache License", (ROOT / "LICENSE").read_text())
         readme = (ROOT / "README.md").read_text()
         metadata = (ROOT / "pyproject.toml").read_text()

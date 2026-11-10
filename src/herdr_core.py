@@ -18,11 +18,11 @@ from typing import Any
 
 # Single source of the supervisor release identity. VERSION, pyproject.toml (normalized), README, and
 # installed metadata are checked against it by the version-consistency tests and CI.
-SUPERVISOR_VERSION = "0.3.0-beta.1"
+SUPERVISOR_VERSION = "0.4.0-beta.1"
 
 
 def normalize_version(text: str) -> str:
-    """Release string -> the PEP 440 form used by packaging metadata (`0.3.0-beta.1` -> `0.3.0b1`)."""
+    """Release string -> the PEP 440 form used by packaging metadata (`0.4.0-beta.1` -> `0.4.0b1`)."""
     value = text.strip()
     for word, short in (("-beta.", "b"), ("-alpha.", "a"), ("-rc.", "rc"), ("-beta", "b0"), ("-alpha", "a0"), ("-rc", "rc0")):
         if word in value:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-supervisor"
-version = "0.3.0b1"
+version = "0.4.0b1"
 description = "Durable human-in-the-loop workflow supervision and Telegram control for Herdr coding agents"
 readme = "README.md"
 requires-python = ">=3.11"

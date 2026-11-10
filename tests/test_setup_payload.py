@@ -22,7 +22,7 @@ class PayloadInventoryTests(SetupCase):
         self.assertEqual({role: len(first.of_role(role)) for role in hi.ROLES},
                          {"program": len(list((self.payload / "src").glob("*.py"))) + 1, "launcher": 8, "unit": 10, "doc": len(list((self.payload / "docs").glob("*.md"))) + 4, "example": 4})  # backup, model-profiles, supervisor, telegram
         self.assertIn("program/quota-dependency.json", {item.key for item in first.files})
-        self.assertEqual(first.version, "0.3.0-beta.1")
+        self.assertEqual(first.version, "0.4.0-beta.1")
         self.assertEqual(first.state_schema_version, 2)
         for item in first.files:
             self.assertEqual(item.sha256, hi.sha256_bytes(first.blobs[item.key]), "the inventory hashes the very bytes that are later published")

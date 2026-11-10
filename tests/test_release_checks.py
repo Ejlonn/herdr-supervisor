@@ -33,7 +33,7 @@ class VersionConsistencyTests(unittest.TestCase):
     def test_single_version_source(self) -> None:
         version = herdr_core.SUPERVISOR_VERSION
         self.assertEqual((ROOT / "VERSION").read_text().strip(), version)
-        self.assertEqual(hs.normalize_version(version), "0.3.0b1")
+        self.assertEqual(hs.normalize_version(version), "0.4.0b1")
         pyproject = (ROOT / "pyproject.toml").read_text()
         self.assertIn(f'version = "{hs.normalize_version(version)}"', pyproject)
         self.assertIn(f"**{version}**", (ROOT / "README.md").read_text())
