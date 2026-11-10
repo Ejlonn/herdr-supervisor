@@ -879,10 +879,56 @@ def release_inventory_id(manifest: dict[str, Any], assets: list[dict[str, Any]])
     return canonical_hash({"version": manifest["version"], "files": files + owned})
 
 
-def receipt_release_problem(layout: Layout, receipt: dict[str, Any], manifest: dict[str, Any]) -> str | None:
-    """Ownership is not a file name pattern. The receipt's exact role/name/hash/size/mode inventory must reproduce the payload identity
-    it records, over the program files of the independently verified generation; and, for an operation that wrote it from an
-    approved plan, must equal the inventory that plan (hash-bound to its approval) enumerated."""
+def backup_identity(layout: Layout, name: str, manifest: dict[str, Any]) -> str:
+    """Hash of the validated backup record (including the previous receipt a rollback would reinstate, which decides what the manager
+    owns afterwards) together with the content hash of every stored copy: what a rollback approval binds."""
+    copies = {entry["file"]: entry["before"]["sha256"] for entry in manifest["entries"] if entry["before"]["state"] == "file"}
+    return canonical_hash({"manifest": manifest, "copies": copies, "legacy": (manifest.get("legacy_lib") or {}).get("files")})
+
+
+def load_backup_checked(layout: Layout, name: str) -> tuple[dict[str, Any] | None, str]:
+    """The backup record with its exact-type schema enforced, or (None, why). The directory and the record must be real, not links."""
+    base = layout.backups / name
+    try:
+        info = os.lstat(base)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return None, "the backup directory is not a real directory"
+        value = json.loads(read_bytes_nofollow(base / "manifest.json", 8 * 1024 * 1024))
+        return validate_backup_manifest(layout, name, value), ""
+    except (OSError, ValueError) as error:
+        return None, f"unreadable ({error})"
+    except InstallError as error:
+        return None, str(error)
+
+
+MAX_RECEIPT_CHAIN = 32
+
+
+def _approved_plan(layout: Layout, receipt: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """The approved plan that wrote this receipt, read from its operation journal and bound to the receipt by operation id, approval
+    hash and the plan's own hash. The operation KIND is taken from that plan, and the receipt's label must agree with it, so editing
+    the label can neither select nor disable a check."""
+    try:
+        journal = json.loads(read_bytes_nofollow(layout.ops / f"{receipt['operation_id']}.json", MAX_JSON_BYTES))
+    except (OSError, ValueError):
+        return None, "the approved plan of the operation that wrote this receipt is not available, so the files it claims to own cannot be proven"
+    plan = journal.get("plan") if isinstance(journal, dict) else None
+    if (not isinstance(plan, dict) or journal.get("operation_id") != receipt["operation_id"] or journal.get("approval_hash") != receipt.get("approval_hash")
+            or canonical_hash(plan) != receipt.get("approval_hash") or plan.get("kind") not in ("setup", "update", "rollback") or plan["kind"] != receipt.get("kind")):
+        return None, "the installation receipt is not the one its approved plan produced (identity, hash or operation kind differ)"
+    return plan, None
+
+
+def receipt_release_problem(layout: Layout, receipt: dict[str, Any], manifest: dict[str, Any], _chain: tuple[str, ...] = ()) -> str | None:
+    """Ownership is not a file name pattern, a label or a self-computed hash. The receipt's exact role/name/hash/size/mode inventory must
+    reproduce the payload identity it records, over the program files of the independently verified generation, and must then be
+    proven by the approved plan of the operation that wrote it, whatever its kind:
+      setup/update  the inventory equals the one the plan enumerated for its candidate;
+      rollback      the plan names a backup whose record is bound into the approval; the inventory is exactly that backup's previous
+                    receipt, which is proven in turn against its own approved operation (bounded, cycle-refusing)."""
+    operation = receipt["operation_id"]
+    if operation in _chain or len(_chain) >= MAX_RECEIPT_CHAIN:
+        return "the installation receipt chain is cyclic or too long to prove"
     claimed = receipt.get("payload_id")
     if not is_hex(claimed, 64):
         return "the installation receipt records no payload identity, so the files it claims to own cannot be proven"
@@ -890,17 +936,31 @@ def receipt_release_problem(layout: Layout, receipt: dict[str, Any], manifest: d
         return "the installation receipt names a different release than the verified generation"
     if release_inventory_id(manifest, receipt["assets"]) != claimed:
         return "the installation receipt's asset inventory does not reproduce the payload identity it records (it lists, omits or alters files the release did not ship)"
-    if receipt.get("kind") in ("setup", "update"):
-        try:
-            journal = json.loads(read_bytes_nofollow(layout.ops / f"{receipt['operation_id']}.json", MAX_JSON_BYTES))
-        except (OSError, ValueError):
-            return "the approved plan of the operation that wrote this receipt is not available, so the files it claims to own cannot be proven"
-        plan = journal.get("plan") if isinstance(journal, dict) else None
-        if (not isinstance(plan, dict) or journal.get("operation_id") != receipt["operation_id"] or journal.get("approval_hash") != receipt.get("approval_hash")
-                or canonical_hash(plan) != receipt.get("approval_hash") or (plan.get("candidate") or {}).get("payload_id") != claimed
-                or plan.get("receipt_assets", plan.get("assets")) != receipt["assets"]):
+    plan, why = _approved_plan(layout, receipt)
+    if plan is None:
+        return why
+    if plan["kind"] in ("setup", "update"):
+        if (plan.get("candidate") or {}).get("payload_id") != claimed or plan.get("receipt_assets", plan.get("assets")) != receipt["assets"]:
             return "the installation receipt's asset inventory is not the one its approved plan enumerated"
-    return None
+        return None
+    target = plan.get("candidate") or {}
+    backup_name = plan.get("backup")
+    if target.get("generation_id") != receipt.get("generation_id") or target.get("program_id") != receipt.get("program_id") or receipt.get("rolled_back_operation") != backup_name:
+        return "the rollback receipt does not describe the release its approved rollback restores"
+    if not isinstance(backup_name, str) or not is_hex(backup_name, 32):
+        return "the approved rollback names no valid backup"
+    record, problem = load_backup_checked(layout, backup_name)
+    if record is None:
+        return f"the backup its approved rollback restored cannot be used to prove ownership: {problem}"
+    if backup_identity(layout, backup_name, record) != plan.get("backup_identity"):
+        return "the backup its rollback restored changed after the rollback was approved"
+    prior = record.get("previous_receipt")
+    if prior is None or prior.get("generation_id") != receipt.get("generation_id") or prior.get("payload_id") != claimed or prior["assets"] != receipt["assets"]:
+        return "the rollback receipt's inventory is not the previous receipt its approved backup recorded"
+    prior_manifest, problems = verify_generation(layout.generations / str(prior["generation_id"]), expect_id=str(prior["generation_id"]), expect_program_id=prior.get("program_id"))
+    if prior_manifest is None or problems:
+        return "the release the rollback restored does not verify: " + "; ".join(problems)
+    return receipt_release_problem(layout, prior, prior_manifest, (*_chain, operation))
 
 
 def read_receipt(layout: Layout) -> dict[str, Any] | None:

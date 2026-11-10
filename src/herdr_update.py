@@ -39,6 +39,7 @@ from herdr_installation import (
     Systemd,
     asset_state,
     assets_for,
+    backup_identity,
     canonical_hash,
     compat_link_state,
     create_file_exclusive,
@@ -48,6 +49,7 @@ from herdr_installation import (
     fsync_dir,
     inspect_install,
     is_int,
+    load_backup_checked,
     load_payload,
     managed_unit_names,
     publish_generation,
@@ -61,7 +63,6 @@ from herdr_installation import (
     state_schema_on_disk,
     switch_active,
     tool_identity,
-    validate_backup_manifest,
     verify_generation,
     verify_units,
     version_key,
@@ -410,21 +411,6 @@ def is_hex_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
-def load_backup_checked(layout: Layout, name: str) -> tuple[dict[str, Any] | None, str]:
-    """The backup record with its exact-type schema enforced, or (None, why). The directory and the record must be real, not links."""
-    base = layout.backups / name
-    try:
-        info = os.lstat(base)
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            return None, "the backup directory is not a real directory"
-        value = json.loads(read_bytes_nofollow(base / "manifest.json", 8 * 1024 * 1024))
-        return validate_backup_manifest(layout, name, value), ""
-    except (OSError, ValueError) as error:
-        return None, f"unreadable ({error})"
-    except InstallError as error:
-        return None, str(error)
-
-
 def load_backup_manifest(layout: Layout, name: str) -> dict[str, Any] | None:
     return load_backup_checked(layout, name)[0]
 
@@ -445,13 +431,6 @@ def verify_backup_files(layout: Layout, name: str, manifest: dict[str, Any]) -> 
         if state["state"] != "file" or state["sha256"] != digest:
             problems.append(f"backup copy of legacy {fname} is missing or altered")
     return problems
-
-
-def backup_identity(layout: Layout, name: str, manifest: dict[str, Any]) -> str:
-    """Hash of the validated backup record (including the previous receipt a rollback would reinstate, which decides what the manager
-    owns afterwards) together with the content hash of every stored copy: what a rollback approval binds."""
-    copies = {entry["file"]: entry["before"]["sha256"] for entry in manifest["entries"] if entry["before"]["state"] == "file"}
-    return canonical_hash({"manifest": manifest, "copies": copies, "legacy": (manifest.get("legacy_lib") or {}).get("files")})
 
 
 # ------------------------------------------------------------------------------------------------ operation context

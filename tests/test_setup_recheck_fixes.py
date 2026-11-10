@@ -239,6 +239,140 @@ class ReleaseOwnershipTests(UpdateCase):
         self.assertEqual(self.update(self.v2)[0], 0, "and an update from the restored release works")
 
 
+class RollbackReceiptOwnershipTests(UpdateCase):
+    """CI2-R2: every receipt kind is proven by the approved operation that wrote it; the kind is taken from that plan, not from the label."""
+
+    unowned = ReleaseOwnershipTests.unowned
+    entry_for = ReleaseOwnershipTests.entry_for
+    reseal = ReleaseOwnershipTests.reseal
+
+    def records(self) -> dict[str, bytes]:
+        """Every journal and backup record, byte for byte."""
+        return {str(path.relative_to(self.layout.manager)): path.read_bytes() for path in sorted(self.layout.manager.rglob("*")) if path.is_file()}
+
+    def forge(self, **changes: Any) -> Path:
+        victim = self.unowned()
+        receipt = self.receipt()
+        receipt.update(changes)
+        receipt["assets"].append(self.entry_for(victim))
+        self.reseal(receipt)
+        self.layout.receipt.write_text(json.dumps(receipt))
+        return victim
+
+    def assert_unowned_file_is_safe(self, victim: Path, needle: str) -> None:
+        records = self.records()
+        state = hi.inspect_install(self.layout)
+        self.assertEqual(state.layout, "inconsistent", state.problems)
+        self.assertIn(needle, " ".join(state.problems))
+        self.assertTrue(any("inconsistent" in item for item in self.preview(self.v2)["blockers"]))
+        code, out, err = self.update(self.v2)
+        self.assertEqual(code, hi.EXIT_REFUSED, out + err)
+        self.assertTrue(victim.exists(), "the user's file was not deleted")
+        self.assertEqual(self.records(), records, "no journal or backup was changed")
+
+    def test_a_forged_rollback_receipt_cannot_grant_ownership(self) -> None:
+        self.assertEqual(self.update(self.v2)[0], 0)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0)
+        self.assertEqual(self.receipt()["kind"], "rollback")
+        victim = self.forge()
+        self.assert_unowned_file_is_safe(victim, "previous receipt its approved backup recorded")
+
+    def test_relabelling_a_receipt_cannot_disable_its_check(self) -> None:
+        for label in ("rollback", "update", "setup", "other"):
+            with self.subTest(label):
+                self.layout.receipt.write_text(json.dumps(self.receipt()))
+                original = self.receipt()
+                victim = self.unowned()
+                forged = {**original, "kind": label}
+                forged["assets"] = [*original["assets"], self.entry_for(victim)]
+                self.reseal(forged)
+                self.layout.receipt.write_text(json.dumps(forged))
+                records = self.records()
+                self.assertEqual(hi.inspect_install(self.layout).layout, "inconsistent")
+                self.assertEqual(self.update(self.v2)[0], hi.EXIT_REFUSED)
+                self.assertTrue(victim.exists())
+                self.assertEqual(self.records(), records)
+                victim.unlink()
+                self.layout.receipt.write_text(json.dumps(original))
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+
+    def test_a_relabelled_receipt_that_changes_nothing_else_is_still_refused(self) -> None:
+        genuine = self.receipt()
+        self.layout.receipt.write_text(json.dumps({**genuine, "kind": "rollback"}))
+        state = hi.inspect_install(self.layout)
+        self.assertEqual(state.layout, "inconsistent")
+        self.assertIn("operation kind", " ".join(state.problems))
+
+    def test_genuine_rollback_rollback_of_rollback_and_updates_stay_provable(self) -> None:
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+        self.assertEqual(self.update(self.v2)[0], 0)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0)
+        self.assertEqual((self.receipt()["kind"], hi.inspect_install(self.layout).layout), ("rollback", "managed"))
+        self.assertEqual(self.active_generation(), self.old_generation)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0, "a rollback can itself be rolled back")
+        self.assertEqual((self.receipt()["kind"], hi.inspect_install(self.layout).layout), ("rollback", "managed"))
+        self.assertNotEqual(self.active_generation(), self.old_generation)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0)
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+        later = self.candidate("payload-after-rollbacks", "0.3.2")
+        self.assertEqual(self.update(later)[0], 0, "an update from a rolled-back release works")
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+
+    def test_an_auxiliary_only_update_after_a_rollback_and_owned_asset_retirement_still_work(self) -> None:
+        extra = self.candidate("payload-extra-doc-2", "0.3.1", lambda root: (root / "docs" / "EXTRA.md").write_text("shipped by one release only\n"))
+        self.assertEqual(self.update(extra)[0], 0)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0)
+        self.assertFalse((self.layout.doc / "EXTRA.md").exists(), "the rolled-back release's own asset is removed again")
+        self.assertEqual(self.update(extra)[0], 0)
+        self.assertTrue((self.layout.doc / "EXTRA.md").exists())
+        later = self.candidate("payload-later-2", "0.3.2")
+        self.assertEqual(self.update(later)[0], 0)
+        self.assertFalse((self.layout.doc / "EXTRA.md").exists(), "a genuinely removed-release asset is still retired")
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+
+    def test_the_evidence_a_rollback_receipt_depends_on_must_be_present_and_unchanged(self) -> None:
+        self.assertEqual(self.update(self.v2)[0], 0)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0)
+        receipt = self.receipt()
+        journal = self.layout.ops / f"{receipt['operation_id']}.json"
+        backup = self.layout.backups / receipt["rolled_back_operation"] / "manifest.json"
+        for label, target in (("journal", journal), ("backup record", backup)):
+            with self.subTest(f"{label} missing"):
+                kept = target.read_bytes()
+                target.unlink()
+                self.assertEqual(hi.inspect_install(self.layout).layout, "inconsistent")
+                target.write_bytes(kept)
+                self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+        with self.subTest("plan altered without its hash"):
+            kept = journal.read_bytes()
+            data = json.loads(kept)
+            data["plan"]["backup_identity"] = "0" * 64
+            journal.write_text(json.dumps(data))
+            self.assertEqual(hi.inspect_install(self.layout).layout, "inconsistent")
+            journal.write_bytes(kept)
+        with self.subTest("backup record altered"):
+            kept = backup.read_bytes()
+            data = json.loads(kept)
+            data["previous_receipt"]["assets"].append(self.entry_for(self.unowned()))
+            backup.write_text(json.dumps(data))
+            state = hi.inspect_install(self.layout)
+            self.assertEqual(state.layout, "inconsistent")
+            self.assertIn("changed after the rollback was approved", " ".join(state.problems))
+            backup.write_bytes(kept)
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+
+    def test_the_proof_chain_is_bounded_and_refuses_cycles(self) -> None:
+        self.assertEqual(self.update(self.v2)[0], 0)
+        self.assertEqual(self.run_tool("rollback", "--apply", "--approve-current")[0], 0)
+        receipt = self.receipt()
+        manifest, problems = hi.verify_generation(self.layout.generations / receipt["generation_id"])
+        self.assertIsNotNone(manifest)
+        assert manifest is not None and not problems
+        self.assertIsNone(hi.receipt_release_problem(self.layout, receipt, manifest))
+        self.assertIn("cyclic", hi.receipt_release_problem(self.layout, receipt, manifest, (receipt["operation_id"],)) or "")
+        self.assertIn("too long", hi.receipt_release_problem(self.layout, receipt, manifest, tuple(f"{n:032x}" for n in range(hi.MAX_RECEIPT_CHAIN))) or "")
+
+
 class LateWorkerTests(UpdateCase):
     """CI3-R1: every worker's own lock is held for the whole operation, running bounded work is never stopped, and units are re-checked in the window."""
 
