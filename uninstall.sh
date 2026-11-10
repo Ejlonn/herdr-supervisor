@@ -57,12 +57,14 @@ remove_file() {
     if [ "$DRY_RUN" -eq 1 ]; then echo "Would remove $1"; else rm -f -- "$1"; fi
 }
 
-for name in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker; do remove_file "$BIN_DIR/$name"; done
+for name in herdr-supervisor herdr-telegram herdr-query-worker herdr-backup herdr-codex-reset-worker herdr-quota-dependency herdr-setup herdr-native-identity; do remove_file "$BIN_DIR/$name"; done
 for name in herdr-server.service herdr-supervisor-worker.service herdr-supervisor-worker.path herdr-query-worker.service herdr-query-worker.path herdr-telegram.service herdr-backup.service herdr-backup.timer herdr-codex-reset-worker.service herdr-codex-reset-worker.path; do remove_file "$UNIT_DIR/$name"; done
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "Would remove $LIB_DIR and $DOC_DIR"
 else
+    # Program generations are published read-only; make them removable before deleting the program directory.
+    if [ -d "$LIB_DIR/generations" ]; then chmod -R u+w -- "$LIB_DIR/generations" 2>/dev/null || true; fi
     rm -rf -- "$LIB_DIR" "$DOC_DIR"
 fi
 

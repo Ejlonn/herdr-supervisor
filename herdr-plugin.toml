@@ -12,6 +12,18 @@ contexts = ["workspace"]
 command = ["sh", "install.sh"]
 
 [[actions]]
+id = "setup-preview"
+title = "Preview guided full setup (read-only)"
+contexts = ["workspace"]
+command = ["python3", "src/herdr_setup.py", "setup", "--profile", "full"]
+
+[[actions]]
+id = "update-preview"
+title = "Preview an update from this checkout (read-only)"
+contexts = ["workspace"]
+command = ["python3", "src/herdr_setup.py", "update"]
+
+[[actions]]
 id = "status"
 title = "Show Supervisor status"
 contexts = ["workspace"]

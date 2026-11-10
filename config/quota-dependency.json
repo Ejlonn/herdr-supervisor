@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "dependency": "herdr-agent-quota",
+  "plugin_id": "herdr-agent-quota",
+  "repository": {
+    "url": "https://github.com/Ejlonn/herdr-agent-quota"
+  },
+  "upstream": {
+    "url": "https://github.com/praxstack/herdr-agent-quota",
+    "relocated_from": "https://github.com/levi-qiao/herdr-agent-quota"
+  },
+  "revision": "809749e585480047e502df072fb8ddccc4719d4e",
+  "tree_sha1": "d47a762885a8acefa85f362ce48cccbf1bb0389d",
+  "manifest_version": "1.5.4",
+  "min_herdr_version": "0.9.0",
+  "license": {
+    "spdx": "MIT",
+    "file": "LICENSE",
+    "sha256": "522e618d01ebcd1f069810bddd0857a2562f1bdb9ed6a2630f99e578c17e6bfb",
+    "copyright": "Copyright (c) 2026 Levi Qiao"
+  },
+  "toolchain": {
+    "channel": "1.95.0",
+    "build_command": ["cargo", "build", "--release", "--locked"]
+  },
+  "critical_files": {
+    "Cargo.lock": "27aee361f19c1a46207d168ac9eb6e43d5359203ce6e71bb428221c55b7c028d",
+    "Cargo.toml": "ce90290ba2d5952bf6bb0f65970cfbf793d2959c4528ba97ae310e1d901461bc",
+    "LICENSE": "522e618d01ebcd1f069810bddd0857a2562f1bdb9ed6a2630f99e578c17e6bfb",
+    "herdr-plugin.toml": "9c7e21baebc3808ccc9d9845ad51d8dcf12ca01824229895fc483ae54cac7c87",
+    "rust-toolchain.toml": "7d21c66a15f41bad66b82ed06a289f5dc8a6e3751951d2696bbf20ce296f2b0f"
+  },
+  "content_manifest_sha256": "3807bdf6fd6df9dfb45ed86b1c904e5592d2ead0b5991c978323d8b53fcfa222",
+  "allowed_symlinks": {
+    "CLAUDE.md": "AGENTS.md"
+  },
+  "recovery_artifacts": [
+    {
+      "kind": "source-archive",
+      "file": "herdr-agent-quota-809749e-source.tar.gz",
+      "sha256": "0f43db667d95b5ac79392a2bf561fad0fa6c6bb6cfd6da39e9191663a945aa00",
+      "note": "git archive of the locked commit (tracked files only, MIT license included); contains no quota snapshots, credentials or build output"
+    },
+    {
+      "kind": "git-bundle",
+      "file": "herdr-agent-quota-809749e.bundle",
+      "sha256": "6761d16b8546ba0c6353b943961ee71e9267d3b2076d21765bf9383fe0dfdba7",
+      "note": "single-commit snapshot of the locked commit; its two parent commits are absent, so it cannot be fetched for history. The tool reads it by unpacking objects and archiving the locked commit"
+    }
+  ],
+  "provenance": {
+    "owned_fork": "https://github.com/Ejlonn/herdr-agent-quota",
+    "fork_parent": "https://github.com/praxstack/herdr-agent-quota",
+    "originally_published_at": "https://github.com/levi-qiao/herdr-agent-quota (no longer resolves)",
+    "pinned_on": "2026-10-22",
+    "pin_evidence": "the commit was the installed, clean, working plugin revision; the owned fork was read through the GitHub API and serves it",
+    "not_used": "fork main (151 commits ahead of the pin, unreviewed) is not a supported revision; moving the pin needs a reviewed change to this file",
+    "build_note": "the plugin's own manifest runs `cargo build --release`; the supported preparation builds with --locked against the hashed Cargo.lock"
+  }
+}

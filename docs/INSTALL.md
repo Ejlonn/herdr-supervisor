@@ -1,16 +1,114 @@
-# Installation and rollback
+# Installation, update and rollback
 
-Requires Herdr 0.9.0 or newer (the minimum tested CLI contract); `herdr-supervisor doctor` fails with an error when the version or a required command/option is missing and warns when only the optional prompt acknowledgement is absent. Run `./install.sh --dry-run` first, then `./install.sh` as the target non-root user. Both refuse to proceed, before creating any file, unless the Herdr executable exists at `~/.local/bin/herdr`. The source tree is copied to `~/.local/lib/herdr-supervisor`, launchers to `~/.local/bin`, examples and documentation to `~/.local/share/doc/herdr-supervisor`, and inactive units to `~/.config/systemd/user`.
+Requires Linux with user systemd, Python 3.11 or newer, and Herdr 0.9.0 or newer installed user-scoped at `~/.local/bin/herdr` (the minimum tested CLI contract). `herdr-supervisor doctor` fails with an error when the version or a required command/option is missing and warns when only the optional prompt acknowledgement is absent. Herdr itself, the Codex and Claude CLIs and their account logins, a Telegram bot token and your owner id, and the choice of your existing Codex/Claude session pair are **your** steps: `herdr-setup` guides them and never performs them (no root, no package manager, no model prompt, no provider login, no session creation).
 
-The installer creates configuration only when the target file is absent. It never overwrites a bot token, config, owner record, task, event, log, lock, or state file. It validates units when `systemd-analyze` is available and `XDG_RUNTIME_DIR` is set (otherwise it reports the check as skipped) and never calls `daemon-reload`, `enable`, `start`, `restart`, or `--now`.
-
-State schema migration is separate and explicit:
+## Quick start
 
 ```sh
-./install.sh --migrate
+./install.sh --dry-run          # preview: writes nothing, runs no service command
+./install.sh                    # minimal, inactive installation of the program files
+herdr-setup status              # what is installed and what is still missing
+herdr-setup setup --profile full --payload "$PWD"   # guided full setup (a preview until you apply it); --payload names the reviewed tree
 ```
 
-Run this only after reviewing the candidate and making a state backup. It does not activate services.
+`./install.sh` (and the marketplace `setup` action, which runs it) is the **minimal profile**: it installs the program files, launchers, disabled unit definitions, documents and examples, and creates a configuration file only when it is absent. It never loads, enables, starts or restarts a service and never replaces an installed release: an existing legacy or different installation is refused, with the next command to run. The result is honestly *installed but inactive*.
+
+## `herdr-setup`
+
+One standard-library command with four operations. **Every operation previews by default**: it writes no target file, contacts no download endpoint and activates nothing. A plan file is an explicit extra output (`--plan-out FILE`, created exclusively, mode 0600).
+
+| Command | What it does |
+|---|---|
+| `herdr-setup setup [--profile minimal\|full]` | Install (minimal) or install and configure selected components (full) |
+| `herdr-setup update [--adopt-legacy-from DIR]` | Replace the installed release with a reviewed local tree |
+| `herdr-setup status` | Read-only installation and readiness report |
+| `herdr-setup rollback` | Undo the last operation (previous release and its assets) |
+
+A preview ends with an **approval hash**. The hash covers the candidate's file contents, the options, the resolved target (home, directories, uid), the exact preimage of every file that may change, the service actions and the ordered action list, and the running tool itself. Apply spends exactly one approval:
+
+```sh
+herdr-setup update --payload /path/to/reviewed/tree --plan-out update.plan   # review the printed actions
+herdr-setup update --apply --plan update.plan --approve HASH                 # non-interactive apply
+herdr-setup setup --interactive --payload /path/to/reviewed/tree            # asks, shows one complete preview, asks for the hash prefix
+```
+
+If the candidate, an option, the target or any preimage changed after the preview, the approval is stale and nothing is written. `--approve-current` computes and approves the plan in one step (that is what `./install.sh` does).
+
+### Payload
+
+`--payload DIR` names a source checkout or a complete source release. A tool running from a checkout uses that checkout; an **installed** tool holds only the program files, so it never searches for a source tree and requires `--payload` (it checks this before asking any question, and shows the source recorded in its receipt as a hint it does not use automatically). The tool reads only an explicit allowlist, hashes the very bytes it later publishes, and refuses symbolic links, hard links, special files, unexpected names or directories, unsafe permission bits, more than 256 files, oversized files, or a `VERSION` that disagrees with `herdr_core.py`. Nothing in the payload is imported or run while it is inspected. A wheel alone contains the console tools but not the units, launchers and documents, so `herdr-setup` reports a missing payload instead of pretending; there is no remote branch following, no curl-to-shell, no background updater and no automatic dependency-pin movement.
+
+### Layout and atomicity
+
+```
+~/.local/lib/herdr-supervisor/active -> generations/<version>-<program id>   (one pointer, one rename)
+~/.local/lib/herdr-supervisor/generations/<version>-<program id>/            (complete, read-only, verified by GENERATION.json)
+~/.local/bin/herdr-*  ~/.config/systemd/user/herdr-*  ~/.local/share/doc/herdr-supervisor/   (enumerated assets)
+~/.local/state/herdr-supervisor/installation/   (receipt.json, ops/ journals, backups/, deploy.lock)
+```
+
+Every launcher resolves `active` exactly once and runs the concrete directory, so concurrent invocations during an update each use one complete release. The previous generation is kept for rollback. Generations are not pruned automatically. The earlier documented hook path `~/.local/lib/herdr-supervisor/herdr_native_identity.py` is kept as a link to the active generation, so a provider hook configured with it keeps working; new hooks should use `~/.local/bin/herdr-native-identity` (see [sessions](SESSIONS.md)).
+
+### Updating
+
+`herdr-setup update` requires a **quiet point** and refuses (changing nothing) while any of these holds: a supervised task is not DONE or CANCELLED, a gate/continuation/owner recovery/interrupted or uncertain delivery/follow-up is unresolved, a supervisor, query or reset worker holds its worker lock, a command, query, reset or pending-start item is queued, a session preparation is unresolved, a service is activating/deactivating or its state cannot be established, task state is unreadable or newer than the candidate supports, or a managed file was modified by someone else. Running tasks are never self-updated.
+
+When it applies, it takes the deployment lock (concurrent applies of one plan join one journal; a different plan goes stale) and the worker locks the supervisor, query and reset workers use for their own exclusion (held for the whole operation, so a late start finds its lock held; a worker already running makes it refuse), backs up every asset it will replace, stops only the managed units that are active (never `herdr-server.service`, which hosts your native sessions), replaces assets, reloads the user manager once if a unit changed, switches the pointer, writes the receipt, runs a launcher smoke check, and restarts only the units it stopped. A failed smoke check restores the previous release automatically. The windows in which files, the pointer or the receipt change hold the controller's transaction lock and re-evaluate the whole quiet-point predicate and the managed units' states inside it, so a job unit that started late, a command or a decision that arrives after the plan was approved stops the mutation (the units this operation stopped are started again). A running worker, query, reset or backup job is waited for, never stopped; only triggers and the Telegram bridge are stopped and restored. The same rule applies to `setup` whenever it would change an installed system (a pure no-op needs no quiet point). It never changes configuration, credentials, provider auth, native histories, registry bindings, gates, tasks, inbox, outbox or any file it does not list.
+
+An interrupted operation is resumed by applying the same plan again, but the journal is not authority by itself: it must be bound to the approval (identity, kind, plan hash, and exactly the ordered step list that plan defines, for a completion record as well as an interrupted one), the enforcing tool, target, options, candidate and dependency must be the approved ones, anything the operation already changed must match its recorded preimage or planned result, and the quiet point and service states are checked again before any further side effect. Finished steps are skipped, idempotent steps repeat, and a step whose effect on the outside world is unknown (a plugin link, a Telegram setup) is checked against its COMPLETE postcondition and never repeated blindly: conflicting, partial or unverified state (an unverified stage, a plugin from another source, a half-written token) stays `RECONCILING` (exit 5); backups are retained.
+
+### Legacy installations
+
+A flat installation from the earlier installer is adopted only explicitly and only when it is byte-for-byte the reviewed tree you name:
+
+```sh
+herdr-setup update --payload NEW_TREE --adopt-legacy-from OLD_TREE   # preview shows every difference that blocks adoption
+```
+
+Version text is never proof. An unknown extra, missing or changed program file blocks adoption and every other change, and its code is never read or imported; a deployment that has modules the reviewed tree does not have (for example private additions) is not replaced. Adoption backs up the flat files and launchers first and `herdr-setup rollback` restores them exactly.
+
+### Metadata is untrusted
+
+Receipts, backup records, journals and generation manifests are validated by exact types before anything is derived from them: every recorded asset must be a canonical managed destination for this layout (and the receipt's complete inventory must reproduce the payload identity it records over the verified generation and be proven by the approved plan of the operation that wrote it, whatever its kind: a setup or update receipt equals what its plan enumerated, a rollback receipt equals the previous receipt of the backup its approved rollback restored, which is proven in turn against its own operation; the kind is read from that plan, so relabelling a receipt cannot disable the check, and a missing or altered journal or backup makes the installation `inconsistent`), every backup copy is addressed only as `files/<n>` or `legacy-lib/<module>` beneath its own operation directory and must match its recorded hash, a generation's directory name must follow from its recomputed program identity and match the identity recorded for it (rewriting a module and its own manifest cannot keep the old name), and generation files and directories must be read-only.
+
+### Rollback
+
+`herdr-setup rollback` returns to the previous generation (or restores the legacy flat files) and the backed-up assets, but only at a quiet point, only when the current assets are exactly what the last operation wrote, only when the previous generation and backups verify, and only when existing task state is not newer than the previous release can read (state is never rolled back to force old code to run). The approval is bound to the verified backup record (including the previous receipt it would reinstate, which must prove its own release) and the content of every stored copy, and both are checked again before anything is restored and before the receipt is written. A rollback can itself be rolled back. The schema migration (`./install.sh --migrate` or `herdr-setup ... --migrate`) is a separate, explicit selection and is never implied by an update.
+
+### Full profile
+
+`herdr-setup setup --profile full` automates the supported stack after a reviewed selection (default components `sessions,telegram,quota`; `paths` is added when you pass `--project-root`, `--review-root` or `--product-repo`). Each component uses an existing contract and reports `ACTION_REQUIRED` with the exact remaining step when something is missing; a full setup is never labelled ready while anything is.
+
+| Component | What it does | What stays yours |
+|---|---|---|
+| `paths` | Sets only the requested keys that are unset; an existing different value is preserved and refuses | Choosing the repositories |
+| `sessions` | Reports whether `codex-main`/`claude-main` (or your configured names) are visible by name, and validates recorded ownership with the supervisor's own exact-identity rule (one live record per provider carrying the recorded session id in the recorded pane; aliases are labels only) | Starting, logging in and confirming the pair (`herdr-supervisor sessions`); never created, restarted or rebound |
+| `telegram` | Runs the protected `herdr-telegram setup` (token from `--telegram-token-file` or a non-echoed prompt in `--interactive`; never an argument; starts in shadow mode); an existing credential or configuration is never overwritten | The bot (@BotFather), your numeric ids |
+| `quota` | Selects the dependency lock once (`--quota-lock`, else the payload's own `config/quota-dependency.json`), binds its content hash and any local archive/bundle hashes into the approval, then stages, verifies and builds the exact pinned plugin through `herdr-quota-dependency`, then `herdr plugin link --disabled DIR` and `herdr plugin enable herdr-agent-quota`; a matching plugin is preserved, a conflicting one stops the run | Rust 1.95.0 and the crates (a source archive does not make the build offline), and the plugin's `configure` action that edits provider hooks (read [Quota plugin dependency](QUOTA_DEPENDENCY.md); Supervisor never runs it) |
+
+Services are opt-in: `--services worker,telegram,query,reset,backup,server` runs `systemctl --user daemon-reload`, then `enable` and `start` for each selected unit, in that order, and nothing else (no `--now`). Query, reset and backup are activated only when configured (a registered query session, an enabled reset policy with the codex CLI, an enabled backup destination); Telegram only when configured; the headless `server` unit is refused while an interactive Herdr server answers. If the user systemd manager cannot be reached the selection is reported as `ACTION_REQUIRED` and no unit is touched.
+
+`herdr-setup status` distinguishes *installed*, *active now* and *survives a reboot*: boot persistence needs enabled units and lingering, which an administrator enables once (`sudo loginctl enable-linger YOUR_USER`; the software never does). Telegram online does not prove Herdr is running after a reboot: open Herdr or configure headless startup explicitly, and never start the headless unit next to an interactive server. `READY` means every local check passes and it would also come back after a reboot; `READY_NOW` means it is usable at this moment but not reboot-persistent (for example a manually opened interactive Herdr, which is honestly reported and never replaced by an extra server). Only boot-target enablement (`enabled`) counts as persistence: `enabled-runtime` is transient and `linked` only makes an externally stored unit file discoverable, so neither does. A reachable Herdr server, recorded sessions matching live agents by exact identity, and a running watcher and bridge are required for either. Network-dependent items are listed as `NOT_VERIFIED` (run `herdr-telegram doctor --network` yourself).
+
+### Unit validation
+
+Candidate units are validated with `systemd-analyze --user verify` **before** any target write, from the exact bytes that will be installed, staged under a scratch HOME together with the launchers they name. A genuine defect refuses the operation. Without a user runtime directory (`XDG_RUNTIME_DIR`) the check is reported as skipped, never as passed.
+
+## Manual and legacy equivalents
+
+The minimal profile replaces the old copy script. To install by hand you would place the files exactly as listed in `MANIFEST.txt`; prefer `herdr-setup`, which also records what it did.
+
+## Quota plugin dependency
+
+The supervisor needs the `herdr-agent-quota` Herdr plugin at one pinned revision (`config/quota-dependency.json`, installed beside the program files). `install.sh` does not acquire, link, enable, or configure it, and does not run the plugin's own installer, which edits provider hooks and settings. The full profile (`herdr-setup setup --profile full`) automates the stage/link/enable below after a preview and an approval; to do it yourself, check and stage it explicitly, in this order:
+
+```sh
+herdr-quota-dependency check                                   # read-only: Herdr, plugin revision, snapshot freshness, build prerequisites
+herdr-quota-dependency bootstrap --stage-dir "$HOME/quota-stage"   # dry run
+herdr-quota-dependency bootstrap --apply --stage-dir "$HOME/quota-stage"   # stage, verify against the lock, build with --locked
+```
+
+An existing installation at the locked revision is preserved; any other revision, duplicate, or unverifiable installation is reported and left alone. Building needs Rust 1.95.0 and the crates in the plugin's `Cargo.lock`; a source archive alone does not make the build offline. The commands that register and enable the staged plugin are printed, not run. Read [Quota plugin dependency](QUOTA_DEPENDENCY.md) for the pin, the offline limits, the operator steps, and rollback.
 
 Configure the workspace and Herdr path in `~/.config/herdr-supervisor/config.json`, then run:
 
@@ -31,4 +129,4 @@ The software never performs that action itself.
 
 The inactive `herdr-codex-reset-worker.path` and `.service` units support optional banked-reset automation. Review them and the reset policy before enabling the path unit. The helper has outbound network access only because the existing supervisor worker remains network denied; it starts Codex app-server over stdio and never handles task text, Telegram tokens, or raw authentication data. Installing files does not enable or start this unit.
 
-For rollback, stop only affected services explicitly, run `./uninstall.sh`, and restore the prior manifest-hashed program files. The uninstall removes files only after every supervisor unit reports an established `inactive` or `failed` state; an active or transitioning unit, or a session where the user systemd manager cannot be queried, makes it stop without removing anything. The uninstall preserves configuration and durable state. If old code cannot read newer state, leave services inactive and recover manually; do not delete state to force startup.
+For rollback use `herdr-setup rollback` (see above). Leave services you did not stop alone; a rollback restarts only the units it stopped. If old code cannot read newer state, leave services inactive and recover manually; do not delete state to force startup. `./uninstall.sh` removes only the enumerated program files (including every generation and the pointer) after every supervisor unit reports an established `inactive` or `failed` state; an active or transitioning unit, or a session where the user systemd manager cannot be queried, makes it stop without removing anything. It preserves configuration and durable state, including the installation receipts and backups.
