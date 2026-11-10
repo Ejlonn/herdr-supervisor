@@ -76,7 +76,6 @@ PROFILES = ("minimal", "full")
 COMPONENTS = ("paths", "sessions", "telegram", "quota")
 DEFAULT_FULL_COMPONENTS = ("sessions", "telegram", "quota")
 SERVICES = tuple(UNIT_FOR_SERVICE)
-PLUGIN_ID = "herdr-agent-quota"
 MIN_PYTHON = (3, 11)
 PATH_KEYS = ("project_root", "review_root", "product_repo")
 
@@ -184,14 +183,14 @@ class QuotaAdapter:
             lock = self._lock_dict()
             if not os.path.lexists(stage) or (stage.is_dir() and not any(stage.iterdir())):
                 return "absent"
-            staged = stage / f"herdr-agent-quota-{lock['revision'][:12]}"
+            staged = stage / hq.staged_name(lock)
             if staged.is_symlink() or not staged.is_dir():
                 return "unverified"
             hq.verify_source(hq.scan_tree(staged), staged, lock)
             receipt = json.loads((stage / hq.RECEIPT_FILE).read_text(encoding="utf-8"))
             if not isinstance(receipt, dict) or receipt.get("revision") != lock["revision"] or receipt.get("plugin_id") != lock["plugin_id"]:
                 return "unverified"
-            return "verified" if (staged / "target/release/herdr-agent-quota").is_file() else "unverified"
+            return "verified" if (staged / "target/release" / lock["plugin_id"]).is_file() else "unverified"
         except (hq.DependencyError, OSError, ValueError):
             return "unverified"
 
@@ -211,7 +210,7 @@ class QuotaAdapter:
         self._plugin(["link", "--disabled", directory])
 
     def enable(self) -> None:
-        self._plugin(["enable", PLUGIN_ID])
+        self._plugin(["enable", self._lock_dict()["plugin_id"]])
 
     def _plugin(self, args: list[str]) -> None:
         if self.probe.binary is None:
@@ -486,7 +485,7 @@ def _plan_quota(env: Env, plan: Plan, options: dict[str, Any], adapters: Adapter
         plan.notes.append("the quota plugin is installed at the locked revision and reports fresh snapshots")
     else:
         plan.prerequisites.append({"id": "quota-hooks", "status": "ACTION_REQUIRED", "detail": "fresh quota snapshots are not confirmed",
-                                   "action": f"after reading docs/QUOTA_DEPENDENCY.md, run `herdr plugin action invoke configure --plugin {PLUGIN_ID}` yourself: it edits provider hook files and reloads the Herdr server, so Supervisor never runs it"})
+                                   "action": f"after reading docs/QUOTA_DEPENDENCY.md, run `herdr plugin action invoke configure --plugin {(report.get('lock') or {}).get('plugin_id', 'the quota plugin')}` yourself: it edits provider hook files and reloads the Herdr server, so Supervisor never runs it"})
     return steps
 
 
@@ -709,7 +708,7 @@ def component_steps(ctx: Ctx, adapters: Adapters) -> list[Step]:
     quota = comp.get("quota") or []
     dependency = ctx.plan.get("dependency") or {}
     stage = dependency.get("stage_dir")
-    staged = os.path.realpath(Path(str(stage)) / f"herdr-agent-quota-{str(dependency.get('revision'))[:12]}") if stage else None
+    staged = os.path.realpath(Path(str(stage)) / f"{dependency.get('plugin_id')}-{str(dependency.get('revision'))[:12]}") if stage else None
     expect_root = staged if "quota_link" in quota else None
 
     def ours(state: dict[str, Any]) -> bool:

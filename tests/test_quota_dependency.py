@@ -125,7 +125,7 @@ class Env:
             entries = q.extract_archive(tar, Path(scratch), {"CLAUDE.md": "AGENTS.md"})
         by = {e.path: e.sha256 for e in entries}
         return {
-            "schema_version": 1, "dependency": "herdr-agent-quota", "plugin_id": "herdr-agent-quota",
+            "schema_version": 1, "dependency": "herdr-agent-quota", "plugin_id": "herdr-agent-quota", "legacy_plugin_ids": ["herdr-agent-old"],
             "repository": {"url": "https://github.com/example/herdr-agent-quota"},
             "upstream": {"url": "https://github.com/example/upstream", "relocated_from": "https://github.com/example/old"},
             "revision": self.revision, "tree_sha1": q.git_tree_sha1(entries), "manifest_version": "1.5.4", "min_herdr_version": "0.9.0",
@@ -206,14 +206,15 @@ class Env:
 class LockTests(unittest.TestCase):
     def test_shipped_lock_is_valid_exact_and_never_floats(self) -> None:
         lock = q.load_lock(str(ROOT / "config/quota-dependency.json"))
-        self.assertEqual(lock["revision"], "809749e585480047e502df072fb8ddccc4719d4e")
-        self.assertEqual(lock["manifest_version"], "1.5.4")
-        self.assertEqual(lock["plugin_id"], "herdr-agent-quota")
+        self.assertEqual(lock["revision"], "cd6927b282d974764b66a08def017adc58d37399")
+        self.assertEqual(lock["tree_sha1"], "89a62b190bb8979033cdbcbad216be8f3feb8786")
+        self.assertEqual(lock["manifest_version"], "1.6.3")
+        self.assertEqual((lock["plugin_id"], lock["legacy_plugin_ids"]), ("herdr-agent-usage", ["herdr-agent-quota"]))
         self.assertEqual(lock["repository"]["url"], "https://github.com/Ejlonn/herdr-agent-quota")
         self.assertEqual(lock["license"]["spdx"], "MIT")
         self.assertEqual(lock["toolchain"]["build_command"], ["cargo", "build", "--release", "--locked"])
-        self.assertEqual(lock["recovery_artifacts"][0]["sha256"], "0f43db667d95b5ac79392a2bf561fad0fa6c6bb6cfd6da39e9191663a945aa00")
-        self.assertEqual(lock["recovery_artifacts"][1]["sha256"], "6761d16b8546ba0c6353b943961ee71e9267d3b2076d21765bf9383fe0dfdba7")
+        self.assertEqual(lock["recovery_artifacts"][0]["sha256"], "e3f802fed9a766001446ecdb6a504ced19e6bf774317a86ce751a6372b4ea868")
+        self.assertEqual(lock["recovery_artifacts"][1]["sha256"], "2d83621686e02f948fc39e74a8b9b1f8a1eebbb7cb6425302be158b8e7f8863a")
 
     def test_malformed_or_floating_locks_are_refused(self) -> None:
         good = json.loads((ROOT / "config/quota-dependency.json").read_text())

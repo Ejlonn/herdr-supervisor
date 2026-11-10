@@ -1,10 +1,10 @@
 # Quota plugin dependency
 
-The supervisor reads provider quota snapshots that the Herdr plugin `herdr-agent-quota` writes, and it rechecks quota through that plugin's non-LLM `refresh` action (`herdr plugin action invoke refresh --plugin herdr-agent-quota`). Nothing at run time contacts GitHub: once the plugin is installed and writing snapshots, a repository outage cannot stop a supervised task. The dependency matters when a **new project or user installs from scratch**, so this repository pins exactly one revision and ships a bounded tool to check and stage it. The controller, the snapshot contract and the refresh command are unchanged.
+The supervisor reads provider quota snapshots that the Herdr plugin `herdr-agent-usage` (formerly `herdr-agent-quota`) writes, and it rechecks quota through that plugin's non-LLM `refresh` action (`herdr plugin action invoke refresh --plugin herdr-agent-usage`). Nothing at run time contacts GitHub: once the plugin is installed and writing snapshots, a repository outage cannot stop a supervised task. The dependency matters when a **new project or user installs from scratch**, so this repository pins exactly one revision and ships a bounded tool to check and stage it. The controller, the snapshot contract and the refresh command are unchanged.
 
-## Known integration gap (unresolved in this release candidate)
+## The plugin id and the earlier pin
 
-The supervisor's defaults follow the upstream plugin's later rename to the Herdr id `herdr-agent-usage`: `quota_dir` resolves to `$XDG_STATE_HOME/herdr/plugins/herdr-agent-usage` and `codex_quota_refresh_command` invokes `--plugin herdr-agent-usage`. The revision pinned below declares the earlier id `herdr-agent-quota` (manifest 1.5.4) and writes its snapshots under that name. Until a post-rename revision has been reviewed and pinned with its own hashes and recovery artifacts, a machine that installs the pinned revision must set `quota_dir` and `codex_quota_refresh_command` explicitly for `herdr-agent-quota`, or the supervisor will find no snapshots under its default path. `herdr-setup`'s full profile and `herdr-quota-dependency` act on the pinned revision only; neither guesses a compatible newer revision, and neither replaces an installed plugin.
+Upstream renamed the Herdr plugin id from `herdr-agent-quota` to `herdr-agent-usage` (upstream commit `7cdb248`, kept as an alias; the renamed plugin adopts the old configuration and snapshot directory on its first launch). The supervisor defaults already use the new id (`quota_dir` is `$XDG_STATE_HOME/herdr/plugins/herdr-agent-usage`, the refresh command names `--plugin herdr-agent-usage`), so this release pins a revision that provides it. The earlier pin (`809749e`, manifest 1.5.4, id `herdr-agent-quota`) is retired. A machine that still has the old plugin installed is reported as a **conflict**, never replaced, adopted or enabled: a human decides whether to update it to the locked revision, then re-runs `check`. Until then the supervisor finds no snapshots under its default path and reports quota as unknown, never as available.
 
 ## The pinned dependency
 
@@ -12,23 +12,25 @@ The single source of truth is `config/quota-dependency.json` (installed beside t
 
 | Field | Value |
 |---|---|
-| Plugin ID | `herdr-agent-quota` |
+| Plugin ID | `herdr-agent-usage` (earlier id `herdr-agent-quota`, listed as `legacy_plugin_ids`) |
 | Repository (owned fork) | `https://github.com/Ejlonn/herdr-agent-quota` |
-| Revision | `809749e585480047e502df072fb8ddccc4719d4e` (an exact commit; never a branch or tag) |
-| Manifest version | 1.5.4 (needs Herdr 0.9.0 or newer) |
-| Git tree | `d47a762885a8acefa85f362ce48cccbf1bb0389d` |
+| Revision | `cd6927b282d974764b66a08def017adc58d37399` (an exact commit, upstream's `chore: release v1.6.3`; never a branch or tag) |
+| Manifest version | 1.6.3 (needs Herdr 0.9.0 or newer) |
+| Git tree | `89a62b190bb8979033cdbcbad216be8f3feb8786` |
 | License | MIT, `Copyright (c) 2026 Levi Qiao`; the `LICENSE` file is part of the pinned tree and is hash-pinned |
 | Toolchain | Rust 1.95.0 (`rust-toolchain.toml`), `cargo build --release --locked` against the hash-pinned `Cargo.lock` |
 | Upstream provenance | originally published at `levi-qiao/herdr-agent-quota` (that address no longer resolves); the project moved to `https://github.com/praxstack/herdr-agent-quota` |
 
-The fork's `main` branch is far ahead of this revision (151 commits when pinned) and has not been reviewed; it is **not** a supported revision. This pin is the revision that was installed, clean and working when the dependency was frozen. Moving to a newer revision means reading its changes, updating the lock and the recovery hashes, and repeating the validation.
+The fork's `main` (`4d6e54b`, 1.6.3 plus later unreleased commits) is **not** a supported revision. This pin was chosen by reading the owned fork once (a read-only clone, nothing installed) and reviewing what the supervisor depends on at this revision: the manifest id `herdr-agent-usage`, the `refresh` action (`refresh --provider all --force`), the state directory named after the plugin id, the snapshot files the supervisor reads (`claude-statusline.json`, `codex-app-server.json`) and the snapshot keys it parses (`session_windows`, `session_quota_scopes`, `quota_scope_windows`, `session_quota_only`), the unchanged license and Rust toolchain, and the dependency delta. The tree id, critical-file hashes and content manifest in the lock were recomputed from the archive with this tool's own verifier; the tree id equals the git tree of the commit. **Not validated here:** building the plugin (the pinned Rust toolchain is not installed on the review host), running it, or its snapshots against a live Herdr.
+
+What this revision adds compared with the retired pin, which an operator should know before installing it: new crates `zstd` (needs a C compiler) and `jobserver`; Cursor and Muse providers (the Cursor provider reads the Cursor IDE's local `cursorAuth/accessToken` and calls `api2.cursor.sh`); a more capable Codex rollout reader (compressed rollouts); and the id rename with legacy-state adoption. Network use by the provider modules existed before (Grok, Devin); none of it is used by the supervisor, none runs from `herdr-quota-dependency`, and the plugin's `configure` action (which edits provider hook files) remains a separate operator decision. Moving to a newer revision means reading its changes, updating the lock and the recovery hashes, and repeating the validation.
 
 Recovery artifacts the lock lists by SHA-256 (the files are distributed separately from this repository; see [Recovery package](#recovery-package)):
 
 | Artifact | SHA-256 |
 |---|---|
-| `herdr-agent-quota-809749e-source.tar.gz` (tracked source of the locked commit, MIT license included) | `0f43db667d95b5ac79392a2bf561fad0fa6c6bb6cfd6da39e9191663a945aa00` |
-| `herdr-agent-quota-809749e.bundle` (a **single-commit** snapshot: the commit's two parents are absent, so it cannot be fetched for history; the tool reads it by unpacking objects) | `6761d16b8546ba0c6353b943961ee71e9267d3b2076d21765bf9383fe0dfdba7` |
+| `herdr-agent-usage-cd6927b-source.tar.gz` (tracked source of the locked commit, MIT license included) | `e3f802fed9a766001446ecdb6a504ced19e6bf774317a86ce751a6372b4ea868` |
+| `herdr-agent-usage-cd6927b.bundle` (a **single-commit** snapshot: the commit's parents are absent, so it cannot be fetched for history; the tool reads it by unpacking objects) | `2d83621686e02f948fc39e74a8b9b1f8a1eebbb7cb6425302be158b8e7f8863a` |
 
 ## Four separate questions
 
@@ -37,7 +39,7 @@ A fresh machine can fail at four independent points. `herdr-quota-dependency che
 | Question | How it is established | When it is not established |
 |---|---|---|
 | Is Herdr available? | `herdr plugin list --json` runs | **UNKNOWN**: install Herdr user-scoped at `~/.local/bin/herdr`; absence of the plugin is never inferred from a failed inventory |
-| Is the plugin installed at the locked revision? | the inventory entry for `herdr-agent-quota` has the locked commit and version (a locally linked plugin counts when it is a clean git checkout of that commit, **or** when its actual source content matches the lock: every file except top-level `target/` build output is hashed from disk and compared with the locked critical-file hashes, plugin id, versions, toolchain channel, content manifest and git tree id. No git metadata is needed, so the directory that `bootstrap` stages passes after it is linked; a receipt or claimed revision is never trusted) | `absent` (bootstrap), or `conflict` (a human decides; nothing is overwritten) |
+| Is the plugin installed at the locked revision? | the inventory entry for `herdr-agent-usage` has the locked commit and version (a locally linked plugin counts when it is a clean git checkout of that commit, **or** when its actual source content matches the lock: every file except top-level `target/` build output is hashed from disk and compared with the locked critical-file hashes, plugin id, versions, toolchain channel, content manifest and git tree id. No git metadata is needed, so the directory that `bootstrap` stages passes after it is linked; a receipt or claimed revision is never trusted) | `absent` (bootstrap), or `conflict` (a human decides; nothing is overwritten; this includes an installation under the earlier id `herdr-agent-quota`) |
 | Is there a fresh snapshot, and is it this session's? | snapshot file present, valid JSON, younger than `--max-age` (default 900 s). **Identity** (the exact session binding) is judged by the supervisor, not by this tool: run `herdr-supervisor doctor` | usage is **UNKNOWN**, never 0%; another session's windows are never borrowed; a stale snapshot is never current usage |
 | Are provider logins, the Claude StatusLine and Herdr session binding set up? | not read; these are separate operator steps (see the plugin's own documentation) | the tool says so and reads no credential |
 
@@ -55,7 +57,7 @@ Exit codes: `0` installed at the locked revision (existing installation preserve
 
 ```sh
 # Review first. Offline, writes nothing; a lock-listed local artifact is fully verified in a removed temporary directory.
-herdr-quota-dependency bootstrap --stage-dir "$HOME/quota-stage" --from-archive /path/to/herdr-agent-quota-809749e-source.tar.gz
+herdr-quota-dependency bootstrap --stage-dir "$HOME/quota-stage" --from-archive /path/to/herdr-agent-usage-cd6927b-source.tar.gz
 # Then stage, verify and build (network only for the repository route):
 herdr-quota-dependency bootstrap --apply --stage-dir "$HOME/quota-stage"                       # exact commit from the owned fork
 herdr-quota-dependency bootstrap --apply --stage-dir "$HOME/quota-stage" --from-archive FILE   # lock-listed recovery archive (or --from-bundle)
@@ -90,12 +92,12 @@ These are printed by `bootstrap` and are **not** run by it. The live link and en
 After the link, `check` verifies the linked directory's **content** against the lock (it does not need git metadata and does not trust the receipt); a changed source file turns it into a `conflict`. Top-level `target/` is build output and is not part of the locked source: the check proves the source, not the binary (the receipt records the binary's SHA-256 for your own comparison).
 
 ```sh
-herdr plugin link --disabled "$HOME/quota-stage/herdr-agent-quota-809749e58548"   # registers without enabling (help: link --disabled)
-herdr plugin enable herdr-agent-quota                                              # starts the plugin's startup and event hooks
+herdr plugin link --disabled "$HOME/quota-stage/herdr-agent-usage-cd6927b282d9"   # registers without enabling (help: link --disabled)
+herdr plugin enable herdr-agent-usage                                              # starts the plugin's startup and event hooks
 herdr-quota-dependency check                                                       # confirm the locked revision and snapshot freshness
 ```
 
-`herdr plugin action invoke configure --plugin herdr-agent-quota` is a separate, optional decision: the plugin's configure action edits provider hook and settings files. Read what it changes first; this repository never runs it. Whether `herdr plugin install Ejlonn/herdr-agent-quota --ref REVISION` honors a full commit id is **NOT VALIDATED** (the help lists only `--ref <REF>`); if you use it, run `check` afterwards and accept only the locked revision. The plugin's own manifest builds with `cargo build --release` (without `--locked`); the supported preparation here builds with `--locked`.
+`herdr plugin action invoke configure --plugin herdr-agent-usage` is a separate, optional decision: the plugin's configure action edits provider hook and settings files. Read what it changes first; this repository never runs it. Whether `herdr plugin install Ejlonn/herdr-agent-quota --ref REVISION` honors a full commit id is **NOT VALIDATED** (the help lists only `--ref <REF>`); if you use it, run `check` afterwards and accept only the locked revision. The plugin's own manifest builds with `cargo build --release` (without `--locked`); the supported preparation here builds with `--locked`.
 
 ## Offline limits
 
@@ -114,7 +116,7 @@ STAGE="$HOME/quota-stage"
 rm -r -- "${STAGE:?}"
 ```
 
-If you linked the staged copy, first run `herdr plugin unlink herdr-agent-quota` (an operator action). Nothing else is created or changed.
+If you linked the staged copy, first run `herdr plugin unlink herdr-agent-usage` (an operator action). Nothing else is created or changed.
 
 ## Recovery package
 
@@ -122,4 +124,4 @@ Maintainers prepare the redistributable recovery set (source archive, bundle, `L
 
 ## Provenance and license
 
-`herdr-agent-quota` is MIT-licensed, Copyright (c) 2026 Levi Qiao. The pinned tree includes the license text and the lock hashes it. The supervisor itself is Apache-2.0; the plugin is a separately installed component and is not vendored into this repository.
+`herdr-agent-usage` (formerly `herdr-agent-quota`) is MIT-licensed, Copyright (c) 2026 Levi Qiao. The pinned tree includes the license text and the lock hashes it. The supervisor itself is Apache-2.0; the plugin is a separately installed component and is not vendored into this repository.

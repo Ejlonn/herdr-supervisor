@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit, bounded dependency check and bootstrap for the `herdr-agent-quota` Herdr plugin.
+"""Explicit, bounded dependency check and bootstrap for the locked Herdr quota plugin (`herdr-agent-usage`).
 
 The supervisor reads quota snapshots written by that plugin and rechecks quota through its non-LLM
 `refresh` action. This tool never changes how snapshots are read. It answers two questions for a fresh
@@ -61,6 +61,7 @@ _ARTIFACT_KINDS = ("git-bundle", "source-archive")
 _LOCK_KEYS = {
     "schema_version", "dependency", "plugin_id", "repository", "upstream", "revision", "tree_sha1", "manifest_version",
     "min_herdr_version", "license", "toolchain", "critical_files", "content_manifest_sha256", "allowed_symlinks", "recovery_artifacts", "provenance",
+    "legacy_plugin_ids",
 }
 # RUSTUP_TOOLCHAIN is deliberately absent: the lock selects the toolchain, an inherited override never does.
 _BUILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "CARGO_HOME", "RUSTUP_HOME")
@@ -103,6 +104,8 @@ def validate_lock(raw: Any) -> dict[str, Any]:
     _require(type(raw["schema_version"]) is int and raw["schema_version"] == 1, "schema_version must be 1")
     _require(_is_str(raw["plugin_id"]) and _PLUGIN_ID.match(raw["plugin_id"]) is not None, "plugin_id shape")
     _require(raw["dependency"] == raw["plugin_id"], "dependency must equal plugin_id")
+    legacy = raw["legacy_plugin_ids"]
+    _require(isinstance(legacy, list) and len(legacy) <= 4 and all(_is_str(v) and _PLUGIN_ID.match(v) is not None and v != raw["plugin_id"] for v in legacy) and len(set(legacy)) == len(legacy), "legacy_plugin_ids must list up to four other plugin ids")
     repository = raw["repository"]
     _require(isinstance(repository, dict) and set(repository) == {"url"} and _is_str(repository["url"]) and _HTTPS_URL.match(repository["url"]) is not None, "repository.url must be an https URL")
     upstream = raw["upstream"]
@@ -561,11 +564,20 @@ def read_inventory(herdr: str | None) -> dict[str, Any]:
     return {"status": "OK", "detail": "", "plugins": plugins}
 
 
+def staged_name(lock: dict[str, Any]) -> str:
+    """Directory a verified source is staged as, and the name of the plugin binary it builds: both follow the locked plugin id."""
+    return f"{lock['plugin_id']}-{lock['revision'][:12]}"
+
+
 def classify(inventory: dict[str, Any], lock: dict[str, Any]) -> dict[str, Any]:
     """State of the dependency in the inventory. Read-only; no state here ever authorizes an overwrite."""
     if inventory["status"] != "OK":
         return {"state": "unknown", "detail": inventory["detail"], "action": "install Herdr user-scoped (`~/.local/bin/herdr`) and make `herdr plugin list --json` work, then re-run check"}
     matches = [p for p in inventory["plugins"] if p.get("plugin_id") == lock["plugin_id"]]
+    legacy = [pl for pl in inventory["plugins"] if pl.get("plugin_id") in lock["legacy_plugin_ids"]]
+    if not matches and legacy:
+        return {"state": "conflict", "detail": f"an earlier release of this plugin is installed under its pre-rename id {legacy[0].get('plugin_id')} (version {legacy[0].get('version')}); the lock pins {lock['plugin_id']} {lock['manifest_version']}",
+                "action": "preserved: neither replaced nor adopted. A human decides whether to update it to the locked revision (the renamed plugin adopts the old configuration and snapshot directory on its first launch) and then re-runs check; the supervisor reads snapshots under the new id only"}
     if not matches:
         return {"state": "absent", "detail": f"plugin {lock['plugin_id']} is not installed", "action": "run `herdr-quota-dependency bootstrap --stage-dir DIR --dry-run`, review it, then repeat with --apply and link the staged source"}
     if len(matches) > 1:
@@ -637,7 +649,7 @@ def local_identity(plugin_root: Any, lock: dict[str, Any]) -> tuple[str | None, 
 
 def default_quota_dir() -> Path:
     state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
-    return Path(state) / "herdr" / "plugins" / "herdr-agent-quota"
+    return Path(state) / "herdr" / "plugins" / "herdr-agent-usage"  # the supervisor default (herdr_core); the locked plugin writes here
 
 
 def telemetry_report(quota_dir: Path, max_age: float, now: float | None = None) -> dict[str, Any]:
@@ -933,7 +945,7 @@ def command_bootstrap(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             report["result"] = "stopped: the build prerequisites are missing"
             report["action"] = toolchain["action"]
             return EXIT_ACTION, report
-    final_name = f"herdr-agent-quota-{lock['revision'][:12]}"
+    final_name = staged_name(lock)
     report["stage"] = {"directory": str(stage) if stage else None, "source_directory": f"{final_name}", "plan": [label for _, _, label in plan]}
     claim: StageClaim | None = None
     if apply and stage is not None:
@@ -1021,7 +1033,7 @@ def build_locked(args: argparse.Namespace, lock: dict[str, Any], env: dict[str, 
     if built.returncode != 0:
         raise DependencyError(f"`{' '.join(build_args)}` failed (exit {built.returncode}): {tail(built.stderr or built.stdout)}", code=EXIT_ACTION,
                               action="fix the toolchain/crate availability (see offline_note) and re-run; the unverified build output was removed")
-    binary = source / "target" / "release" / "herdr-agent-quota"
+    binary = source / "target" / "release" / lock["plugin_id"]  # the plugin binary carries the plugin id
     if not binary.is_file():
         raise DependencyError("the build finished without the expected plugin binary", code=EXIT_ACTION, action="inspect the build output; nothing was staged")
     used = compiler_releases_used(source)
@@ -1092,13 +1104,13 @@ def render(report: dict[str, Any]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="herdr-quota-dependency", description="Check or stage the pinned herdr-agent-quota plugin dependency (never installs, links, configures or contacts a provider).")
+    parser = argparse.ArgumentParser(prog="herdr-quota-dependency", description="Check or stage the pinned herdr-agent-usage plugin dependency (never installs, links, configures or contacts a provider).")
     parser.add_argument("--lock", help="dependency lock path (default: beside the program files or in the source tree)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check", help="read-only: dependency state, snapshot freshness, build prerequisites")
     check.add_argument("--herdr", help="Herdr executable (default: HERDR_BIN_PATH, ~/.local/bin/herdr, PATH)")
-    check.add_argument("--quota-dir", help="snapshot directory (default: $XDG_STATE_HOME/herdr/plugins/herdr-agent-quota)")
+    check.add_argument("--quota-dir", help="snapshot directory (default: $XDG_STATE_HOME/herdr/plugins/herdr-agent-usage)")
     check.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE_SECONDS, help="seconds before a snapshot is stale")
     check.add_argument("--require-telemetry", action="store_true", help="exit 3 unless every provider snapshot is FRESH")
     check.add_argument("--cargo-home", help=argparse.SUPPRESS)

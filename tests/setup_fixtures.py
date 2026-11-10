@@ -255,7 +255,7 @@ class FakeQuota:
 
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
-        self.state: dict[str, Any] = {"state": "absent", "detail": "plugin herdr-agent-quota is not installed", "enabled": None, "action": "bootstrap"}
+        self.state: dict[str, Any] = {"state": "absent", "detail": "plugin herdr-agent-usage is not installed", "enabled": None, "action": "bootstrap"}
         self.fresh = False
         self.toolchain = "PRESENT"
         self.dry_code = 0
@@ -280,7 +280,7 @@ class FakeQuota:
             return "absent"
         if self.stage_tamper:
             return "unverified"
-        return "verified" if (stage / "herdr-agent-quota-809749e58548").is_dir() and (stage / "BOOTSTRAP_RECEIPT.json").is_file() else "unverified"
+        return "verified" if (stage / "herdr-agent-usage-cd6927b282d9").is_dir() and (stage / "BOOTSTRAP_RECEIPT.json").is_file() else "unverified"
 
     def plugin_state(self) -> dict[str, Any]:
         return {"state": self.state.get("state"), "enabled": self.state.get("enabled"), "root": self.root}
@@ -296,7 +296,7 @@ class FakeQuota:
             return self.dry_code, {"toolchain": {"status": self.toolchain, "action": "install the pinned Rust toolchain"}, "result": "dry run", "action": "install the pinned Rust toolchain"}
         if self.stage_code:
             return self.stage_code, {"result": "stopped", "action": "retry"}
-        staged = Path(stage_dir) / "herdr-agent-quota-809749e58548"
+        staged = Path(stage_dir) / "herdr-agent-usage-cd6927b282d9"
         staged.mkdir(parents=True)
         (Path(stage_dir) / "BOOTSTRAP_RECEIPT.json").write_text("{}")
         return 0, {"result": "staged and verified"}

@@ -100,7 +100,7 @@ The minimal profile replaces the old copy script. To install by hand you would p
 
 ## Quota plugin dependency
 
-The supervisor needs the `herdr-agent-quota` Herdr plugin at one pinned revision (`config/quota-dependency.json`, installed beside the program files). `install.sh` does not acquire, link, enable, or configure it, and does not run the plugin's own installer, which edits provider hooks and settings. The full profile (`herdr-setup setup --profile full`) automates the stage/link/enable below after a preview and an approval; to do it yourself, check and stage it explicitly, in this order:
+The supervisor needs the `herdr-agent-usage` Herdr plugin at one pinned revision (`config/quota-dependency.json`, installed beside the program files). `install.sh` does not acquire, link, enable, or configure it, and does not run the plugin's own installer, which edits provider hooks and settings. The full profile (`herdr-setup setup --profile full`) automates the stage/link/enable below after a preview and an approval; to do it yourself, check and stage it explicitly, in this order:
 
 ```sh
 herdr-quota-dependency check                                   # read-only: Herdr, plugin revision, snapshot freshness, build prerequisites

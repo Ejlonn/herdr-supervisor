@@ -105,8 +105,8 @@ class ExternalContractTests(SetupCase):
         adapter = hsetup.QuotaAdapter(self.env, probe, {})
         adapter.link("/stage/dir")
         adapter.enable()
-        self.assertEqual(self.host.plugin_log, [["link", "--disabled", "/stage/dir"], ["enable", "herdr-agent-quota"]])
-        self.assertEqual(json.loads((ROOT / "config/quota-dependency.json").read_text())["plugin_id"], "herdr-agent-quota")
+        self.assertEqual(self.host.plugin_log, [["link", "--disabled", "/stage/dir"], ["enable", "herdr-agent-usage"]])
+        self.assertEqual(json.loads((ROOT / "config/quota-dependency.json").read_text())["plugin_id"], "herdr-agent-usage")
 
     def test_systemd_and_herdr_commands_issued_by_planning_are_read_only(self) -> None:
         self.install()

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "dependency": "herdr-agent-quota",
-  "plugin_id": "herdr-agent-quota",
+  "dependency": "herdr-agent-usage",
+  "plugin_id": "herdr-agent-usage",
   "repository": {
     "url": "https://github.com/Ejlonn/herdr-agent-quota"
   },
@@ -9,9 +9,9 @@
     "url": "https://github.com/praxstack/herdr-agent-quota",
     "relocated_from": "https://github.com/levi-qiao/herdr-agent-quota"
   },
-  "revision": "809749e585480047e502df072fb8ddccc4719d4e",
-  "tree_sha1": "d47a762885a8acefa85f362ce48cccbf1bb0389d",
-  "manifest_version": "1.5.4",
+  "revision": "cd6927b282d974764b66a08def017adc58d37399",
+  "tree_sha1": "89a62b190bb8979033cdbcbad216be8f3feb8786",
+  "manifest_version": "1.6.3",
   "min_herdr_version": "0.9.0",
   "license": {
     "spdx": "MIT",
@@ -21,40 +21,49 @@
   },
   "toolchain": {
     "channel": "1.95.0",
-    "build_command": ["cargo", "build", "--release", "--locked"]
+    "build_command": [
+      "cargo",
+      "build",
+      "--release",
+      "--locked"
+    ]
   },
   "critical_files": {
-    "Cargo.lock": "27aee361f19c1a46207d168ac9eb6e43d5359203ce6e71bb428221c55b7c028d",
-    "Cargo.toml": "ce90290ba2d5952bf6bb0f65970cfbf793d2959c4528ba97ae310e1d901461bc",
+    "Cargo.lock": "72963e6940947508eb2939fcb0baede91cd486001468b1e8560a5426adfb08b7",
+    "Cargo.toml": "ad0eac2f0024d97d87c48691ff1bee903fc0fcf76534d9e4501d65024202417a",
     "LICENSE": "522e618d01ebcd1f069810bddd0857a2562f1bdb9ed6a2630f99e578c17e6bfb",
-    "herdr-plugin.toml": "9c7e21baebc3808ccc9d9845ad51d8dcf12ca01824229895fc483ae54cac7c87",
+    "herdr-plugin.toml": "a91c942d41a05544131edf0b49dfbf59bc6aaa5f0ecfbfdd14502d6433dc23ef",
     "rust-toolchain.toml": "7d21c66a15f41bad66b82ed06a289f5dc8a6e3751951d2696bbf20ce296f2b0f"
   },
-  "content_manifest_sha256": "3807bdf6fd6df9dfb45ed86b1c904e5592d2ead0b5991c978323d8b53fcfa222",
+  "content_manifest_sha256": "611057e928bc8c71d781ea0b09efbfa3215f5ad38da22796ebe1456489582b1b",
   "allowed_symlinks": {
     "CLAUDE.md": "AGENTS.md"
   },
   "recovery_artifacts": [
     {
       "kind": "source-archive",
-      "file": "herdr-agent-quota-809749e-source.tar.gz",
-      "sha256": "0f43db667d95b5ac79392a2bf561fad0fa6c6bb6cfd6da39e9191663a945aa00",
+      "file": "herdr-agent-usage-cd6927b-source.tar.gz",
+      "sha256": "e3f802fed9a766001446ecdb6a504ced19e6bf774317a86ce751a6372b4ea868",
       "note": "git archive of the locked commit (tracked files only, MIT license included); contains no quota snapshots, credentials or build output"
     },
     {
       "kind": "git-bundle",
-      "file": "herdr-agent-quota-809749e.bundle",
-      "sha256": "6761d16b8546ba0c6353b943961ee71e9267d3b2076d21765bf9383fe0dfdba7",
-      "note": "single-commit snapshot of the locked commit; its two parent commits are absent, so it cannot be fetched for history. The tool reads it by unpacking objects and archiving the locked commit"
+      "file": "herdr-agent-usage-cd6927b.bundle",
+      "sha256": "2d83621686e02f948fc39e74a8b9b1f8a1eebbb7cb6425302be158b8e7f8863a",
+      "note": "single-commit snapshot of the locked commit (shallow, no parents); it cannot be fetched for history. The tool reads it by unpacking objects and archiving the locked commit"
     }
   ],
   "provenance": {
     "owned_fork": "https://github.com/Ejlonn/herdr-agent-quota",
     "fork_parent": "https://github.com/praxstack/herdr-agent-quota",
     "originally_published_at": "https://github.com/levi-qiao/herdr-agent-quota (no longer resolves)",
-    "pinned_on": "2026-10-22",
-    "pin_evidence": "the commit was the installed, clean, working plugin revision; the owned fork was read through the GitHub API and serves it",
-    "not_used": "fork main (151 commits ahead of the pin, unreviewed) is not a supported revision; moving the pin needs a reviewed change to this file",
-    "build_note": "the plugin's own manifest runs `cargo build --release`; the supported preparation builds with --locked against the hashed Cargo.lock"
-  }
+    "pinned_on": "2026-11-10",
+    "pin_evidence": "the commit is upstream's release commit `chore: release v1.6.3` (#129) in the owned fork, read once with a read-only clone; the renamed plugin id herdr-agent-usage (commit 7cdb248) and the snapshot files and `refresh` action the supervisor consumes were reviewed at this revision; the tree id, critical-file hashes and content manifest were recomputed from the archive with this tool's own verifier",
+    "replaces": "809749e585480047e502df072fb8ddccc4719d4e (manifest 1.5.4, plugin id herdr-agent-quota): the earlier pin predates the rename, so the supervisor's default quota path and refresh command named a plugin id it did not provide",
+    "not_used": "fork main (4d6e54b, 1.6.3 plus later unreleased commits) is not a supported revision; moving the pin needs a reviewed change to this file",
+    "build_note": "the plugin's own manifest runs `cargo build --release`; the supported preparation builds with --locked against the hashed Cargo.lock. This revision adds the zstd crate (C compiler needed) and Cursor and Muse providers whose network use and credential reads are listed in docs/QUOTA_DEPENDENCY.md"
+  },
+  "legacy_plugin_ids": [
+    "herdr-agent-quota"
+  ]
 }

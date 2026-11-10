@@ -7,15 +7,19 @@ same scripted host the setup suites use, so nothing touches the machine.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import subprocess
 import threading
 import time
 import unittest
 from pathlib import Path
 
+import herdr_core as core
 import herdr_helper_context as hctx
 import herdr_installation as hi
+import herdr_quota_dependency as q
 import test_helper_context
 import test_named_pairs_telegram
 import test_setup_review_fixes as earlier
@@ -172,3 +176,59 @@ class PolicySelectionLockTests(test_named_pairs_telegram.TgPairCase):
         self.assertFalse(holder.is_alive() or tapper.is_alive())
         self.assertEqual(results[0].get("result"), "selection_updated")
         self.assertEqual(self.pending(pending)["workflow_policy"], "gated_v2")
+
+
+class QuotaPluginIdentityTests(unittest.TestCase):
+    """The plugin the dependency lock pins is the plugin the supervisor's defaults read and refresh. An installation under the pre-rename
+    id is never mistaken for the locked one (and never replaced)."""
+
+    FIXTURES = ROOT / "tests/fixtures/quota-dependency"
+
+    def lock(self) -> dict:
+        return q.load_lock(str(ROOT / "config/quota-dependency.json"))
+
+    def inventory(self, **changes) -> dict:
+        data = json.loads((self.FIXTURES / "plugin-list-installed-quota-0.9.5.json").read_text())
+        plugin = data["result"]["plugins"][0]
+        plugin.update(changes)
+        return {"status": "OK", "detail": "", "plugins": [plugin]}
+
+    def test_the_lock_the_defaults_and_the_dependency_tool_name_one_plugin(self) -> None:
+        plugin_id = self.lock()["plugin_id"]
+        config = core.resolve_config_defaults(copy.deepcopy(core.DEFAULT_CONFIG))
+        self.assertEqual(Path(config["quota_dir"]).name, plugin_id)
+        command = core.DEFAULT_CONFIG["codex_quota_refresh_command"]
+        self.assertEqual(command[command.index("--plugin") + 1], plugin_id)
+        self.assertEqual(q.default_quota_dir().name, plugin_id)
+        self.assertEqual(q.staged_name(self.lock()), f"{plugin_id}-{self.lock()['revision'][:12]}")
+
+    def test_the_recorded_pre_rename_installation_is_a_conflict_never_pinned(self) -> None:
+        recorded = self.inventory()
+        self.assertEqual(recorded["plugins"][0]["plugin_id"], "herdr-agent-quota", "the fixture is the real earlier plugin")
+        state = q.classify(recorded, self.lock())
+        self.assertEqual(state["state"], "conflict")
+        self.assertIn("pre-rename id herdr-agent-quota", state["detail"])
+        self.assertIn("neither replaced nor adopted", state["action"])
+
+    def test_the_locked_plugin_under_the_new_id_is_pinned_and_a_wrong_revision_is_not(self) -> None:
+        lock = self.lock()
+        source = {"kind": "github", "owner": "Ejlonn", "repo": "herdr-agent-quota", "resolved_commit": lock["revision"]}
+        good = self.inventory(plugin_id=lock["plugin_id"], version=lock["manifest_version"], source=source)
+        self.assertEqual(q.classify(good, lock)["state"], "pinned")
+        for label, changes in (("other revision", {"source": {**source, "resolved_commit": "0" * 40}}), ("other version", {"version": "1.5.4"})):
+            with self.subTest(label):
+                bad = self.inventory(plugin_id=lock["plugin_id"], version=lock["manifest_version"], source=source)
+                bad["plugins"][0].update(changes)
+                self.assertEqual(q.classify(bad, lock)["state"], "conflict")
+
+    def test_the_legacy_id_list_is_validated_as_part_of_the_lock(self) -> None:
+        raw = json.loads((ROOT / "config/quota-dependency.json").read_text())
+        for label, value in (("missing", None), ("not a list", "herdr-agent-quota"), ("own id", ["herdr-agent-usage"]), ("duplicate", ["a-b", "a-b"]), ("bad shape", ["../x"]), ("too many", ["a1", "a2", "a3", "a4", "a5"])):
+            with self.subTest(label):
+                broken = copy.deepcopy(raw)
+                if value is None:
+                    del broken["legacy_plugin_ids"]
+                else:
+                    broken["legacy_plugin_ids"] = value
+                with self.assertRaises(q.DependencyError):
+                    q.validate_lock(broken)

@@ -18,7 +18,7 @@ import herdr_setup as hsetup
 from setup_fixtures import FakeQuota, SetupCase, snapshot
 from v2_fixtures import FAKE_TOKEN
 
-STAGE_NAME = "herdr-agent-quota-809749e58548"
+STAGE_NAME = "herdr-agent-usage-cd6927b282d9"
 
 
 class FullCase(SetupCase):

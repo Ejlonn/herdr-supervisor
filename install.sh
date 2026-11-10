@@ -65,6 +65,6 @@ echo "Guided full setup (Telegram, quota plugin, optional services; a preview un
 echo "  herdr-setup setup --profile full --payload \"$SOURCE_DIR\""
 echo "(the installed tool does not search for a source tree: it is told which reviewed tree to use)"
 cat <<'EOF2'
-Quota plugin: run `herdr-quota-dependency check` (read-only) to see whether the pinned herdr-agent-quota plugin is installed;
+Quota plugin: run `herdr-quota-dependency check` (read-only) to see whether the pinned herdr-agent-usage plugin is installed;
 this installer never installs, links or configures it. See docs/QUOTA_DEPENDENCY.md.
 EOF2
