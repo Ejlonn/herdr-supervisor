@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import threading
+import time
 import unittest
 from pathlib import Path
 
 import herdr_helper_context as hctx
 import herdr_installation as hi
 import test_helper_context
+import test_named_pairs_telegram
 import test_setup_review_fixes as earlier
 from test_setup_full import FullCase
 
@@ -136,3 +139,36 @@ class WorkerLauncherLayoutTests(unittest.TestCase):
         (self.library / "active").unlink()
         (self.library / "active").symlink_to(generation.name)
         self.assertEqual(hctx.installed_library(self.home), self.library)
+
+
+class PolicySelectionLockTests(test_named_pairs_telegram.TgPairCase):
+    """The workflow-policy choice is a writer of the pending-start record like the pair choice and the Start commit, so it takes the same
+    lock: a selection can never interleave with a Start (or overwrite a receipt) and a Start never reads a half-applied selection."""
+
+    test_the_feature_is_invisible_until_an_administrator_enables_it = None
+
+    def test_a_policy_selection_waits_for_the_pending_lock_and_then_applies(self) -> None:
+        pending = self.task_card()
+        token = self.one("workflow_policy", policy="gated_v2")
+        holding, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with self.bridge._pending_lock():
+                holding.set()
+                release.wait(15)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(holding.wait(10))
+        results: list = []
+        tapper = threading.Thread(target=lambda: results.append(self.tap(token)))
+        tapper.start()
+        time.sleep(0.5)
+        self.assertEqual(results, [], "the selection is serialised behind the lock holder")
+        self.assertEqual(self.pending(pending).get("workflow_policy"), "supervised_v2", "nothing was applied while the lock was held")
+        release.set()
+        holder.join(10)
+        tapper.join(10)
+        self.assertFalse(holder.is_alive() or tapper.is_alive())
+        self.assertEqual(results[0].get("result"), "selection_updated")
+        self.assertEqual(self.pending(pending)["workflow_policy"], "gated_v2")
