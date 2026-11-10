@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 import herdr_installation as hi
-from setup_fixtures import SetupCase, copy_payload
+from setup_fixtures import CURRENT_VERSION, SetupCase, copy_payload
 
 
 class PayloadInventoryTests(SetupCase):
@@ -20,7 +20,7 @@ class PayloadInventoryTests(SetupCase):
         self.assertEqual(first.payload_id, second.payload_id)
         self.assertEqual(first.generation_id, second.generation_id)
         self.assertEqual({role: len(first.of_role(role)) for role in hi.ROLES},
-                         {"program": len(list((self.payload / "src").glob("*.py"))) + 1, "launcher": 8, "unit": 10, "doc": len(list((self.payload / "docs").glob("*.md"))) + 4, "example": 3})
+                         {"program": len(list((self.payload / "src").glob("*.py"))) + 1, "launcher": 8, "unit": 10, "doc": len(list((self.payload / "docs").glob("*.md"))) + 4, "example": 4})  # backup, model-profiles, supervisor, telegram
         self.assertIn("program/quota-dependency.json", {item.key for item in first.files})
         self.assertEqual(first.version, "0.3.0-beta.1")
         self.assertEqual(first.state_schema_version, 2)
@@ -87,7 +87,7 @@ class PayloadInventoryTests(SetupCase):
         def bad_version(root: Path) -> None:
             (root / "VERSION").write_text("main\n")
             core = root / "src/herdr_core.py"
-            core.write_text(core.read_text().replace('SUPERVISOR_VERSION = "0.3.0-beta.1"', 'SUPERVISOR_VERSION = "main"'))
+            core.write_text(core.read_text().replace(f'SUPERVISOR_VERSION = "{CURRENT_VERSION}"', 'SUPERVISOR_VERSION = "main"'))
 
         def no_manager(root: Path) -> None:
             (root / "src/herdr_update.py").unlink()
@@ -106,7 +106,7 @@ class PayloadInventoryTests(SetupCase):
 
         def computed_constant(root: Path) -> None:
             core = root / "src/herdr_core.py"
-            core.write_text(core.read_text().replace('SUPERVISOR_VERSION = "0.3.0-beta.1"', 'SUPERVISOR_VERSION = "0.3.0" + "-beta.1"'))
+            core.write_text(core.read_text().replace(f'SUPERVISOR_VERSION = "{CURRENT_VERSION}"', 'SUPERVISOR_VERSION = "0.4.0" + "-beta.1"'))
 
         def import_side_effect(root: Path) -> None:
             (root / "src/herdr_trap.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")

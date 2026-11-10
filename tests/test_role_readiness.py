@@ -10,7 +10,7 @@ from pathlib import Path
 import herdr_role_readiness as rr  # noqa: E402
 from v2_fixtures import CLAUDE_SESSION, FakeHerdr, V2Case, hs  # noqa: I001 - first: puts the source or installed layout on sys.path
 
-ROLES = ["prospera-tracer", "prospera-test-runner", "prospera-diff-auditor"]
+ROLES = ["repository-tracer", "repository-test-runner", "repository-diff-auditor"]
 VERSION = "2.1.306 (Claude Code)"
 
 
@@ -80,9 +80,9 @@ class ReadinessReportTests(RoleCase):
         self.observe("agent_tool_catalog", ROLES[:2])
         claude = self.report()["claude"]
         self.assertEqual(claude["selectability"]["status"], "OPERATOR_REPORTED_NOT_SELECTABLE")
-        self.assertEqual(claude["selectability"]["missing"], ["prospera-diff-auditor"])
+        self.assertEqual(claude["selectability"]["missing"], ["repository-diff-auditor"])
         self.assertTrue(claude["selectability"]["action"])
-        self.observe("agent_tool_catalog_absent", ["prospera-tracer"])
+        self.observe("agent_tool_catalog_absent", ["repository-tracer"])
         self.assertEqual(self.report()["claude"]["selectability"]["status"], "OPERATOR_REPORTED_NOT_SELECTABLE")
 
     def test_session_or_version_change_invalidates_without_carrying_the_claim_forward(self) -> None:
@@ -107,14 +107,14 @@ class ReadinessReportTests(RoleCase):
         self.assertEqual((claude["definitions"]["status"], claude["definitions"]["missing"]), ("absent", sorted(ROLES)))
         self.assertEqual(claude["selectability"]["status"], "UNKNOWN")
         self.assertTrue(claude["selectability"]["action"])
-        self.assertEqual(self.report()["codex"]["status"], "not_applicable")
-        self.assertIn("disabled by policy", self.report()["codex"]["detail"])
+        self.assertEqual(self.report()["codex"]["status"], "guarded_opt_in")
+        self.assertEqual(self.report()["codex"]["selectability"]["status"], "UNKNOWN")
         with self.assertRaises(hs.SupervisorError):
             self.sup.record_role_observation("codex", "agent_tool_catalog", ["x"], "cli:operator")
 
     def test_observation_input_is_strictly_validated_and_never_unbound(self) -> None:
         self.install()
-        bad = (("not_a_kind", ROLES), ("agent_tool_catalog", []), ("agent_tool_catalog", ["../etc/passwd"]), ("agent_tool_catalog", "prospera-tracer"), ("agent_tool_catalog", ["a"] * 65))
+        bad = (("not_a_kind", ROLES), ("agent_tool_catalog", []), ("agent_tool_catalog", ["../etc/passwd"]), ("agent_tool_catalog", "repository-tracer"), ("agent_tool_catalog", ["a"] * 65))
         for kind, roles in bad:
             with self.subTest(kind=kind, roles=str(roles)[:30]), self.assertRaises(hs.SupervisorError):
                 self.sup.record_role_observation("claude", kind, roles, "cli:operator")
@@ -211,8 +211,8 @@ class OptionalSettingsValidationTests(RoleCase):
     def test_valid_settings_and_absence_are_accepted(self) -> None:
         self.load()
         self.load(subagent_roles=None, native_session_roots=None)
-        config = self.load(subagent_roles={"claude": {"definitions_dir": "/srv/agents", "roles": ["prospera-tracer", "a.b-c_d"]}}, native_session_roots={"claude": "/srv/claude", "codex": "/srv/codex"})
-        self.assertEqual(config["subagent_roles"]["claude"]["roles"], ["prospera-tracer", "a.b-c_d"])
+        config = self.load(subagent_roles={"claude": {"definitions_dir": "/srv/agents", "roles": ["repository-tracer", "a.b-c_d"]}}, native_session_roots={"claude": "/srv/claude", "codex": "/srv/codex"})
+        self.assertEqual(config["subagent_roles"]["claude"]["roles"], ["repository-tracer", "a.b-c_d"])
         self.load(subagent_roles={"claude": {}})
 
 
@@ -226,7 +226,7 @@ class DoctorAndStatusTests(RoleCase):
         self.assertNotIn("selectability in the running parent session is UNKNOWN", " ".join(report["errors"]))
         status = self.sup.status()
         self.assertEqual(status["subagent_roles"]["claude"], {"definitions": "installed", "selectability": "UNKNOWN", "session_bound": True})
-        self.assertEqual(status["subagent_roles"]["codex"], "not_applicable")
+        self.assertEqual(status["subagent_roles"]["codex"], "guarded_opt_in")
         self.assertEqual((self.herdr.prompts, self.herdr.sent_keys, self.herdr.starts), ([], [], []))
         self.assertEqual(self.owners_digest(), owners)
 

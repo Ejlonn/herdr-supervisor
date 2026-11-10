@@ -355,6 +355,7 @@ class NativeFlow(V2Case):
         sup = super().make_supervisor()
         root = Path(self.tmp.name) / "native"
         sup.native_roots = {"claude": root / "claude", "codex": root / "codex"}
+        sup.codex_child_guard_enabled = False      # these cases test native RESULT recovery in isolation with hand-built transcripts; the child guard has its own suite (test_codex_child_guard.py)
         return sup
 
     @property

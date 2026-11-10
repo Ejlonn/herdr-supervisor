@@ -20,7 +20,7 @@ from unittest import mock
 import herdr_installation as hi
 import herdr_setup as hsetup
 import herdr_telegram as htg
-from setup_fixtures import FakeQuota, SetupCase, snapshot, touch_task_state
+from setup_fixtures import CURRENT_VERSION, FakeQuota, SetupCase, snapshot, touch_task_state
 from test_setup_full import FullCase
 from test_setup_update import UpdateCase, edit_unit
 from v2_fixtures import FAKE_TOKEN
@@ -319,7 +319,7 @@ class GenerationAnchorTests(UpdateCase):
         os.chmod(directory, 0o555)
 
     def test_an_auxiliary_only_change_reuses_the_same_verified_generation(self) -> None:
-        docs_only = self.candidate("docs-only", "0.3.0-beta.1", lambda root: (root / "docs/INSTALL.md").write_text((root / "docs/INSTALL.md").read_text() + "\ndocs-only-change\n"))
+        docs_only = self.candidate("docs-only", CURRENT_VERSION, lambda root: (root / "docs/INSTALL.md").write_text((root / "docs/INSTALL.md").read_text() + "\ndocs-only-change\n"))
         before = self.active_generation()
         code, out, err = self.update(docs_only)
         self.assertEqual(code, 0, out + err)
@@ -346,7 +346,7 @@ class QuietPointRuleTests(UpdateCase):
 
     def test_setup_cannot_bypass_the_quiet_point_with_a_changed_unit(self) -> None:
         touch_task_state(self.layout, "WAIT_USER")
-        same_program = self.candidate("same-program", "0.3.0-beta.1", edit_unit)
+        same_program = self.candidate("same-program", CURRENT_VERSION, edit_unit)
         unit_before = (self.layout.unit / "herdr-telegram.service").read_bytes()
         before = snapshot(self.home)
         code, out, err = self.run_tool("setup", "--profile", "minimal", "--payload", str(same_program), "--apply", "--approve-current")

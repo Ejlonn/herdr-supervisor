@@ -64,6 +64,9 @@ def print_status(report: dict[str, Any]) -> None:
             print(f"Delivery:     {delivery.get('status')} turn={delivery.get('turn_id')} kind={delivery.get('kind')}")
         selection=report.get("session_selection") or {}
         print(f"Sessions:     {selection.get('policy','preserve')} profiles={selection.get('profiles') or {}}")
+        pair=report.get("session_pair")
+        if isinstance(pair,dict) and isinstance(pair.get("identities"),dict):
+            print(f"Pair:         {pair.get('name')} claude={(pair['identities'].get('claude') or {}).get('session_id','')[:8]} codex={(pair['identities'].get('codex') or {}).get('session_id','')[:8]} repository={(pair.get('context') or {}).get('repository')}")
         preparation=report.get("session_preparation")
         if isinstance(preparation,dict):
             print(f"Session prep: {preparation.get('status')} id={preparation.get('preparation_id') or 'unknown'}")

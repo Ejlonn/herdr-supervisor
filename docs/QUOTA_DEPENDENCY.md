@@ -2,6 +2,10 @@
 
 The supervisor reads provider quota snapshots that the Herdr plugin `herdr-agent-quota` writes, and it rechecks quota through that plugin's non-LLM `refresh` action (`herdr plugin action invoke refresh --plugin herdr-agent-quota`). Nothing at run time contacts GitHub: once the plugin is installed and writing snapshots, a repository outage cannot stop a supervised task. The dependency matters when a **new project or user installs from scratch**, so this repository pins exactly one revision and ships a bounded tool to check and stage it. The controller, the snapshot contract and the refresh command are unchanged.
 
+## Known integration gap (unresolved in this release candidate)
+
+The supervisor's defaults follow the upstream plugin's later rename to the Herdr id `herdr-agent-usage`: `quota_dir` resolves to `$XDG_STATE_HOME/herdr/plugins/herdr-agent-usage` and `codex_quota_refresh_command` invokes `--plugin herdr-agent-usage`. The revision pinned below declares the earlier id `herdr-agent-quota` (manifest 1.5.4) and writes its snapshots under that name. Until a post-rename revision has been reviewed and pinned with its own hashes and recovery artifacts, a machine that installs the pinned revision must set `quota_dir` and `codex_quota_refresh_command` explicitly for `herdr-agent-quota`, or the supervisor will find no snapshots under its default path. `herdr-setup`'s full profile and `herdr-quota-dependency` act on the pinned revision only; neither guesses a compatible newer revision, and neither replaces an installed plugin.
+
 ## The pinned dependency
 
 The single source of truth is `config/quota-dependency.json` (installed beside the program files as `quota-dependency.json`). Do not edit it to follow a branch; a new revision needs a reviewed change to that file.

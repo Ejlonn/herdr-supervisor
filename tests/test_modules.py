@@ -26,7 +26,7 @@ from v2_fixtures import V2Case, hs  # noqa: E402
 
 SRC = Path(hs.__file__).resolve().parent
 # One-way layering, lowest first. A module may import only modules that appear before it.
-LAYERS = ["herdr_core", "herdr_cli", "herdr_helper_context", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_native_results", "herdr_role_readiness", "herdr_redaction", "herdr_skill_baseline", "herdr_support_skills", "herdr_onboarding", "herdr_validation", "herdr_startup", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
+LAYERS = ["herdr_core", "herdr_cli", "herdr_pairs", "herdr_helper_context", "herdr_session_catalog", "herdr_quota", "herdr_protocol", "herdr_native_results", "herdr_codex_children", "herdr_role_readiness", "herdr_redaction", "herdr_skill_baseline", "herdr_support_skills", "herdr_onboarding", "herdr_validation", "herdr_startup", "herdr_workflow", "herdr_sessions", "herdr_helpers", "herdr_runtime", "herdr_command"]
 FACADE = "herdr_supervisor"
 # Names companion modules and tests consume through the facade (recorded before the split).
 CONSUMED = sorted({
@@ -105,9 +105,10 @@ class CharacterizationTests(V2Case):
         # Re-recorded after the general-workflow-profiles change added `default_workflow_policy:
         # "supervised_v2"` to DEFAULT_CONFIG (previous golden b549cbdf…), then after the quota plugin's
         # id moved from herdr-agent-quota to herdr-agent-usage in the refresh command (previous golden 795f4295…).
-        self.assertEqual(hashlib.sha256(json.dumps({k:v for k,v in hs.DEFAULT_CONFIG.items() if k not in ("helpers", "native_tracking")}, sort_keys=True).encode()).hexdigest(), "54e762185cea73ce22f55dc2b0fc98f2f39326d2a30ebda256c8a889e1ec5e80")
+        self.assertEqual(hashlib.sha256(json.dumps({k:v for k,v in hs.DEFAULT_CONFIG.items() if k not in ("helpers", "native_tracking", "session_pairs")}, sort_keys=True).encode()).hexdigest(), "54e762185cea73ce22f55dc2b0fc98f2f39326d2a30ebda256c8a889e1ec5e80")
         self.assertEqual(hs.DEFAULT_CONFIG["default_workflow_policy"], "supervised_v2")
         self.assertEqual(hs.DEFAULT_CONFIG["helpers"], {"enabled": False})
+        self.assertEqual(hs.DEFAULT_CONFIG["session_pairs"], {"enabled": False, "allowed_roots": [], "instruction_root": None})  # named pairs are inert until an administrator opts in
         self.assertEqual(hs.DEFAULT_CONFIG["native_tracking"], {"enabled": False, "roots": [], "files": []})
         # Recorded after the gate-preserving follow-up added the optional `agent_followup: None` default
         # (pre-follow-up value: a558de0f…). Every other default is byte-identical to the accepted monolith.
@@ -132,7 +133,7 @@ class CharacterizationTests(V2Case):
 
     def test_prompt_text_is_unchanged(self) -> None:
         """gated_v2 text is byte-for-byte the original golden (workflow_contract added, wording untouched);
-        supervised_v2 is a new golden pinning its distinct, non-Prospera-specific wording."""
+        supervised_v2 is a new golden pinning its distinct, project-neutral wording."""
         class Builder(hs.SupervisorV2Mixin):
             config = {"review_root": "/r", "project_root": "/p"}
 

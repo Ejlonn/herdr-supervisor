@@ -214,7 +214,7 @@ class ExplicitMigrationTests(SetupCase):
     def test_state_migration_runs_only_when_selected_and_after_the_smoke_check(self) -> None:
         self.install()
         self.assertFalse([call for call in self.host.calls if call[1:2] == ["migrate"]], "an install never migrates state implicitly")
-        newer = self.candidate("migrating", "0.3.1")
+        newer = self.candidate("migrating", "0.4.1")
         self.reset_calls()
         code, out, err = self.run_tool("update", "--payload", str(newer), "--apply", "--approve-current", "--migrate")
         self.assertEqual(code, 0, out + err)
@@ -374,7 +374,7 @@ class InstallScriptTests(SetupCase):
 
     def test_install_refuses_a_busy_or_different_installation_instead_of_overwriting(self) -> None:
         self.assertEqual(self.run_script("install.sh").returncode, 0)
-        newer = self.candidate("newer", "0.3.1")
+        newer = self.candidate("newer", "0.4.1")
         del newer
         self.layout.state.joinpath("inbox/pending").mkdir(parents=True)
         self.layout.state.joinpath("inbox/pending/x.json").write_text("{}")

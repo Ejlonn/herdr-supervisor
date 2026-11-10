@@ -36,14 +36,16 @@ HUMAN_ACTION = (
 )
 
 
-def installed_definitions(directory: Path) -> dict[str, Any]:
-    """Names and SHA-256 of `*.md` definitions in the provider's agents directory. Read-only; never reads a definition into a report."""
+def installed_definitions(directory: Path, *, pattern: str = "*.md") -> dict[str, Any]:
+    """Names and SHA-256 of provider definitions. Files alone never prove pickup."""
+    if pattern not in ("*.md", "*.toml"):
+        raise SupervisorError("unsupported role definition format")
     try:
         real = Path(os.path.realpath(directory))
         if not real.is_dir():
             return {"status": "absent", "directory": str(directory), "roles": []}
         roles = []
-        for path in sorted(real.glob("*.md"))[:MAX_ROLES]:
+        for path in sorted(real.glob(pattern))[:MAX_ROLES]:
             if path.is_symlink() or not path.is_file():
                 continue
             roles.append({"name": path.stem, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size})
@@ -81,7 +83,7 @@ def record_observation(path: Path, *, provider: str, session_id: str, provider_v
     """Append an operator observation bound to the exact live session and the version read at this moment. The caller supplies the live
     session id it just verified against owners.json; an unknown version refuses (an unbound observation would carry forward silently)."""
     if provider != "claude":
-        raise SupervisorError("role observations are only supported for claude (Codex subagents are disabled)")
+        raise SupervisorError("operator role observations are only supported for claude; Codex requires native callable and transcript evidence")
     if kind not in OBSERVATION_KINDS:
         raise SupervisorError(f"observation kind must be one of {', '.join(OBSERVATION_KINDS)}")
     if not isinstance(session_id, str) or not session_id:

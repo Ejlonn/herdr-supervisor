@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -26,6 +27,8 @@ if str(LIB) not in sys.path:
 import herdr_installation as hi  # noqa: E402
 import herdr_setup as hsetup  # noqa: E402
 
+# The release under test: candidates that mean "the same version as the installed one" name this, never a literal.
+CURRENT_VERSION = (ROOT / "VERSION").read_text().strip()
 PAYLOAD_DIRS = ("src", "bin", "systemd", "docs", "config")
 PAYLOAD_FILES = ("README.md", "LICENSE", "VERSION", "MANIFEST.txt")
 UNITS = ("herdr-server.service", "herdr-supervisor-worker.path", "herdr-supervisor-worker.service", "herdr-query-worker.path", "herdr-query-worker.service",
@@ -41,7 +44,7 @@ def copy_payload(destination: Path, *, version: str | None = None, mutate: Any =
         shutil.copy2(ROOT / name, destination / name)
     if version is not None:
         core = destination / "src/herdr_core.py"
-        core.write_text(core.read_text().replace('SUPERVISOR_VERSION = "0.3.0-beta.1"', f'SUPERVISOR_VERSION = "{version}"'))
+        core.write_text(re.sub(r'SUPERVISOR_VERSION = "[^"]*"', f'SUPERVISOR_VERSION = "{version}"', core.read_text(), count=1))
         (destination / "VERSION").write_text(version + "\n")
     if mutate is not None:
         mutate(destination)

@@ -31,6 +31,7 @@ from typing import Any, Callable
 import herdr_artifacts as ha
 import herdr_backup as hb
 import herdr_codex_reset as hcr
+import herdr_pairs as hpair
 import herdr_present as hp
 import herdr_query
 import herdr_redaction as hr
@@ -38,12 +39,14 @@ import herdr_startup as hst
 import herdr_supervisor as hs
 import telegram_api as tg
 from herdr_sessions import probe_model_flag, session_contract_supported
+from herdr_workflow import pair_switch_problem
 
 CONFIG_SCHEMA = 1
 MODES = ("unconfigured", "shadow", "actionable")
 CHUNK = 3800
 DEFAULT_TIMEZONE = "UTC"
-COMMANDS = ("sessions", "status", "task", "reset-budget", "plan", "pending", "pause", "resume", "cancel", "done", "defer", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
+PAIR_ACTIONS = ("pair_menu", "pair_use", "pair_existing", "pair_pick", "pair_create", "pair_clear")
+COMMANDS = ("sessions", "status", "task", "reset-budget", "pair-set", "plan", "pending", "pause", "resume", "cancel", "done", "defer", "logs", "doctor", "ask", "ask-agent", "revise", "answer", "backup", "help")
 UPLOAD_STATUSES = ("pending_confirmation", "reset_authorization", "start_enqueued", "started", "cancelled", "expired", "failed", "superseded")
 # Compact task-start workflow choice (plan item 4): shown before Start, bound into the pending-task
 # identity, and validated by the same staleness checks as session_selection.
@@ -596,6 +599,7 @@ class Bridge:
             "herdr-supervisor remote control\n"
             "/status – task, stage, agents, quotas, gate\n"
             "/task <text> – start a gated task with Codex (rejected while a task is active)\n"
+            "/pair-set NAME | REPOSITORY | REVIEW_BASE – complete a named-pair choice made on the Start card (only when named pairs are enabled)\n"
             "/plan – pending plan summary; /pending – current human gate\n"
             "/pause /resume /cancel – supervisor control (sessions preserved)\n"
             "/done [note] – close a handoff-ready task as an operator handoff: remaining git/runtime actions are yours and are NOT verified\n"
@@ -670,13 +674,23 @@ class Bridge:
             return {"result": "busy"}
         return self._stage_reset_authorization(update_id, user_id, chat_id, {"task_text": argument, "source": "telegram"})
 
+    @contextlib.contextmanager
+    def _pending_lock(self) -> Any:
+        """The ONE lock every writer of a pending-start record holds (Start commit, supersede, policy/profile/pair selection, /pair-set): a selection can
+        never overwrite an enqueued/consuming/started receipt, and a Start can never read a half-applied selection."""
+        self.sup_paths.pending_starts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (self.sup_paths.pending_starts_dir / ".commit.lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            yield
+
     def _stage_reset_authorization(self, update_id: int, user_id: int, chat_id: int, task: dict[str, Any]) -> dict[str, Any]:
         self.sup_paths.pending_starts_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
-        for old in self.sup_paths.pending_starts_dir.glob("*.json"):
-            try: previous=hs.load_json(old,label="pending task")
-            except hs.SupervisorError: continue
-            if previous.get("chat_id")==chat_id and previous.get("status")=="pending":
-                previous["status"]="superseded"; hs.atomic_write_json(old,previous)
+        with self._pending_lock():
+            for old in self.sup_paths.pending_starts_dir.glob("*.json"):
+                try: previous=hs.load_json(old,label="pending task")
+                except hs.SupervisorError: continue
+                if previous.get("chat_id")==chat_id and previous.get("status")=="pending":
+                    previous["status"]="superseded"; hs.atomic_write_json(old,previous)
         pending_id = str(uuid.uuid4())
         inventory_error = None
         try:
@@ -734,6 +748,10 @@ class Bridge:
             token=self.new_interaction(action="session_policy",event=pseudo,gate=None,chat_id=chat_id,
                                        extra={"pending_id":pending_id,"policy":policy,"task_sha256":record["task_sha256"],"view_revision":1})
             rows.append([{"text":label,"callback_data":token}])
+        if hpair.pairs_enabled(self.sup_config):
+            menu=self.new_interaction(action="pair_menu",event=pseudo,gate=None,chat_id=chat_id,
+                                      extra={"pending_id":pending_id,"task_sha256":record["task_sha256"],"view_revision":1})
+            rows.append([{"text":"Named pair…","callback_data":menu}])
         cancel=self.new_interaction(action="reset_budget_cancel",event=pseudo,gate=None,chat_id=chat_id,
                                     extra={"pending_id":pending_id,"task_sha256":record["task_sha256"],"view_revision":1})
         rows.append([{"text":"Cancel","callback_data":cancel}])
@@ -790,6 +808,20 @@ class Bridge:
         shown=record.get("inventory_available_count")
         identity_note="" if record.get("account_fingerprint") else "\nAutomatic reset redemption is unavailable; reset budget must remain 0."
         suffix="\nUse /reset-budget N for a larger authorized value." if int(record["available_count"])>8 else ""
+        pair_block = ""
+        pair = selection.get("pair")
+        menu_token = self.new_interaction(action="pair_menu", event=pseudo, gate=None, chat_id=chat_id,
+                                          extra={"pending_id": pending_id, "task_sha256": record["task_sha256"], "view_revision": revision}) if hpair.pairs_enabled(self.sup_config) and (pair or record.get("pair_draft")) else None
+        change = [[{"text": "Change pair…", "callback_data": menu_token}]] if menu_token else []
+        if record.get("pair_draft") and not pair:
+            self.safe_send(chat_id, self._pair_incomplete_text(record), reply_markup={"inline_keyboard": [*change, [{"text": "Cancel task start", "callback_data": cancel}]]})
+            return
+        if pair:
+            problem = self._pair_selection_problem(selection)
+            pair_block = self._pair_card_text(pair) + (f"\nCannot start: {problem}\nNothing was sent, launched, renamed or rebound." if problem else "") + "\n\n"
+            if problem:
+                rows = [row for row in rows if not any(str(b.get('text', '')).startswith('Start task') for b in row)]
+            rows = [*change, *rows]
         profiles=", ".join(f"{p}: {selection['profiles'][p]}" for p in sorted(fresh)) or "current models"
         for provider in sorted(fresh):
             if len(self.sup_config["session_start"]["model_profiles"][provider]) == 1:
@@ -798,7 +830,7 @@ class Bridge:
 
         workflow_label = WORKFLOW_POLICY_LABELS.get(workflow_policy, workflow_policy)
         start_label = START_AGENT_LABELS.get(starting_agent, starting_agent)
-        self.safe_send(chat_id,f"Ready to start this task\n\nTask:\n{self._task_preview(record['task'])}\n\nWorkflow: {workflow_label}\nStart agent: {start_label}\nSessions: {selection['policy']}\nModels: {profiles}\nExisting sessions stay preserved; each fresh session uses provider quota only when first prompted.\nBanked Codex resets available: {shown if shown is not None else 'unavailable'}\nA Full Reset can refresh both 5-hour and weekly windows and may change the weekly reset date.{identity_note}{suffix}\n\nTap one Start task button to create the run.",reply_markup={"inline_keyboard":rows})
+        self.safe_send(chat_id,f"Ready to start this task\n\nTask:\n{self._task_preview(record['task'])}\n\n{pair_block}Workflow: {workflow_label}\nStart agent: {start_label}\nSessions: {selection['policy']}\nModels: {profiles}\nExisting sessions stay preserved; each fresh session uses provider quota only when first prompted.\nBanked Codex resets available: {shown if shown is not None else 'unavailable'}\nA Full Reset can refresh both 5-hour and weekly windows and may change the weekly reset date.{identity_note}{suffix}\n\nTap one Start task button to create the run.",reply_markup={"inline_keyboard":rows})
 
     def _task_preview(self, task: dict[str, Any]) -> str:
         """Body text for the start card: the typed task itself, or the already-validated upload name and
@@ -826,9 +858,7 @@ class Bridge:
     def _start_pending_budget(self,path:Path,budget:int,user_id:int,chat_id:int,callback_id:str|None,interaction:tuple[Path,dict[str,Any]]|None)->dict[str,Any]:
         # One commit at a time per host: a duplicate tap re-reads the record under the lock and can never
         # write a stale copy over state the worker advanced after the first tap published the command.
-        self.sup_paths.pending_starts_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
-        with (self.sup_paths.pending_starts_dir/".commit.lock").open("a+") as lock:
-            fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        with self._pending_lock():
             return self._start_pending_budget_locked(path,budget,user_id,chat_id,callback_id,interaction)
 
     def _start_pending_budget_locked(self,path:Path,budget:int,user_id:int,chat_id:int,callback_id:str|None,interaction:tuple[Path,dict[str,Any]]|None)->dict[str,Any]:
@@ -858,6 +888,12 @@ class Bridge:
         if isinstance(budget,bool) or not isinstance(budget,int) or budget<0 or budget>int(record.get("available_count",0)):
             if callback_id:self._ack(callback_id,"Budget is outside the displayed range.")
             return {"rejected":"invalid_budget"}
+        if status=="pending":
+            pair_problem=self._pair_selection_problem(record["session_selection"])
+            if pair_problem:
+                if callback_id:self._ack(callback_id,"The pair choice is no longer startable; nothing was started.")
+                self.safe_send(chat_id,f"Task not started: {pair_problem}\nNothing was sent, launched, renamed or rebound. Choose the pair again with /task.")
+                return {"rejected":"pair_not_startable","reason":pair_problem}
         fingerprint=record.get("account_fingerprint")
         if budget>0 and status=="pending":  # a committed authorization is re-verified by the worker itself
             try:
@@ -1248,43 +1284,52 @@ class Bridge:
             self._ack(callback_id, problem)
             return {"rejected": problem}
         action = record["action"]
+        if action in PAIR_ACTIONS:
+            try:
+                with self._pending_lock():  # read, compare status/revision and write as ONE step against a concurrent Start
+                    return self._pair_callback(callback_id, record, record_path, chat_id, action)
+            except (hs.SupervisorError, OSError, ValueError, KeyError, TypeError) as error:
+                self._ack(callback_id, f"That pair choice could not be applied ({type(error).__name__}); nothing was started. Use the newest card.")
+                return {"rejected": "pair_error", "error": type(error).__name__}
         if action in ("workflow_policy", "starting_agent"):
-            pending_id = record.get("pending_id")
-            path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
-            if not isinstance(pending_id, str) or not path.exists():
-                self._ack(callback_id,"This task start is no longer valid."); return {"rejected":"missing_pending_start"}
-            pending=hs.load_json(path,label="pending task")
-            if (pending.get("status")!="pending" or pending.get("task_sha256")!=record.get("task_sha256")
-                    or pending.get("view_revision")!=record.get("view_revision")):
-                self._ack(callback_id,"This task choice is stale; use the newest card."); return {"rejected":"stale_pending_start"}
-            if action == "workflow_policy":
-                policy = record.get("policy")
-                if policy not in WORKFLOW_POLICY_LABELS:
-                    self._ack(callback_id,"Unsupported workflow choice."); return {"rejected":"invalid_workflow_policy"}
-                update = {"workflow_policy":policy,"view_revision":int(pending["view_revision"])+1}
-                if policy != "supervised_v2":
-                    # F4: gated_v2 always normalizes to codex; a Claude start choice cannot survive a
-                    # switch away from supervised_v2, so no card can silently offer a Claude start under it.
-                    update["starting_agent"] = "codex"
-                pending.update(update)
-                hs.atomic_write_json(path,pending); self._consume(record_path,record)
-                self._ack(callback_id,"Choice recorded; review the final Start task card.")
-                self._send_start_confirmation(chat_id,pending)
-                return {"callback":action,"result":"selection_updated"}
-            if action == "starting_agent":
-                agent = record.get("agent")
-                if pending.get("workflow_policy") != "supervised_v2":
-                    self._ack(callback_id,"gated_v2 always starts with Codex."); return {"rejected":"starting_agent_not_selectable"}
-                if agent not in ("codex","claude"):
-                    self._ack(callback_id,"Unsupported starting agent."); return {"rejected":"invalid_starting_agent"}
-                pending.update({"starting_agent":agent,"view_revision":int(pending["view_revision"])+1})
-                hs.atomic_write_json(path,pending); self._consume(record_path,record)
-                self._ack(callback_id,"Choice recorded; review the final Start task card.")
-                self._send_start_confirmation(chat_id,pending)
-                return {"callback":action,"result":"selection_updated"}
+            with self._pending_lock():  # a selection must never overwrite an enqueued/consuming/started receipt
+                pending_id = record.get("pending_id")
+                path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
+                if not isinstance(pending_id, str) or not path.exists():
+                    self._ack(callback_id,"This task start is no longer valid."); return {"rejected":"missing_pending_start"}
+                pending=hs.load_json(path,label="pending task")
+                if (pending.get("status")!="pending" or pending.get("task_sha256")!=record.get("task_sha256")
+                        or pending.get("view_revision")!=record.get("view_revision")):
+                    self._ack(callback_id,"This task choice is stale; use the newest card."); return {"rejected":"stale_pending_start"}
+                if action == "workflow_policy":
+                    policy = record.get("policy")
+                    if policy not in WORKFLOW_POLICY_LABELS:
+                        self._ack(callback_id,"Unsupported workflow choice."); return {"rejected":"invalid_workflow_policy"}
+                    update = {"workflow_policy":policy,"view_revision":int(pending["view_revision"])+1}
+                    if policy != "supervised_v2":
+                        # F4: gated_v2 always normalizes to codex; a Claude start choice cannot survive a
+                        # switch away from supervised_v2, so no card can silently offer a Claude start under it.
+                        update["starting_agent"] = "codex"
+                    pending.update(update)
+                    hs.atomic_write_json(path,pending); self._consume(record_path,record)
+                    self._ack(callback_id,"Choice recorded; review the final Start task card.")
+                    self._send_start_confirmation(chat_id,pending)
+                    return {"callback":action,"result":"selection_updated"}
+                if action == "starting_agent":
+                    agent = record.get("agent")
+                    if pending.get("workflow_policy") != "supervised_v2":
+                        self._ack(callback_id,"gated_v2 always starts with Codex."); return {"rejected":"starting_agent_not_selectable"}
+                    if agent not in ("codex","claude"):
+                        self._ack(callback_id,"Unsupported starting agent."); return {"rejected":"invalid_starting_agent"}
+                    pending.update({"starting_agent":agent,"view_revision":int(pending["view_revision"])+1})
+                    hs.atomic_write_json(path,pending); self._consume(record_path,record)
+                    self._ack(callback_id,"Choice recorded; review the final Start task card.")
+                    self._send_start_confirmation(chat_id,pending)
+                    return {"callback":action,"result":"selection_updated"}
         if action in ("session_policy", "session_profile"):
             try:
-                return self._selection_callback(callback_id, record, record_path, chat_id, action)
+                with self._pending_lock():
+                    return self._selection_callback(callback_id, record, record_path, chat_id, action)
             except (hs.SupervisorError, OSError, ValueError, KeyError, TypeError) as error:
                 # Every selection button gets bounded visible feedback, including an internal failure; the
                 # choice is idempotent UI state, so the owner can simply tap the newest card again.
@@ -1612,6 +1657,7 @@ class Bridge:
             if not self.fresh_policy_available(policy):
                 self._ack(callback_id,"Fresh session creation is no longer available."); return {"rejected":"invalid_session_capability"}
             selection={"policy":policy,"profiles":{"codex":"default","claude":"default"}}
+            pending.pop("pair_draft", None)  # choosing a plain policy abandons any half-made pair choice
         else:
             provider,profile=record.get("provider"),record.get("profile")
             fresh={"fresh-codex":{"codex"},"fresh-claude":{"claude"},"fresh-all":{"codex","claude"}}.get(selection["policy"],set())
@@ -1628,6 +1674,261 @@ class Bridge:
         self._ack(callback_id,ack or "Choice recorded; review the final Start task card.")
         self._send_start_confirmation(chat_id,pending)
         return {"callback":action,"result":"selection_updated"}
+
+    # ----- named session pairs. Selection only: no launch, prompt, rename, rebind or configuration call happens here; the supervisor re-proves everything at Start.
+
+    def _catalog_agents(self) -> list[dict[str, Any]]:
+        """Observed sessions as live-agent records (read-only, from the status report's session catalog); fail closed when unavailable."""
+        try:
+            rows = (self.status_reader().get("session_catalog") or {}).get("sessions") or []
+        except (OSError, hs.SupervisorError):
+            return []
+        agents = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            agent = {"agent": row.get("provider"), "pane_id": row.get("pane_id"), "agent_status": row.get("lifecycle")}
+            if isinstance(row.get("session_id"), str):
+                agent["agent_session"] = {"value": row["session_id"]}  # duplicates and unverified rows stay visible to the exact-identity predicates
+            agents.append(agent)  # a row with an omitted identity stays too: it is exactly the uncertainty the boundary proof must see
+        return agents
+
+    def _pair_selection_problem(self, selection: dict[str, Any]) -> str | None:
+        """Why the chosen pair cannot start right now (None = it can). Read-only; mirrors the supervisor's start checks."""
+        pair = selection.get("pair")
+        if pair is None:
+            return None
+        try:
+            pair = hpair.validate_pair_selection(pair, str(selection.get("policy")))
+            if not hpair.pairs_enabled(self.sup_config):
+                return "named pairs are not enabled on this installation"
+            boundary = pair_switch_problem(self.sup_paths, self._state(), self._catalog_agents())  # the supervisor's own old-run / old-pair proof, read-only
+            if boundary:
+                return boundary
+            if pair["mode"] == "create":
+                hpair.check_context(self.sup_config, pair["context"])
+                if not self.fresh_policy_available("fresh-all"):
+                    return "fresh session creation is not available"
+                doc = hpair.load_registry(self.sup_paths)
+                if hpair.name_key(pair["name"]) in doc["reservations"] or any(e["name_key"] == hpair.name_key(pair["name"]) for e in doc["entries"].values()) or len(doc["entries"]) + len(doc["reservations"]) >= hpair.MAX_PAIRS:
+                    return "that pair name is taken or the pair registry is full"
+                return None
+            if pair["mode"] == "saved":
+                entry = hpair.get_entry(self.sup_paths, pair["pair_id"])
+                if entry is None:
+                    return "the saved pair no longer exists"
+                if hpair.entry_fingerprint(entry) != pair["fingerprint"]:
+                    return "the saved pair changed after this card was shown"
+                hpair.check_context(self.sup_config, entry["context"])  # current administrator roots and canonical directories, not just the stored bytes
+                identities = entry["identities"]
+            else:
+                hpair.check_context(self.sup_config, pair["context"])
+                identities = pair["identities"]
+                if any(identities[p]["session_id"] in hpair.foreign_sessions(self.sup_paths) for p in hs.PROVIDERS):
+                    return "a chosen session already belongs to a saved pair, a query session or a helper worker"
+                if hpair.name_key(pair["name"]) in {e["name_key"] for e in hpair.list_entries(self.sup_paths)}:
+                    return "that pair name is already used"
+            problems = hpair.live_problems(self._catalog_agents(), identities, settled=True)
+            return "; ".join(problems) if problems else None
+        except hs.SupervisorError as error:
+            return str(error)
+
+    def _pair_card_text(self, pair: dict[str, Any]) -> str:
+        mode = pair["mode"]
+        if mode == "saved":
+            entry = hpair.get_entry(self.sup_paths, pair["pair_id"])
+            if entry is None:
+                return "Named pair: (missing)"
+            return "Named pair (saved):\n" + redact(hpair.binding_view(hpair.binding_from_entry(entry, bound_at="")), limit=900)
+        ctx = pair["context"]
+        lines = [f"Named pair ({'new, fresh sessions are created' if mode == 'create' else 'save the chosen existing sessions'}): {redact(pair['name'], limit=64)}"]
+        if mode == "save_existing":
+            ids = pair["identities"]
+            lines.append(f"claude {ids['claude']['session_id'][:8]} ({ids['claude']['pane_id']}) · codex {ids['codex']['session_id'][:8]} ({ids['codex']['pane_id']})")
+        lines += [f"Repository: {redact(ctx['repository'], limit=300)}", f"Review base: {redact(ctx['review_base'], limit=300)}"]
+        return "\n".join(lines)
+
+    def _pair_incomplete_text(self, record: dict[str, Any]) -> str:
+        draft = record["pair_draft"]
+        if draft.get("mode") == "save_existing" and set(draft.get("identities") or {}) != set(hs.PROVIDERS):
+            return "Choose both existing sessions first."
+        return ("Send the pair details to finish this choice:\n/pair-set NAME | REPOSITORY | REVIEW_BASE\n"
+                "Repository and review base must be existing directories inside the administrator-allowed roots; the name is only a label.")
+
+    def _pair_pending(self, record: dict[str, Any], callback_id: str) -> tuple[Path, dict[str, Any]] | None:
+        pending_id = record.get("pending_id")
+        path = self.sup_paths.pending_starts_dir / f"{pending_id}.json"
+        if not isinstance(pending_id, str) or not path.exists():
+            self._ack(callback_id, "This task start is no longer valid.")
+            return None
+        pending = hs.load_json(path, label="pending task")
+        if pending.get("status") != "pending" or pending.get("task_sha256") != record.get("task_sha256") or pending.get("view_revision") != record.get("view_revision"):
+            self._ack(callback_id, "This task choice is stale; use the newest card.")
+            return None
+        return path, pending
+
+    def _pair_commit(self, path: Path, pending: dict[str, Any], record_path: Path, record: dict[str, Any], chat_id: int, ack: str) -> dict[str, Any]:
+        pending["view_revision"] = int(pending["view_revision"]) + 1
+        hs.atomic_write_json(path, pending)
+        self._consume(record_path, record)
+        self._ack(str(record.get("callback_id") or ""), ack)
+        self._send_start_confirmation(chat_id, pending)
+        return {"callback": record["action"], "result": "pair_selection_updated"}
+
+    def _pair_candidates(self, provider: str) -> list[dict[str, Any]]:
+        try:
+            taken = hpair.foreign_sessions(self.sup_paths)
+        except hs.SupervisorError:
+            return []  # unknown ownership offers nothing
+        try:
+            rows = (self.status_reader().get("session_catalog") or {}).get("sessions") or []
+        except (OSError, hs.SupervisorError):
+            return []
+        return [r for r in rows if isinstance(r, dict) and r.get("provider") == provider and r.get("usable") is True and r.get("identity_verified") is True
+                and r.get("session_id") not in taken and hpair.valid_pane(r.get("pane_id"))][:8]
+
+    def _send_pair_menu(self, chat_id: int, pending: dict[str, Any], revision: int) -> None:
+        pseudo = {"event_id": f"reset-auth:{pending['pending_id']}", "run_id": pending["pending_id"], "supervisor_state": "PENDING_START"}
+        base = {"pending_id": pending["pending_id"], "task_sha256": pending["task_sha256"], "view_revision": revision}
+        rows: list[list[dict[str, str]]] = []
+        for entry in hpair.list_entries(self.sup_paths)[:8]:
+            token = self.new_interaction(action="pair_use", event=pseudo, gate=None, chat_id=chat_id, extra={**base, "pair_id": entry["pair_id"]})
+            rows.append([{"text": f"Use saved pair: {redact(entry['name'], limit=40)}", "callback_data": token}])
+        for label, action in (("Save existing pair…", "pair_existing"), ("Create and save pair…", "pair_create"), ("Back to current sessions", "pair_clear")):
+            if action == "pair_create" and not self.fresh_policy_available("fresh-all"):
+                continue
+            rows.append([{"text": label, "callback_data": self.new_interaction(action=action, event=pseudo, gate=None, chat_id=chat_id, extra=base)}])
+        self.safe_send(chat_id, "Choose the Claude/Codex pair for this task. Nothing is started, launched, renamed or rebound by choosing.", reply_markup={"inline_keyboard": rows})
+
+    def _send_pair_candidates(self, chat_id: int, pending: dict[str, Any], provider: str) -> None:
+        pseudo = {"event_id": f"reset-auth:{pending['pending_id']}", "run_id": pending["pending_id"], "supervisor_state": "PENDING_START"}
+        rows = []
+        for row in self._pair_candidates(provider):
+            token = self.new_interaction(action="pair_pick", event=pseudo, gate=None, chat_id=chat_id, extra={
+                "pending_id": pending["pending_id"], "task_sha256": pending["task_sha256"], "view_revision": pending["view_revision"],
+                "provider": provider, "pane_id": row["pane_id"], "session_id": row["session_id"]})
+            rows.append([{"text": f"{row['pane_id']} · {str(row['session_id'])[:8]} · {row.get('lifecycle')}", "callback_data": token}])
+        text = f"Choose the existing {provider.title()} session (verified identity, settled):" if rows else f"No verified, settled, unsaved {provider.title()} session is available. Nothing was changed."
+        self.safe_send(chat_id, text, reply_markup={"inline_keyboard": rows} if rows else None)
+
+    def _pair_callback(self, callback_id: str, record: dict[str, Any], record_path: Path, chat_id: int, action: str) -> dict[str, Any]:
+        if not hpair.pairs_enabled(self.sup_config):
+            self._ack(callback_id, "Named pairs are not enabled.")
+            return {"rejected": "pairs_disabled"}
+        found = self._pair_pending(record, callback_id)
+        if found is None:
+            return {"rejected": "stale_pending_start"}
+        path, pending = found
+        revision = int(pending["view_revision"])
+        default = {"codex": "default", "claude": "default"}
+        record = {**record, "callback_id": callback_id}
+        if action == "pair_menu":
+            self._consume(record_path, record)
+            self._ack(callback_id, "Choose a pair.")
+            self._send_pair_menu(chat_id, pending, revision)
+            return {"callback": action, "result": "menu"}
+        if action == "pair_clear":
+            pending["session_selection"] = {"policy": "preserve", "profiles": default}
+            pending.pop("pair_draft", None)
+            return self._pair_commit(path, pending, record_path, record, chat_id, "Back to the current sessions.")
+        if action == "pair_use":
+            entry = hpair.get_entry(self.sup_paths, record.get("pair_id"))
+            if entry is None:
+                self._ack(callback_id, "That saved pair no longer exists.")
+                return {"rejected": "missing_pair"}
+            pending["session_selection"] = {"policy": "preserve", "profiles": default, "pair": {"mode": "saved", "pair_id": entry["pair_id"], "fingerprint": hpair.entry_fingerprint(entry)}}
+            pending.pop("pair_draft", None)
+            return self._pair_commit(path, pending, record_path, record, chat_id, "Saved pair chosen; review the final Start card.")
+        if action == "pair_create":
+            if not self.fresh_policy_available("fresh-all"):
+                self._ack(callback_id, "Fresh session creation is not available.")
+                return {"rejected": "invalid_session_capability"}
+            pending["session_selection"] = {"policy": "fresh-all", "profiles": default}
+            pending["pair_draft"] = {"mode": "create"}
+            return self._pair_commit(path, pending, record_path, record, chat_id, "Send /pair-set NAME | REPOSITORY | REVIEW_BASE.")
+        if action == "pair_existing":
+            pending["session_selection"] = {"policy": "preserve", "profiles": default}
+            pending["pair_draft"] = {"mode": "save_existing", "identities": {}}
+            pending["view_revision"] = revision + 1
+            hs.atomic_write_json(path, pending)
+            self._consume(record_path, record)
+            self._ack(callback_id, "Choose the Claude session.")
+            self._send_pair_candidates(chat_id, pending, "claude")
+            return {"callback": action, "result": "choose_claude"}
+        # pair_pick: one explicitly chosen, still verified session
+        draft = pending.get("pair_draft")
+        provider = record.get("provider")
+        if not isinstance(draft, dict) or draft.get("mode") != "save_existing" or provider not in hs.PROVIDERS:
+            self._ack(callback_id, "That choice is no longer valid.")
+            return {"rejected": "invalid_pick"}
+        match = [r for r in self._pair_candidates(provider) if r.get("session_id") == record.get("session_id") and r.get("pane_id") == record.get("pane_id")]
+        if len(match) != 1:
+            self._ack(callback_id, "That session is no longer a verified, settled, unsaved candidate.")
+            return {"rejected": "invalid_pick"}
+        draft.setdefault("identities", {})[provider] = {"pane_id": match[0]["pane_id"], "session_id": match[0]["session_id"]}
+        pending["view_revision"] = revision + 1
+        hs.atomic_write_json(path, pending)
+        self._consume(record_path, record)
+        self._ack(callback_id, f"{provider.title()} session chosen.")
+        if set(draft["identities"]) == set(hs.PROVIDERS):
+            try:
+                hpair.validate_identities(draft["identities"])
+            except hs.SupervisorError as error:
+                pending["pair_draft"] = {"mode": "save_existing", "identities": {}}
+                hs.atomic_write_json(path, pending)
+                self.safe_send(chat_id, f"Those sessions cannot form a pair: {error}. Start the choice again.")
+                return {"rejected": "invalid_pair"}
+            self.safe_send(chat_id, self._pair_incomplete_text(pending))
+        else:
+            self._send_pair_candidates(chat_id, pending, "codex" if provider == "claude" else "claude")
+        return {"callback": action, "result": "session_chosen"}
+
+    def cmd_pair_set(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        with self._pending_lock():  # the pending record is re-read, compared and rewritten as one step against a concurrent Start
+            return self._pair_set_locked(update_id, argument, user_id, chat_id)
+
+    def _pair_set_locked(self, update_id: int, argument: str, user_id: int, chat_id: int) -> dict[str, Any]:
+        """`/pair-set NAME | REPOSITORY | REVIEW_BASE`: complete the pending save-existing or create choice. The values are validated against the
+        administrator-allowed roots; Telegram input can never widen them."""
+        if not hpair.pairs_enabled(self.sup_config):
+            self.safe_send(chat_id, "Named pairs are not enabled on this installation.")
+            return {"result": "pairs_disabled"}
+        parts = [part.strip() for part in argument.split("|")]
+        if len(parts) != 3 or not all(parts):
+            self.safe_send(chat_id, "Usage: /pair-set NAME | REPOSITORY | REVIEW_BASE")
+            return {"result": "usage"}
+        candidates = sorted(self.sup_paths.pending_starts_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if self.sup_paths.pending_starts_dir.exists() else []
+        for path in candidates:
+            try:
+                pending = hs.load_json(path, label="pending task")
+            except hs.SupervisorError:
+                continue
+            if pending.get("status") == "pending" and pending.get("chat_id") == chat_id and pending.get("owner_user_id") == user_id and isinstance(pending.get("pair_draft"), dict):
+                break
+        else:
+            self.safe_send(chat_id, "No pair choice is waiting for details. Use /task, then Named pair….")
+            return {"result": "none"}
+        if self.clock() > float(pending.get("expires_at_unix", 0)):
+            self.safe_send(chat_id, "That task start expired; send /task again.")
+            return {"result": "expired"}
+        draft = pending["pair_draft"]
+        try:
+            context = {"instruction_root": hpair.instruction_root(self.sup_config), "repository": parts[1], "review_base": parts[2]}
+            context = hpair.check_context(self.sup_config, context)
+            name = hpair.normalize_name(parts[0])
+            policy = "preserve" if draft["mode"] == "save_existing" else "fresh-all"
+            pair = {"mode": draft["mode"], "name": name, "context": context}
+            if draft["mode"] == "save_existing":
+                pair["identities"] = draft.get("identities") or {}
+            pair = hpair.validate_pair_selection(pair, policy)
+        except hs.SupervisorError as error:
+            self.safe_send(chat_id, f"Pair details not accepted: {error}")
+            return {"result": "rejected"}
+        pending["session_selection"] = {"policy": policy, "profiles": {"codex": "default", "claude": "default"}, "pair": pair}
+        pending["view_revision"] = int(pending["view_revision"]) + 1
+        hs.atomic_write_json(path, pending)
+        self._send_start_confirmation(chat_id, pending)
+        return {"result": "pair_selection_updated"}
 
     def _ack(self, callback_id: str, text: str) -> None:
         if not callback_id:

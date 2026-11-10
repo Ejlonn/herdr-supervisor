@@ -518,7 +518,7 @@ class StateMigrationAndEventsTests(V2Case):
 class InboxWorkerRecoveryTests(V2Case):
     def test_task_command_starts_run_idempotently_and_hostile_text_is_data(self) -> None:
         """No explicit workflow_policy on the inbox command resolves to config's default_workflow_policy
-        (supervised_v2 unless a workspace sets it otherwise, e.g. Prospera's gated_v2); a command that
+        (supervised_v2 unless a workspace sets it otherwise, e.g. a strict gated_v2); a command that
         does name a policy gets exactly that policy (see the case below)."""
         hostile = "Fix it; $(rm -rf /) `echo pwned` \n--start claude\x00"
         command = {"request_id": "req-0000000001", "action": "task", "task_text": hostile, "actor": "telegram:1", "chat_id": 5}

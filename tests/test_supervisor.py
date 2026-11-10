@@ -182,9 +182,14 @@ class SupervisorTestCase(unittest.TestCase):
         self.project_root.mkdir()
         (self.project_root / "AGENTS.md").write_text("# rules\n")
         self.paths = hs.Paths(config_file=root / "config.json", state_dir=self.state_dir)
+        self.codex_native_root = root / "codex-native"      # candidate fixture addition: a childless PRIMARY Codex transcript so the transcript child guard has a readable history
+        (self.codex_native_root / "2026" / "11" / "04").mkdir(parents=True)
+        (self.codex_native_root / "2026" / "11" / "04" / f"rollout-2026-11-04T10-00-00-{CODEX_SESSION}.jsonl").write_text(
+            json.dumps({"timestamp": "2026-11-04T10:00:00.000Z", "type": "session_meta", "payload": {"id": CODEX_SESSION, "source": "cli", "cwd": "/synthetic"}}) + "\n")
         self.config = hs.resolve_config_defaults(hs.deep_merge(
             hs.DEFAULT_CONFIG,
             {
+                "native_session_roots": {"codex": str(self.codex_native_root)},
                 "project_root": str(self.project_root),
                 "quota_dir": str(self.quota_dir),
                 "quota_safety_buffer_seconds": 60,

@@ -19,7 +19,7 @@ import herdr_core as core
 import herdr_installation as hi
 import herdr_setup as hsetup
 import herdr_update as hu
-from setup_fixtures import SetupCase, copy_payload, snapshot, touch_task_state
+from setup_fixtures import CURRENT_VERSION, SetupCase, copy_payload, snapshot, touch_task_state
 
 OLD_LAUNCHER = '#!/bin/sh\n# legacy launcher\nexec python3 "${{HERDR_SUPERVISOR_LIB:-$HOME/.local/lib/herdr-supervisor}}/{module}" "$@"\n'
 LAUNCHER_MODULES = {"herdr-supervisor": "herdr_supervisor.py", "herdr-telegram": "herdr_telegram.py", "herdr-query-worker": "herdr_query.py", "herdr-backup": "herdr_backup.py",
@@ -41,7 +41,7 @@ class UpdateCase(SetupCase):
         super().setUp()
         self.install()
         self.old_generation = self.active_generation()
-        self.v2 = self.candidate("payload-2", "0.3.1", edit_docs_and_unit)
+        self.v2 = self.candidate("payload-2", "0.4.1", edit_docs_and_unit)
 
     def preview(self, payload: Path, *extra: str) -> dict[str, Any]:
         return self.plan_json("update", "--payload", str(payload), *extra)
@@ -66,7 +66,7 @@ class UpdatePreviewTests(UpdateCase):
         self.assertEqual(self.host.service_calls(), [])
         self.assertEqual([call[2] for call in self.host.commands("systemctl")][:1], ["show-environment"])
         self.assertTrue(all(call[2] in ("show-environment", "is-active") for call in self.host.commands("systemctl")), "the preview only queries")
-        self.assertEqual(document["plan"]["candidate"]["version"], "0.3.1")
+        self.assertEqual(document["plan"]["candidate"]["version"], "0.4.1")
         self.assertEqual(document["plan"]["installed"]["layout"], "managed")
         self.assertEqual(document["blockers"], [])
         titles = [action["title"] for action in document["plan"]["actions"]]
@@ -442,7 +442,7 @@ class RollbackTests(UpdateCase):
 
     def test_rollback_is_refused_when_state_is_newer_than_the_previous_release_supports(self) -> None:
         """The previous generation's own manifest (not a copy in the receipt) says which state schema it can read."""
-        older = self.candidate("old-schema", "0.3.0-beta.1", lambda root: (root / "src/herdr_core.py").write_text((root / "src/herdr_core.py").read_text().replace("STATE_SCHEMA_VERSION = 2", "STATE_SCHEMA_VERSION = 1")))
+        older = self.candidate("old-schema", CURRENT_VERSION, lambda root: (root / "src/herdr_core.py").write_text((root / "src/herdr_core.py").read_text().replace("STATE_SCHEMA_VERSION = 2", "STATE_SCHEMA_VERSION = 1")))
         self.assertEqual(self.update(older)[0], 0)
         self.assertEqual(hi.load_payload(older).state_schema_version, 1)
         self.assertEqual(self.update(self.payload)[0], 0, "moving to the schema-2 release is allowed")
@@ -461,7 +461,7 @@ class RollbackTests(UpdateCase):
 class SmokeFailureTests(UpdateCase):
     def test_a_candidate_that_fails_its_smoke_check_is_reverted_completely(self) -> None:
         self.host.active.update({"herdr-telegram.service": "active"})
-        broken = self.candidate("broken", "0.3.1", lambda root: (root / "src/herdr_supervisor.py").write_text("raise SystemExit('broken candidate')\n"))
+        broken = self.candidate("broken", "0.4.1", lambda root: (root / "src/herdr_supervisor.py").write_text("raise SystemExit('broken candidate')\n"))
         before_units = {path.name: path.read_bytes() for path in self.layout.unit.iterdir()}
         receipt_before = self.layout.receipt.read_bytes()
         self.reset_calls()
@@ -620,7 +620,7 @@ class CrashRecoveryTests(UpdateCase):
         self.assertIn("receipt", "; ".join(state.problems))
         code, out, _err = self.run_tool("--json", "status")
         self.assertEqual(json.loads(out)["overall"], "FAILED")
-        other = self.candidate("other", "0.3.2")
+        other = self.candidate("other", "0.4.2")
         self.assert_refused(other, "inconsistent")
         code, out, err = self.run_tool("update", "--apply", "--plan", str(path), "--approve", digest)
         self.assertEqual(code, 0, out + err)
@@ -693,7 +693,7 @@ class ConcurrencyTests(UpdateCase):
         self.assertEqual(hi.verify_generation(self.layout.generations / str(self.active_generation()))[1], [])
 
     def test_two_different_candidates_serialize_and_the_second_approval_goes_stale(self) -> None:
-        other = self.candidate("payload-3", "0.3.2")
+        other = self.candidate("payload-3", "0.4.2")
         first, second = self.tmp / "p1.json", self.tmp / "p2.json"
         self.assertEqual(self.run_tool("update", "--payload", str(self.v2), "--plan-out", str(first))[0], 0)
         self.assertEqual(self.run_tool("update", "--payload", str(other), "--plan-out", str(second))[0], 0)
@@ -719,14 +719,14 @@ class LauncherConsistencyTests(SetupCase):
             "import herdr_present\n"
             "print(os.path.dirname(os.path.abspath(herdr_present.__file__)), flush=True)\n"
         )
-        first = self.candidate("probe-1", "0.3.0-beta.1", lambda root: (root / "src/herdr_supervisor.py").write_text(probe))
+        first = self.candidate("probe-1", CURRENT_VERSION, lambda root: (root / "src/herdr_supervisor.py").write_text(probe))
         self.install(first)
         generation_one = self.active_generation()
         barrier = self.tmp / "barrier"
         process = subprocess.Popen([str(self.layout.bin / "herdr-supervisor")], env={**os.environ, "HOME": str(self.home), "BARRIER": str(barrier)}, stdout=subprocess.PIPE, text=True)
         assert process.stdout is not None
         started = process.stdout.readline().strip()
-        second = self.candidate("probe-2", "0.3.1", lambda root: (root / "src/herdr_supervisor.py").write_text(probe))
+        second = self.candidate("probe-2", "0.4.1", lambda root: (root / "src/herdr_supervisor.py").write_text(probe))
         code, out, err = self.update(second)
         self.assertEqual(code, 0, out + err)
         self.assertNotEqual(self.active_generation(), generation_one)
@@ -774,12 +774,12 @@ class CompatibilityLinkTests(SetupCase):
         return done.stdout.strip()
 
     def test_the_old_hook_path_resolves_the_active_generation_even_after_updates(self) -> None:
-        first = self.probe_candidate("probe-a", "0.3.0-beta.1")
+        first = self.probe_candidate("probe-a", CURRENT_VERSION)
         self.install(first)
         link = self.layout.lib / self.HOOK
         self.assertEqual(os.readlink(link), f"active/{self.HOOK}")
         self.assertEqual(self.run_hook(), str((self.layout.generations / str(self.active_generation())).resolve()), "the script directory is the concrete generation, resolved once")
-        second = self.probe_candidate("probe-b", "0.3.1")
+        second = self.probe_candidate("probe-b", "0.4.1")
         self.assertEqual(self.update(second)[0], 0)
         self.assertEqual(self.run_hook(), str((self.layout.generations / str(self.active_generation())).resolve()))
         self.assertTrue(link.is_symlink())

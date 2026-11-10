@@ -30,8 +30,13 @@ GLOBAL_SERVICE_UNIT = "herdr-codex-reset-worker.service"
 CODEX_BIN_ENV = "HERDR_CODEX_BIN"
 _FINGERPRINT_DOMAIN = "herdr-helper-context-v1\0"
 _FIELDS = ("version", "instance", "journal_root", "codex_bin", "codex_home", "working_directory")
-# SHA-256 of the shipped bin/herdr-codex-reset-worker launcher (a test pins it to the file in the source tree).
-WORKER_LAUNCHER_SHA256 = "6ac2ee6cb3a295260eae851653354f40b921e62e18e749c18ccf1aa319cbcb6e"
+# SHA-256 of the shipped bin/herdr-codex-reset-worker launcher (a test pins it to the file in the source tree). It resolves the
+# managed program generation behind the `active` pointer once and falls back to a flat library for legacy layouts.
+WORKER_LAUNCHER_SHA256 = "3f8398d673c501837074fd4b9acc3b62aab7118c59692b7d4e3cf4b9c7d1c677"
+# The earlier flat-layout launcher stays a supported installed launcher: an installation made before managed generations has it until
+# its next reviewed update, and readiness must not report a working legacy worker as unsupported.
+LEGACY_WORKER_LAUNCHER_SHA256 = "6ac2ee6cb3a295260eae851653354f40b921e62e18e749c18ccf1aa319cbcb6e"
+SUPPORTED_WORKER_LAUNCHERS = (WORKER_LAUNCHER_SHA256, LEGACY_WORKER_LAUNCHER_SHA256)
 # The installed worker module must declare it understands context-bound requests.
 WORKER_PROTOCOL_MARKER = "HELPER_CONTEXT_PROTOCOL = 1"
 # How a fresh Codex pane is launched. `agent-start` (the default) lets Herdr launch its canonical executable in its own
@@ -711,17 +716,31 @@ def inspect_loaded_units(context: Mapping[str, Any], unit_dir: Path, home: Path 
     return problems, facts
 
 
+def installed_library(home: Path | str | None) -> Path:
+    """The directory the installed launcher executes: the managed program generation the `active` pointer names (exactly one level,
+    `generations/<name>`), else the flat legacy library. Read-only; any other pointer value is not followed."""
+    base = _home(home) / ".local/lib/herdr-supervisor"
+    pointer = base / "active"
+    try:
+        target = os.readlink(pointer) if pointer.is_symlink() else None
+    except OSError:
+        target = None
+    if target is not None and re.fullmatch(r"generations/[A-Za-z0-9._+-]+", target) and ".." not in target:
+        return base / target
+    return base
+
+
 def inspect_worker_runtime(home: Path | str | None) -> list[str]:
     """The supported launcher and the installed library it executes (read-only file facts)."""
     problems: list[str] = []
     worker = _home(home) / WORKER_COMMAND_SUBPATH
     try:
-        launcher_ok = worker.is_file() and os.access(worker, os.X_OK) and hashlib.sha256(worker.read_bytes()).hexdigest() == WORKER_LAUNCHER_SHA256
+        launcher_ok = worker.is_file() and os.access(worker, os.X_OK) and hashlib.sha256(worker.read_bytes()).hexdigest() in SUPPORTED_WORKER_LAUNCHERS
     except OSError:
         launcher_ok = False
     if not launcher_ok:
         problems.append(f"{worker} is missing, not executable, or not the supported worker launcher; reinstall the reviewed version")
-    library = _home(home) / ".local/lib/herdr-supervisor"
+    library = installed_library(home)
     try:
         module_text = (library / "herdr_codex_reset.py").read_text()
     except OSError:

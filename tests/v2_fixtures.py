@@ -40,6 +40,16 @@ class FakeClock:
 
 _RESUMED = object()
 
+
+def write_codex_primary_rollout(root: Path, session: str = CODEX_SESSION) -> Path:
+    """A transparent (no spawn, no child) PRIMARY Codex rollout for `session` under `root` (YYYY/MM/DD layout). Candidate fixture addition: the transcript child guard
+    fails closed (unknown) for a Codex parent without a readable history, so Codex-parent fixtures carry a real-shaped, childless primary transcript."""
+    day = root / "2026" / "11" / "04"
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / f"rollout-2026-11-04T10-00-00-{session}.jsonl"
+    path.write_text(json.dumps({"timestamp": "2026-11-04T10:00:00.000Z", "type": "session_meta", "payload": {"id": session, "source": "cli", "cwd": "/synthetic"}}) + "\n")
+    return path
+
 import herdr_codex_reset as hcr  # noqa: E402
 import herdr_helper_context as hctx  # noqa: E402
 
@@ -564,7 +574,12 @@ class V2Case(unittest.TestCase):
         self.product_repo = self.project_root / "product"
         self.product_repo.mkdir()
         self.paths = hs.Paths(config_file=root / "config.json", state_dir=self.state_dir)
+        self.codex_native_root = root / "codex-native"
+        # childless PRIMARY transcripts for the fixture's Codex session and for every fresh Codex session a test can bind (fresh-start flows get their own identity)
+        for session in (CODEX_SESSION, "44444444-4444-4444-8444-444444444444", "66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777"):
+            write_codex_primary_rollout(self.codex_native_root, session)
         self.config = hs.resolve_config_defaults(hs.deep_merge(hs.DEFAULT_CONFIG, {
+            "native_session_roots": {"codex": str(self.codex_native_root)},      # never the machine's real ~/.codex/sessions: every Supervisor built from this config (restarts included) sees the childless fixture transcript
             # A NEW fresh Codex is launched directly through the explicit pane-run recipe, so the fixture's default is that method. The fake adapter models an empty-input contract, so the default input
             # policy stays the strict one; the guarded profile is exercised by test_guarded_pane.
             "session_start": {"codex_launch_method": "explicit-pane-run"},

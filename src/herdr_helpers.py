@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import herdr_pairs as hp
 from herdr_cli import match_exact_session, session_identity
 from herdr_core import READY_STATES, TERMINAL_STATES, HerdrError, SupervisorError, atomic_write_json, load_json, valid_pane_id
 from herdr_redaction import credential_value_present, redact
@@ -146,7 +147,7 @@ class HelperManager:
         agent = exact[0]
         if ready and agent.get('agent_status') not in READY_STATES:
             raise SupervisorError('helper is busy or blocked; wait for settlement')
-        protected = [*self.sup.owners().values(), *load_query_registry(self.sup.paths).values()]
+        protected = [*self.sup.owners().values(), *load_query_registry(self.sup.paths).values(), *({'session_id': session} for session in hp.foreign_sessions(self.sup.paths, helpers=False))]  # saved pairs and EVERY query record are protected; an unreadable or malformed record raises (unknown ownership refuses); the helper registry itself is the caller's own
         if any(b.get('pane_id') == binding['pane_id'] or b.get('session_id') == binding['session_id'] for b in protected):
             raise SupervisorError('workflow/query owners cannot be helper workers')
         if binding['provider'] != 'codex' or not readonly_process(self.sup.herdr.process_info(binding['pane_id']), binding['model'], binding['cwd']):
