@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shutil
 import subprocess
 import threading
 import time
@@ -159,6 +160,59 @@ class WorkerLauncherLayoutTests(unittest.TestCase):
                 self.point(target)
                 self.assert_parity(f"current launcher, pointer {target}", False)
                 self.assertIn("refuses to run", " ".join(hctx.inspect_worker_runtime(self.home)))
+
+    def populate(self, directory: str) -> None:
+        """A synthetic generation (named exactly `directory`, newline characters included) holding the worker modules."""
+        generation = self.library / directory
+        generation.mkdir(parents=True)
+        (generation / "herdr_codex_reset.py").write_text(f"{hctx.WORKER_PROTOCOL_MARKER}\nprint('worker ran')\n")
+        (generation / "herdr_helper_context.py").write_text("# synthetic\n")
+
+    def test_trailing_newlines_in_the_pointer_follow_the_launchers_command_substitution(self) -> None:
+        """`GEN=$(readlink ...)` strips every trailing newline, so the launcher executes the NORMALISED generation, never a literal
+        newline-named directory. Readiness must agree in both directions (the earlier parser approved the literal directory)."""
+        self.install_variant("current")
+        (self.library / "herdr_codex_reset.py").unlink()  # no flat fallback may mask the result
+        normalised = self.GENERATION
+        for newlines in ("\n", "\n\n", "\n\n\n"):
+            literal = normalised + newlines
+            with self.subTest(newlines=len(newlines), modules="only at the literal newline-named directory"):
+                self.cleanup_generations()
+                self.populate(literal)
+                self.point(literal)
+                self.assert_parity(f"{len(newlines)} trailing newline(s), literal directory only", False)
+            with self.subTest(newlines=len(newlines), modules="at the normalised directory"):
+                self.cleanup_generations()
+                self.populate(normalised)
+                self.point(literal)
+                self.assert_parity(f"{len(newlines)} trailing newline(s), normalised directory present", True)
+            with self.subTest(newlines=len(newlines), modules="at both"):
+                self.cleanup_generations()
+                self.populate(normalised)
+                self.populate(literal)
+                self.point(literal)
+                self.assert_parity(f"{len(newlines)} trailing newline(s), both directories present", True)
+
+    def test_a_trailing_newline_does_not_rescue_a_malformed_pointer(self) -> None:
+        self.install_variant("current")
+        for target in ("../elsewhere\n", "/abs/path\n", "generations/a/b\n", "generations/\n", "\n", "other\n\n"):
+            with self.subTest(target=target):
+                (self.library / "active").unlink(missing_ok=True)
+                self.point(target)
+                self.assert_parity(f"current launcher, pointer {target!r}", False)
+
+    def test_an_embedded_newline_is_not_stripped(self) -> None:
+        """Only TRAILING newlines are removed by command substitution; a newline inside the name is part of the directory the launcher runs."""
+        self.install_variant("current")
+        (self.library / "herdr_codex_reset.py").unlink()
+        inner = self.GENERATION + "x\ny"
+        self.populate(inner)
+        self.point(inner)
+        self.assert_parity("an embedded newline in the generation name", True)
+
+    def cleanup_generations(self) -> None:
+        (self.library / "active").unlink(missing_ok=True)
+        shutil.rmtree(self.library / "generations", ignore_errors=True)
 
     def test_a_pointer_to_a_generation_without_the_worker_is_not_ready_for_the_current_launcher(self) -> None:
         self.install_variant("current")

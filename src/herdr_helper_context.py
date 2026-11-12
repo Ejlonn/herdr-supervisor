@@ -738,6 +738,9 @@ def worker_library(home: Path | str | None, launcher_sha256: str | None) -> tupl
         target = os.readlink(pointer)
     except OSError as error:
         return None, f"the active pointer cannot be read ({error.strerror}); the launcher cannot resolve a program generation"
+    # The launcher reads the pointer with `GEN=$(readlink ...)`, and command substitution strips every trailing newline; the library it
+    # then executes is the stripped name, so readiness must resolve exactly that (never the literal, newline-named directory).
+    target = target.rstrip("\n")
     problem = pointer_problem(target)
     return (None, problem) if problem else (base / target, None)
 
