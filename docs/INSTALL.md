@@ -65,7 +65,7 @@ A flat installation from the earlier installer is adopted only explicitly and on
 herdr-setup update --payload NEW_TREE --adopt-legacy-from OLD_TREE   # preview shows every difference that blocks adoption
 ```
 
-Version text is never proof. An unknown extra, missing or changed program file blocks adoption and every other change, and its code is never read or imported; a deployment that has modules the reviewed tree does not have (for example private additions) is not replaced. Adoption backs up the flat files and launchers first and `herdr-setup rollback` restores them exactly.
+Version text is never proof. An unknown extra, missing or changed program file blocks adoption and every other change, and its code is never read or imported; a deployment that has modules the reviewed tree does not have (for example private additions) is not replaced. Adoption backs up the flat files and launchers first and `herdr-setup rollback` restores them exactly. The earlier public release predates the dependency lock, `herdr-setup`, `herdr-native-identity` and `herdr-quota-dependency`, so the OLD_TREE is not required to carry them (it is still checked file by file against the installed bytes); the NEW_TREE must carry the lock and the manager, and a restored legacy release is smoke-checked only on the launchers it shipped.
 
 ### Metadata is untrusted
 

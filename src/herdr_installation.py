@@ -530,9 +530,11 @@ def load_payload(root: Path, *, require_manager: bool = True) -> Payload:
     for required in REQUIRED_PROGRAM:
         if f"program/{required}" not in present:
             raise InstallError(f"payload has no src/{required}")
-    if QUOTA_LOCK and f"program/{QUOTA_LOCK}" not in present:
-        raise InstallError(f"payload has no config/{QUOTA_LOCK}")
     if require_manager:
+        # A current managed candidate must carry the dependency lock. A reviewed pre-manager tree (inspected only to adopt an earlier flat
+        # installation) predates it and legitimately has none; its identity is still verified byte for byte against the installed files.
+        if f"program/{QUOTA_LOCK}" not in present:
+            raise InstallError(f"payload has no config/{QUOTA_LOCK}")
         for required in MANAGER_MODULES:
             if f"program/{required}" not in present:
                 raise InstallError(f"payload has no src/{required}; it cannot manage installations")

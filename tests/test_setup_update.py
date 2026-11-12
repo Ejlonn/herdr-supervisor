@@ -377,6 +377,89 @@ class LegacyAdoptionTests(SetupCase):
         self.assertNotEqual(report["overall"], "READY")
 
 
+class RealLegacyLayoutTests(LegacyAdoptionTests):
+    """The earlier PUBLIC release (2279f37) as it really was: 28 flat modules (none of the pair/child-guard/manager/quota-dependency ones), five
+    launchers (no herdr-setup, herdr-native-identity or herdr-quota-dependency), and NO `config/quota-dependency.json`. The inherited
+    fixture copies the new payload and so kept the lock and a launcher the old release never shipped, which hid both. Every inherited
+    adoption/refusal test is re-run on the authentic layout, plus the cases below."""
+
+    NEW_MODULES = ("herdr_codex_children.py", "herdr_pairs.py", "herdr_quota_dependency.py")
+    OLD_LAUNCHERS = ("herdr-backup", "herdr-codex-reset-worker", "herdr-query-worker", "herdr-supervisor", "herdr-telegram")
+    STUB = "import sys\nsys.exit(0 if '--help' in sys.argv else 2)\n"
+
+    def make_legacy_tree(self, name: str = "legacy-source") -> Path:
+        tree = copy_payload(self.tmp / name)
+        for module in (*hi.MANAGER_MODULES, *self.NEW_MODULES):
+            (tree / "src" / module).unlink()
+        for launcher in sorted(path.name for path in (tree / "bin").iterdir()):
+            (tree / "bin" / launcher).unlink()
+        for launcher in self.OLD_LAUNCHERS:
+            module = {"herdr-codex-reset-worker": "herdr_codex_reset.py", "herdr-query-worker": "herdr_query.py", "herdr-backup": "herdr_backup.py"}.get(launcher, launcher.replace("-", "_") + ".py")
+            (tree / "bin" / launcher).write_text(OLD_LAUNCHER.format(module=module))
+            (tree / "src" / module).write_text(self.STUB)  # the old modules' own code is not under test; each launcher must still start
+        (tree / "config" / hi.QUOTA_LOCK).unlink()
+        (tree / "docs" / "QUOTA_DEPENDENCY.md").unlink(missing_ok=True)
+        (tree / "docs" / "RELEASE_NOTES.md").unlink(missing_ok=True)
+        return tree
+
+    def install_legacy(self, tree: Path) -> hi.Payload:
+        payload = super().install_legacy(tree)
+        for path in self.layout.lib.iterdir():
+            path.chmod(0o644)  # the old installer used `install -m 0644`; the fixture's plain write would follow the test runner's umask
+        return payload
+
+    def test_the_fixture_is_the_authentic_old_inventory(self) -> None:
+        names = {item.key for item in self.legacy.files}
+        self.assertNotIn(f"program/{hi.QUOTA_LOCK}", names)
+        self.assertEqual(sorted(item.name for item in self.legacy.of_role("launcher")), sorted(self.OLD_LAUNCHERS))
+        self.assertFalse(any(name in names for name in (f"program/{m}" for m in (*hi.MANAGER_MODULES, *self.NEW_MODULES))))
+
+    def test_a_pre_manager_source_without_the_lock_is_inspectable_but_a_managed_candidate_must_carry_it(self) -> None:
+        self.assertEqual(hi.load_payload(self.legacy_tree, require_manager=False).version, self.legacy.version)
+        with self.assertRaises(hi.InstallError):
+            hi.load_payload(self.legacy_tree)  # the strict default still demands the manager and the lock
+        candidate = copy_payload(self.tmp / "lockless-candidate")
+        (candidate / "config" / hi.QUOTA_LOCK).unlink()
+        with self.assertRaisesRegex(hi.InstallError, "no config/quota-dependency.json"):
+            hi.load_payload(candidate)
+        with self.assertRaisesRegex(hi.InstallError, "no config/quota-dependency.json"):
+            hi.load_payload(candidate, require_manager=True)
+        before = snapshot(self.home)
+        code, out, err = self.adopt(payload=candidate)
+        self.assertEqual(code, hi.EXIT_REFUSED, out + err)
+        self.assertEqual(snapshot(self.home), before, "a candidate without the lock is refused with nothing written, even for a valid legacy source")
+
+    def test_adoption_then_rollback_restores_every_legacy_asset_exactly(self) -> None:
+        def inventory() -> dict[str, tuple]:
+            result: dict[str, tuple] = {}
+            for label, root in (("lib", self.layout.lib), ("bin", self.layout.bin), ("unit", self.layout.unit), ("doc", self.layout.doc)):
+                result.update({f"{label}/{key}": value for key, value in snapshot(root).items() if not key.startswith(("generations", "active"))})
+            return result
+
+        before = inventory()
+        self.assertTrue(before and {"lib/herdr_supervisor.py", "bin/herdr-supervisor"} <= set(before))
+        code, out, err = self.adopt()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+        self.assertTrue((self.layout.bin / "herdr-quota-dependency").exists() and (self.layout.bin / "herdr-setup").exists())
+        rolled = self.run_tool("rollback", "--apply", "--approve-current")
+        self.assertEqual(rolled[0], 0, rolled[1] + rolled[2])
+        self.assertIn("Result: COMPLETE", rolled[1])
+        self.assertEqual(inventory(), before, "flat modules, launchers, units and documents are byte, mode and link identical to the old install")
+        for name in ("herdr-setup", "herdr-quota-dependency", "herdr-native-identity"):
+            self.assertFalse((self.layout.bin / name).exists(), f"{name} did not exist in the old release")
+        self.assertEqual(hi.inspect_install(self.layout).layout, "legacy")
+
+    def test_the_smoke_check_of_a_restored_legacy_release_names_only_what_it_shipped(self) -> None:
+        self.assertEqual(hu.LEGACY_SMOKE_LAUNCHERS, ("herdr-supervisor", "herdr-telegram"))
+        self.assertTrue(set(hu.LEGACY_SMOKE_LAUNCHERS) <= set(self.OLD_LAUNCHERS))
+        self.assertTrue(set(hu.LEGACY_SMOKE_LAUNCHERS) <= set(hu.SMOKE_LAUNCHERS))
+        ctx = hu.Ctx(env=self.env, kind="rollback", plan={"candidate": {"kind": "legacy"}}, payload=None, operation_id="x", approval_hash="y")
+        self.assertEqual(hu.smoke_check(ctx), [])
+        (self.layout.bin / "herdr-telegram").unlink()
+        self.assertEqual(hu.smoke_check(ctx), ["launcher herdr-telegram is missing"], "a launcher the old release DID ship is still required")
+
+
 class RollbackTests(UpdateCase):
     def test_rollback_restores_the_previous_release_assets_and_services(self) -> None:
         self.host.active.update({"herdr-telegram.service": "active"})

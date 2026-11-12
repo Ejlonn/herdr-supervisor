@@ -76,6 +76,7 @@ PLAN_SCHEMA = 1
 KINDS = ("setup", "update", "rollback")
 SERVER_UNIT = "herdr-server.service"
 SMOKE_LAUNCHERS = ("herdr-supervisor", "herdr-telegram", "herdr-quota-dependency", "herdr-setup")
+LEGACY_SMOKE_LAUNCHERS = ("herdr-supervisor", "herdr-telegram")  # the launchers the pre-manager release shipped and that read the flat library
 _STATE_DIRS = ("query", "outbox", "codex-reset", "codex-reset/pending", "codex-reset/processing", "codex-reset/results", "pending-starts")
 _INITIAL_CONFIG = (("sup_config", "supervisor.example.json"), ("backup_config", "backup.example.json"), ("tg_config", "telegram.example.json"))
 
@@ -660,11 +661,10 @@ def smoke_check(ctx: Ctx) -> list[str]:
     if expected is not None and active != expected:
         problems.append(f"the active generation is {active}, expected {expected}")
     env = {**os.environ, "HOME": str(ctx.layout.home), "HERDR_SUPERVISOR_LIB": str(ctx.layout.lib)}
-    for name in SMOKE_LAUNCHERS:
+    legacy = ctx.plan["candidate"].get("kind") == "legacy"
+    for name in (LEGACY_SMOKE_LAUNCHERS if legacy else SMOKE_LAUNCHERS):  # a restored legacy release is judged by what it actually shipped
         launcher = ctx.layout.bin / name
         if not launcher.exists():
-            if name == "herdr-setup" and ctx.plan["candidate"].get("kind") == "legacy":
-                continue  # the legacy release never shipped this launcher
             problems.append(f"launcher {name} is missing")
             continue
         result = ctx.env.host.run([str(launcher), "--help"], timeout=60, env=env)
