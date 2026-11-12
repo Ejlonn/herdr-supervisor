@@ -4,6 +4,7 @@ refusal is asserted against a whole-tree snapshot and the recorded external comm
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -13,7 +14,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+from unittest import mock
 
 import herdr_core as core
 import herdr_installation as hi
@@ -303,9 +305,10 @@ class LegacyAdoptionTests(SetupCase):
         self.assertFalse(self.layout.active.exists() or self.layout.active.is_symlink(), "the pointer is removed so the restored launchers use the flat layout again")
         self.assertEqual((self.layout.bin / "herdr-supervisor").read_bytes(), old_launcher)
         self.assertFalse((self.layout.bin / "herdr-setup").exists(), "an asset the legacy release never had is removed again")
-        done = subprocess.run([str(self.layout.bin / "herdr-supervisor"), "--help"], env={**os.environ, "HOME": str(self.home)}, capture_output=True, text=True, timeout=60)
-        self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(hi.inspect_install(self.layout).layout, "legacy")
+        # This test's own check runs the restored launcher after the status is read, quietly: it must not be what writes bytecode.
+        done = subprocess.run([str(self.layout.bin / "herdr-supervisor"), "--help"], env={**os.environ, "HOME": str(self.home), "PYTHONDONTWRITEBYTECODE": "1"}, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_adoption_needs_the_explicit_flag_and_never_version_text(self) -> None:
         before = snapshot(self.home)
@@ -385,7 +388,8 @@ class RealLegacyLayoutTests(LegacyAdoptionTests):
 
     NEW_MODULES = ("herdr_codex_children.py", "herdr_pairs.py", "herdr_quota_dependency.py")
     OLD_LAUNCHERS = ("herdr-backup", "herdr-codex-reset-worker", "herdr-query-worker", "herdr-supervisor", "herdr-telegram")
-    STUB = "import sys\nsys.exit(0 if '--help' in sys.argv else 2)\n"
+    # Each old module imports a sibling flat module, as the real ones do: running it writes bytecode beside the modules unless told not to.
+    STUB = "import sys\nimport herdr_redaction\nsys.exit(0 if '--help' in sys.argv else 2)\n"
 
     def make_legacy_tree(self, name: str = "legacy-source") -> Path:
         tree = copy_payload(self.tmp / name)
@@ -397,6 +401,7 @@ class RealLegacyLayoutTests(LegacyAdoptionTests):
             module = {"herdr-codex-reset-worker": "herdr_codex_reset.py", "herdr-query-worker": "herdr_query.py", "herdr-backup": "herdr_backup.py"}.get(launcher, launcher.replace("-", "_") + ".py")
             (tree / "bin" / launcher).write_text(OLD_LAUNCHER.format(module=module))
             (tree / "src" / module).write_text(self.STUB)  # the old modules' own code is not under test; each launcher must still start
+        (tree / "src" / "herdr_redaction.py").write_text("VALUE = 1\n")
         (tree / "config" / hi.QUOTA_LOCK).unlink()
         (tree / "docs" / "QUOTA_DEPENDENCY.md").unlink(missing_ok=True)
         (tree / "docs" / "RELEASE_NOTES.md").unlink(missing_ok=True)
@@ -438,17 +443,68 @@ class RealLegacyLayoutTests(LegacyAdoptionTests):
 
         before = inventory()
         self.assertTrue(before and {"lib/herdr_supervisor.py", "bin/herdr-supervisor"} <= set(before))
-        code, out, err = self.adopt()
-        self.assertEqual(code, 0, out + err)
-        self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
-        self.assertTrue((self.layout.bin / "herdr-quota-dependency").exists() and (self.layout.bin / "herdr-setup").exists())
-        rolled = self.run_tool("rollback", "--apply", "--approve-current")
+        with self.ordinary_python_environment():
+            code, out, err = self.adopt()
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(hi.inspect_install(self.layout).layout, "managed")
+            self.assertTrue((self.layout.bin / "herdr-quota-dependency").exists() and (self.layout.bin / "herdr-setup").exists())
+            rolled = self.run_tool("rollback", "--apply", "--approve-current")
         self.assertEqual(rolled[0], 0, rolled[1] + rolled[2])
         self.assertIn("Result: COMPLETE", rolled[1])
         self.assertEqual(inventory(), before, "flat modules, launchers, units and documents are byte, mode and link identical to the old install")
         for name in ("herdr-setup", "herdr-quota-dependency", "herdr-native-identity"):
             self.assertFalse((self.layout.bin / name).exists(), f"{name} did not exist in the old release")
         self.assertEqual(hi.inspect_install(self.layout).layout, "legacy")
+
+    @staticmethod
+    @contextlib.contextmanager
+    def ordinary_python_environment() -> Iterator[None]:
+        """The operator's normal shell: Python may write bytecode (the test runner itself often disables it, which hid LEGACY-1-R1)."""
+        with mock.patch.dict(os.environ):
+            for variable in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"):
+                os.environ.pop(variable, None)
+            yield
+
+    def test_help_probes_leave_a_restored_legacy_installation_recognisable_and_adoptable_again(self) -> None:
+        def flat() -> dict[str, tuple]:
+            return {key: value for key, value in snapshot(self.layout.lib).items() if not key.startswith(("generations", "active"))}
+
+        before = flat()
+        # An identical approved plan is idempotent (ALREADY_APPLIED), so the second adoption names a newer candidate: a genuinely new plan.
+        candidates = {1: self.payload, 2: self.candidate("next-release", "0.4.0")}
+        for round_number in (1, 2):  # adoption after a rollback must work again
+            with self.ordinary_python_environment():
+                self.assertNotIn("PYTHONDONTWRITEBYTECODE", os.environ)
+                code, out, err = self.adopt(payload=candidates[round_number])
+                self.assertEqual(code, 0, f"adoption {round_number}: {out}{err}")
+                rolled = self.run_tool("rollback", "--apply", "--approve-current")
+            self.assertEqual(rolled[0], 0, rolled[1] + rolled[2])
+            self.assertFalse(list(self.layout.lib.rglob("__pycache__")), "an internal probe created bytecode in the restored library")
+            self.assertEqual(flat(), before, "the restored flat library is exactly the old one")
+            state = hi.inspect_install(self.layout)
+            self.assertEqual((state.layout, state.problems), ("legacy", []), "the restored installation is still recognised")
+
+    def test_the_probe_environment_is_forced_quiet_and_the_callers_environment_is_otherwise_kept(self) -> None:
+        ctx = hu.Ctx(env=self.env, kind="rollback", plan={"candidate": {"kind": "legacy"}}, payload=None, operation_id="x", approval_hash="y")
+        seen: list[dict[str, str]] = []
+        real_run = self.env.host.run
+
+        def recording(argv, **kwargs):
+            seen.append(dict(kwargs.get("env") or {}))
+            return real_run(argv, **kwargs)
+
+        with mock.patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "", "CALLER_MARKER": "kept", "PATH": os.environ.get("PATH", "")}), mock.patch.object(self.env.host, "run", side_effect=recording):
+            self.assertEqual(hu.smoke_check(ctx), [])
+        self.assertTrue(seen and all(item["PYTHONDONTWRITEBYTECODE"] == "1" and item["CALLER_MARKER"] == "kept" and item["HOME"] == str(self.home) for item in seen), seen)
+        self.assertFalse(list(self.layout.lib.rglob("__pycache__")))
+
+    def test_a_bytecode_directory_in_a_legacy_library_still_blocks_adoption_and_is_never_ignored(self) -> None:
+        (self.layout.lib / "__pycache__").mkdir()
+        before = snapshot(self.home)
+        code, out, err = self.adopt()
+        self.assertEqual(code, hi.EXIT_REFUSED, out + err)
+        self.assertEqual(snapshot(self.home), before)
+        self.assertEqual(hi.inspect_install(self.layout).layout, "unknown")
 
     def test_the_smoke_check_of_a_restored_legacy_release_names_only_what_it_shipped(self) -> None:
         self.assertEqual(hu.LEGACY_SMOKE_LAUNCHERS, ("herdr-supervisor", "herdr-telegram"))

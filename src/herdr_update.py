@@ -660,7 +660,10 @@ def smoke_check(ctx: Ctx) -> list[str]:
         return [str(error)]
     if expected is not None and active != expected:
         problems.append(f"the active generation is {active}, expected {expected}")
-    env = {**os.environ, "HOME": str(ctx.layout.home), "HERDR_SUPERVISOR_LIB": str(ctx.layout.lib)}
+    # The probes must leave the installation byte-for-byte as it is: a restored flat (legacy) library is writable, so an ordinary `python3`
+    # launcher would create `__pycache__` beside the modules and the installation would no longer be recognised (`scan_legacy` refuses every
+    # unexpected directory, as it must). The caller's environment is otherwise passed through unchanged.
+    env = {**os.environ, "HOME": str(ctx.layout.home), "HERDR_SUPERVISOR_LIB": str(ctx.layout.lib), "PYTHONDONTWRITEBYTECODE": "1"}
     legacy = ctx.plan["candidate"].get("kind") == "legacy"
     for name in (LEGACY_SMOKE_LAUNCHERS if legacy else SMOKE_LAUNCHERS):  # a restored legacy release is judged by what it actually shipped
         launcher = ctx.layout.bin / name
