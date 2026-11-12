@@ -979,6 +979,13 @@ class Supervisor(SupervisorV2Mixin):
         except (SupervisorError, KeyError, OSError):
             return None
 
+    @staticmethod
+    def _stalled_delivery(delivery: Any) -> bool:
+        """A registered ambiguous submission, never a known rejection or arbitrary policy failure."""
+        return (isinstance(delivery, dict) and not isinstance(delivery.get("accepted_at"), str) and delivery.get("error_code") in ("timeout", "agent_prompt_stalled")
+                and (delivery.get("status") == "uncertain" or
+                     (delivery.get("status") == "completed" and delivery.get("outcome") == "rejected_by_policy" and not delivery.get("accepted_at"))))
+
     def collect_routing_result(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], *, purpose: str) -> tuple[ProtocolBlock | None, str, Any]:
         """Terminal first (the supported path, unchanged). Only when it holds no valid current frame for an accepted V2 turn is the exact
         primary session's native transcript consulted, read-only and bounded. Returns (block-from-terminal, terminal output, NativeResult|None).
@@ -995,12 +1002,12 @@ class Supervisor(SupervisorV2Mixin):
             pane_frame_allowed = not (verdict is not None and verdict.spawned)      # after a spawn only the verified primary native frame can route
             snapshot_native = verdict.native if verdict is not None else None
         block = parse_protocol(output, state["run_id"], delivery["turn_id"]) if pane_frame_allowed else None
-        if block is not None:
+        if block is not None and purpose != "retry_stalled":
             return block, output, None
         # Accepted = the prompt was confirmed delivered at some point (`accepted_at` survives the later `completed/rejected_by_policy` marking
-        # of a missing-result wait, which is exactly when the explicit retry runs). An uncertain delivery that was never confirmed stays closed.
+        # of a missing-result wait, which is exactly when the explicit retry runs). An ambiguous timeout/stall may be reconciled only by its exact primary native final after fresh settlement checks.
         accepted = delivery.get("status") == "accepted" or isinstance(delivery.get("accepted_at"), str)
-        if state.get("workflow_policy") not in V2_WORKFLOW_POLICIES or not accepted or delivery.get("agent") != provider:
+        if state.get("workflow_policy") not in V2_WORKFLOW_POLICIES or not (accepted or self._stalled_delivery(delivery)) or delivery.get("agent") != provider:
             return None, output, None
         try:
             session_id = self.owners()[provider]["session_id"]
@@ -1110,6 +1117,17 @@ class Supervisor(SupervisorV2Mixin):
                 if earlier.get("frame_sha256") != native.provenance.get("frame_sha256"):
                     raise SupervisorError("a different native routing frame was already recovered for this turn; refusing to route a second one")
                 return None  # already recovered and routed once: duplicate callback/restart creates nothing
+        if self._stalled_delivery(delivery):
+            if not native.recoverable or native.block is None or native.block.run_id != state["run_id"] or native.block.turn_id != delivery["turn_id"]:
+                raise SupervisorError("stalled delivery requires an exact primary native final before acceptance")
+            # The provider's own exact prompt->primary-final attribution, plus the caller's fresh settlement
+            # recheck, reconciles the ambiguous acknowledgement. A missing/partial/conflicting result never does.
+            delivery["accepted_at"] = iso_utc(self.clock())
+            delivery["accepted_via"] = "native_primary_final"
+            if "outcome" in delivery:
+                delivery["previous_outcome"] = delivery.pop("outcome")
+            delivery["status"] = "accepted"
+            self._log(state, "prompt_accepted_by_native_final", agent=provider, turn_id=delivery["turn_id"])
         recoveries.append({"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"], "agent": provider, "purpose": purpose,
                            "at": iso_utc(self.clock()), **{k: v for k, v in native.provenance.items() if k in ("provider", "dev", "ino", "offset_start", "offset_end", "record_offset", "record_id", "message_sha256", "frame_sha256", "cursor_used", "eligible_finals")}})
         del recoveries[:-20]
@@ -1138,7 +1156,22 @@ class Supervisor(SupervisorV2Mixin):
             session = self.owners()[provider]["session_id"]
         except (SupervisorError, HerdrError, KeyError) as error:
             return SettleResult("identity", str(error), error), None
-        verdict = cc.verify(session, self._native_roots().get("codex"), clock=self.clock, route=route, native_always=native_always)
+        for attempt in range(3):
+            verdict = cc.verify(session, self._native_roots().get("codex"), clock=self.clock, route=route, native_always=native_always)
+            transient = verdict.kind == cc.UNKNOWN and verdict.detail.startswith((
+                "the bounded native work exceeded ", "the native transcript grew from ",
+                "an evidence file changed after it was read (extent drift)",
+                "the rollout namespace changed while the decision was made (relationship-set drift)"))
+            if not transient or attempt == 2:
+                break
+            self.sleeper(1.0)
+            try:
+                _target, current = self._guard_agent(provider)
+            except (SupervisorError, HerdrError) as error:
+                return SettleResult("identity", str(error), error), None
+            if current.get("agent_status") not in READY_STATES:
+                return SettleResult("hold", "lifecycle changed during bounded native consistency retry"), None
+
         return SettleResult(_CODEX_GUARD_KINDS[verdict.kind], f"codex child guard {verdict.kind}: {verdict.detail}"[:400]), verdict
 
     def _codex_settle(self, state: dict[str, Any], provider: str, purpose: str, *, wait: bool, patience: float | None, control: bool) -> SettleResult:
@@ -1705,10 +1738,22 @@ class Supervisor(SupervisorV2Mixin):
                 delivery.get("status") == "uncertain" and isinstance(delivery.get("accepted_at"), str)
             )
             if strict and not accepted:
+                if self._stalled_delivery(delivery):
+                    since = delivery.get("settlement_pending_since")
+                    if not isinstance(since, (int, float)):
+                        since = self.clock()
+                        delivery["settlement_pending_since"] = since
+                        self._log(state, "stalled_delivery_settlement_wait", agent=provider, turn_id=delivery["turn_id"])
+                        self.store.write_state(state)
+                    if self.clock() - since < 60.0:
+                        self.sleeper(min(2.5, 60.0 - (self.clock() - since)))
+                        continue  # one bounded observation episode; never resubmit or infer quota from an unaccepted delivery
+                    state["missing_result"] = {"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"],
+                                               "agent": provider, "attempts": 0, "created_at_unix": self.clock()}
                 return self.set_wait_user(
                     state,
                     f"{name} settled ({status}) without a protocol block, but delivery was never confirmed accepted; "
-                    "quota cannot explain uncertain delivery and nothing was resent.",
+                    "quota cannot explain uncertain delivery and nothing was resent. Use the bound routing-result retry after the turn settles.",
                     requires_action=True,
                 )
             self.refresh_quota(state, provider)

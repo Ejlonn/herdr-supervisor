@@ -128,9 +128,10 @@ class LargePairStart(NamedPairChildGuardTests):
         self.herdr.responses = [response]
         self.sup.resume()
         self.assertEqual(len(self.herdr.prompts), 1)
-        self.assertIsNone(self.state()["pending_gate"])
-        self.assertIn("delivery was never confirmed accepted", self.state()["wait_user_reason"])
-        self.assertEqual(self.state()["delivery"]["outcome"], "rejected_by_policy")
+        self.assertEqual(self.state()["pending_gate"]["gate_type"], "plan_approval")
+        self.assertEqual(self.state()["pending_gate"]["status"], "pending")
+        self.assertIsNone(self.state().get("approved_plan"), "native proof creates the gate, never approves it")
+        self.assertEqual(self.state()["delivery"]["accepted_via"], "native_primary_final")
         self.assertEqual(len(self.herdr.prompts), 1)
         self.assertEqual(self.herdr.sent_keys, [])
         self.assertEqual(self.state()["session_pair"], self.bound)

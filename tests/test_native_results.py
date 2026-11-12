@@ -518,13 +518,14 @@ class ClaudeControllerTests(NativeFlow):
         self.assertIn("Native transcript recovery: unavailable", state["wait_user_reason"])
         self.assert_nothing_sent_beyond_the_turn()
 
-    def test_uncertain_delivery_is_never_resolved_from_a_native_result(self) -> None:
+    def test_uncertain_ack_is_reconciled_only_by_the_exact_primary_native_final(self) -> None:
         reply = {"output": "no frame", "error": "agent_prompt_stalled", "before": self.native_writer(path=self.claude_path)}
         self.claude_flow(reply)
         state = self.state()
         self.assertEqual(state["supervisor_state"], "WAIT_USER")
-        self.assertEqual(self.events_named("native_result_lookup"), [])
-        self.assertNotEqual(self.pending().get("gate_type"), "generic_question")
+        self.assertEqual(self.events_named("native_result_lookup")[-1]["status"], nr.FOUND)
+        self.assertEqual(self.pending().get("gate_type"), "generic_question")
+        self.assertEqual(state["delivery"]["accepted_via"], "native_primary_final")
         self.assert_nothing_sent_beyond_the_turn()
 
     def test_explicit_retry_uses_the_same_resolver_once_and_sends_nothing(self) -> None:

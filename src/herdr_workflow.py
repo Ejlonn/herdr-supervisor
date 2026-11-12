@@ -854,6 +854,9 @@ class SupervisorV2Mixin:
             raise SupervisorError("retry must be bound to the current run")
         if self.followup_unresolved(state) is not None:
             raise SupervisorError("a follow-up question is unresolved; return to the decision before retrying the routing result")
+        stalled = isinstance(delivery, dict) and getattr(self, "_stalled_delivery", lambda value: False)(delivery)
+        if stalled and isinstance(delivery, dict) and not isinstance(missing, dict):
+            missing = {"schema_version": 1, "run_id": state["run_id"], "agent": delivery.get("agent"), "turn_id": delivery.get("turn_id"), "attempts": 0, "created_at_unix": self.clock()}
         if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action") or not isinstance(missing, dict):
             raise SupervisorError("no unread routing result is pending for this run")
         if not isinstance(turn_id, str) or turn_id != missing.get("turn_id") or not isinstance(delivery, dict) or delivery.get("turn_id") != turn_id:
@@ -876,7 +879,7 @@ class SupervisorV2Mixin:
         if guard.kind != "clear":
             raise SupervisorError(f"{name} may still have background children or its idle state cannot be confirmed ({guard.kind}: {guard.detail}); nothing was read, routed or resent. Try again once the pane is quiet.")
         try:
-            block, _output, native = self.collect_routing_result(state, provider, delivery, purpose="retry")
+            block, _output, native = self.collect_routing_result(state, provider, delivery, purpose="retry_stalled" if stalled else "retry")
         except HerdrError as error:
             raise SupervisorError(f"cannot read {name} output: {error}") from error
         source = "terminal"
@@ -892,6 +895,7 @@ class SupervisorV2Mixin:
             jobs = self._claude_pending_work(state, provider, delivery)
             if jobs.kind in ("pending", "awaiting_final", "retry"):
                 raise SupervisorError(f"the accepted turn still has unresolved native work ({jobs.kind}: {jobs.detail}); the one-time result retry was not consumed and nothing was resent")
+        state["missing_result"] = missing
         missing["attempts"] = int(missing["attempts"]) + 1
         missing["last_attempt_unix"] = self.clock()
         if native is not None:
