@@ -83,7 +83,7 @@ Exit codes: `0` verified (or nothing to do); `3` something is missing (source, t
 
 ### Automated by `herdr-setup` (optional)
 
-`herdr-setup setup --profile full` can run this sequence for you after a preview and an approval: `bootstrap --apply` into a new stage directory, then `herdr plugin link --disabled DIR`, then `herdr plugin enable herdr-agent-quota`, then `check`. It checks the real inventory first (a matching plugin is preserved and only enabled when disabled; a conflict stops the run), reconciles any interrupted link/enable with a read-only inventory read instead of repeating it, and never runs `configure`. The `link --disabled` and `enable <PLUGIN_ID>` contracts are recorded as help fixtures for Herdr 0.9.5; the whole sequence remains **NOT VALIDATED** against a live Herdr until it is run in a disposable environment.
+`herdr-setup setup --profile full` can run this sequence for you after a preview and an approval: `bootstrap --apply` into a new stage directory, then `herdr plugin link --disabled DIR`, then `herdr plugin enable herdr-agent-usage`, then `check`. It checks the real inventory first (a matching plugin is preserved and only enabled when disabled; a conflict stops the run), reconciles any interrupted link/enable with a read-only inventory read instead of repeating it, and never runs `configure`. The `link --disabled` and `enable <PLUGIN_ID>` contracts are recorded as help fixtures for Herdr 0.9.5; the whole sequence remains **NOT VALIDATED** against a live Herdr until it is run in a disposable environment.
 
 ### What you do afterwards (explicit operator steps)
 
