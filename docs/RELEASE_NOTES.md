@@ -1,6 +1,6 @@
 # Herdr Supervisor 0.4.0-beta.1 — release notes
 
-Beta status does not relax authorization, redaction, callback replay, prompt-delivery, state-integrity or approval-hash guarantees. These notes describe what the release source contains relative to the initial `0.3.0-beta.1` source release. Validation status is stated at the end; items marked **pending** have not been run and must not be read as passed.
+Beta status does not relax authorization, redaction, callback replay, prompt-delivery, state-integrity or approval-hash guarantees. These notes describe what the release source contains relative to the initial `0.3.0-beta.1` source release. Validation status and the beta limits are stated at the end; items marked **pending** or listed as limits have not been validated and must not be read as passed.
 
 ## Installation and updates
 
@@ -41,9 +41,28 @@ Beta status does not relax authorization, redaction, callback replay, prompt-del
 
 ## Validation status
 
-Offline source validation (synthetic fixtures only, no provider, network or live-service calls): full test discovery, ruff, mypy, compile and shell syntax, source and wheel packaging with all entry points, a real `systemd-analyze --user verify` of the shipped units, offline verification of the plugin recovery artifacts against the lock, and a content scan. Counts and logs: the release handoff.
+This is a beta with limited, component-level runtime validation. It is not a full-runtime pass, and it is not published.
 
-**Pending** (not run for this release; each needs its own authorization): CI on the supported Python 3.11 and 3.13 matrix; building, linking, enabling and running the pinned plugin and real quota snapshots; real Telegram, provider sessions and native hooks; fresh installation, update, worker lifecycle, rollback, legacy adoption and recovery on a disposable user; user-systemd activation, linger and reboot persistence; fresh remote comparison, final artifacts and checksums, tag and publication. Earlier core-installer runtime results are partial component evidence, not evidence for this combined candidate.
+Offline source validation (synthetic fixtures only, no provider, network or live-service calls): full test discovery with branch coverage on the supported Python 3.11 and 3.13, ruff, mypy, compile and shell syntax, source and wheel packaging with all entry points, a real `systemd-analyze --user verify` of the shipped units, offline verification of the plugin recovery artifacts against the lock, and a content scan. Counts and logs: the release handoff.
+
+Isolated component checks, run separately on a disposable user and a dedicated test bot:
+
+- The pinned quota plugin was built with the pinned toolchain, and its real collector produced a fresh two-window Codex quota snapshot.
+- Fresh minimal and selected installations, worker lifecycle, a synthetic managed update with three rollbacks and the refusal checks, adoption and exact rollback of a genuine public pre-manager release, and recovery of the same saved plan after an actual process exit during an update.
+- The Telegram bridge answered one owner command through its production handler and reply.
+- A Claude session was observed with exact native identity, the hook, one completed turn without tools, and a real statusLine observation with two matching session windows.
+- A genuine captured statusLine observation was converted into a session snapshot by the pinned collector as a local replay. It is aged data, not a freshly measured live quota.
+
+These results were gathered on a predecessor revision whose program, configuration, launcher and service-unit files are byte-identical to the release commit. The later changes are documentation only, and no result is relabelled. Several earlier combined validation packets ended incomplete or failed. They remain recorded as such, and the passing component results above are not presented as a pass of those packets.
+
+**Beta limits** (not validated):
+
+- One isolated Codex native startup and hook check is not complete. Its prompt delivery is unknown, and it was not replayed or replaced.
+- A fresh end-to-end live Claude snapshot was not retested after the native observation.
+- The deployed Telegram service sandbox, the reboot and boot delivery chain (including linger), and whole-machine or active-service crash persistence were not validated. Reboot testing was deliberately deferred. Ordinary process-exit recovery was tested.
+- Setup and integration are not claimed to work on every host configuration.
+
+**Pending**: CI on the supported Python 3.11 and 3.13 matrix; fresh remote comparison; final artifacts and checksums; tag and publication. Each needs its own authorization.
 
 ## Known limitations
 
