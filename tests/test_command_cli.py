@@ -19,6 +19,7 @@ class CliCase(V2Case):
         self.paths.config_file.write_text(json.dumps({
             "schema_version": 1, "herdr_bin": os.sys.executable, "project_root": str(self.project_root), "review_root": str(self.review_root),
             "product_repo": str(self.product_repo), "quota_dir": str(self.quota_dir), "quota_safety_buffer_seconds": 60,
+            "native_session_roots": {"codex": str(self.codex_native_root)},      # the fixture's childless Codex transcript (the transcript child guard needs a readable history)
         }))
         self._env = {k: os.environ.get(k) for k in ("HERDR_SUPERVISOR_CONFIG", "HERDR_SUPERVISOR_STATE_DIR")}
         os.environ["HERDR_SUPERVISOR_CONFIG"] = str(self.paths.config_file)
@@ -234,10 +235,10 @@ class DeferHandoffAndRoleCliTests(CliCase):
         rr.read_provider_version = lambda command, runner: "2.1.306 (Claude Code)"
         self.addCleanup(lambda: setattr(rr, "read_provider_version", original))
         prompts = len(self.herdr.prompts)
-        code, out, err = self.run_cli("role-observe", "--kind", "agent_tool_catalog", "--role", "prospera-tracer", "--role", "prospera-test-runner")
+        code, out, err = self.run_cli("role-observe", "--kind", "agent_tool_catalog", "--role", "repository-tracer", "--role", "repository-test-runner")
         self.assertEqual(code, 0, err)
         record = json.loads(out)["recorded"]
-        self.assertEqual((record["authority"], record["provider_version"], record["roles"]), ("operator_evidence_only", "2.1.306 (Claude Code)", ["prospera-test-runner", "prospera-tracer"]))
+        self.assertEqual((record["authority"], record["provider_version"], record["roles"]), ("operator_evidence_only", "2.1.306 (Claude Code)", ["repository-test-runner", "repository-tracer"]))
         self.assertTrue(record["actor"].startswith("cli:"))
         self.assertEqual(len(self.herdr.prompts), prompts)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):  # an unsupported kind never reaches the supervisor

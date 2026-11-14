@@ -18,11 +18,11 @@ from typing import Any
 
 # Single source of the supervisor release identity. VERSION, pyproject.toml (normalized), README, and
 # installed metadata are checked against it by the version-consistency tests and CI.
-SUPERVISOR_VERSION = "0.3.0-beta.1"
+SUPERVISOR_VERSION = "0.4.0-beta.1"
 
 
 def normalize_version(text: str) -> str:
-    """Release string -> the PEP 440 form used by packaging metadata (`0.3.0-beta.1` -> `0.3.0b1`)."""
+    """Release string -> the PEP 440 form used by packaging metadata (`0.4.0-beta.1` -> `0.4.0b1`)."""
     value = text.strip()
     for word, short in (("-beta.", "b"), ("-alpha.", "a"), ("-rc.", "rc"), ("-beta", "b0"), ("-alpha", "a0"), ("-rc", "rc0")):
         if word in value:
@@ -73,7 +73,7 @@ V2_WORKFLOW_POLICIES = ("gated_v2", "supervised_v2")
 
 # Immutable, resolved per-policy contract: what a run may and must do, decided once at task start and
 # never reinterpreted from mutable configuration afterward (see herdr_validation.resolve_workflow_contract).
-# `gated_v2` is Prospera's strict Codex-plans/Claude-implements procedure; every field below matches its
+# `gated_v2` is the strict Codex-plans/Claude-implements procedure; every field below matches its
 # current hardcoded behavior exactly. `supervised_v2` is the general policy: planning is optional, either
 # provider may start or receive a handoff, and a voluntary plan gate accepts any safe Markdown artifact
 # below the review root instead of the literal CODEX_PLAN.md filename. Both share the same protocol-safety
@@ -187,7 +187,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_consecutive_auto_turns": 8,
     # Default workflow policy for new tasks that do not name one explicitly (CLI `--policy`, Telegram task
     # start). Must be a V2_WORKFLOW_POLICIES member; `v1` cannot be the default going forward. A workspace
-    # (e.g. Prospera's local config) may set this to `gated_v2` to keep its strict procedure as the default
+    # (e.g. a project's local config) may set this to `gated_v2` to keep its strict procedure as the default
     # without changing the marketplace plugin's own default.
     "default_workflow_policy": "supervised_v2",
     "wait_timeout_ms": 10000,
@@ -226,6 +226,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the fixed --model argv is constructed only after a read-only local capability probe.
     "helpers": {"enabled": False},
     "native_tracking": {"enabled": False, "roots": [], "files": []},
+    # Reusable named Claude/Codex pairs (herdr_pairs). Inert unless enabled AND at least one administrator-allowed absolute root is
+    # listed: Telegram input can only choose repository/review directories inside these roots, never widen them.
+    "session_pairs": {"enabled": False, "allowed_roots": [], "instruction_root": None},
     "session_start": {
         "enabled": True, "direction": "right", "ratio": 0.5,
         "provider_commands": {"codex": "codex", "claude": "claude"},
@@ -619,6 +622,12 @@ def load_config(path: Path) -> dict[str, Any]:
         raise SupervisorError("native_tracking.roots must be at most eight absolute paths")
     if not isinstance(tracking.get("files"), list) or len(tracking["files"]) > 32:
         raise SupervisorError("native_tracking.files must be at most 32 explicit registrations")
+    pairs = config.get("session_pairs")
+    if (not isinstance(pairs, dict) or set(pairs) - {"enabled", "allowed_roots", "instruction_root"} or type(pairs.get("enabled")) is not bool
+            or not isinstance(pairs.get("allowed_roots"), list) or len(pairs["allowed_roots"]) > 16
+            or any(type(p) is not str or not p.startswith("/") or "\x00" in p or p != os.path.normpath(p) or len(p) > 1024 for p in pairs["allowed_roots"])
+            or (pairs.get("instruction_root") is not None and (type(pairs["instruction_root"]) is not str or not pairs["instruction_root"].startswith("/") or "\x00" in pairs["instruction_root"]))):
+        raise SupervisorError("session_pairs must be {enabled: boolean, allowed_roots: up to sixteen canonical absolute paths, instruction_root: absolute path or null}")
 
     return config
 

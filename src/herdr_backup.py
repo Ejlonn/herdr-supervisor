@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 from herdr_supervisor import Paths, SupervisorError, _number, atomic_write_json, iso_utc, load_json
 
-VERSION = "0.3.0-beta.1"
+VERSION = "0.4.0-beta.1"
 STRATEGIES = ("ssh_snapshot", "git_recovery", "both")
 DEFAULT_EXCLUSIONS = [
     "**/.env", "**/.env.*", "**/bot-token", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*", "**/*.p12", "**/*.pfx",

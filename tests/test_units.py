@@ -83,12 +83,17 @@ class UnitFileTests(unittest.TestCase):
         installer = INSTALLER.read_text()
         for forbidden in ("--now", "systemctl --user enable", "systemctl --user start", "systemctl --user restart", "systemctl --user stop", "daemon-reload", "herdr server stop", "herdr agent", "git ", "sudo"):
             self.assertNotIn(forbidden, installer, forbidden)
-        self.assertIn("systemd-analyze --user verify", installer)
-        self.assertIn('TG_LOCK_DIR="$HOME/.local/state/herdr-telegram-locks"', installer)
-        self.assertIn('chmod 0700 "$SUP_CONFIG_DIR"', installer)
+        # The script is a thin entry point to the minimal profile; the work (and its safety contract) lives in the shared module.
+        self.assertIn("herdr_setup.py", installer)
+        self.assertIn("--profile minimal", installer)
+        self.assertIn("--migrate", installer)
+        manager = (LIB / "herdr_installation.py").read_text()
+        self.assertIn('"systemd-analyze", "--user", "verify"', manager)
+        self.assertIn('"daemon-reload", "stop", "start", "enable", "disable"', manager, "the only service verbs the manager can issue")
+        for forbidden in ("--now", "herdr server stop", '"agent", "start"', "sudo", "loginctl enable-linger", "enable-linger"):
+            self.assertNotIn(forbidden, manager.replace("show-user", ""), forbidden)
         manifest = MANIFEST.read_text()
         self.assertIn("~/.local/state/herdr-telegram-locks/", manifest)
-        self.assertIn('"$BIN_DIR/herdr-supervisor" migrate', installer)
 
     @unittest.skipUnless((Path.home() / ".local/lib/herdr-supervisor/MANIFEST.txt").exists(), "V2 not installed")
     def test_installed_bot_lock_dir_exists_with_0700(self) -> None:

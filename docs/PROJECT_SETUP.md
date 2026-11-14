@@ -78,7 +78,7 @@ Apply attempts are serialized for the same bundle and project, including differe
 
 ## Versioned portable skills
 
-Baseline **1.0.0** is shipped inside Supervisor and copied only when the operator selects an adaptive/gated proposal. Preserve mode does not copy or activate it. It contains portable workflow methodology, not a copy of the current machine's installed skills or Prospera-specific hosts, scripts, branches and business rules. Normal source, wheel and installer distributions carry the same baseline. `workflow-observer` is a small original task-observation skill, not the full third-party task-observer distribution and not a dependency on its global logs.
+Baseline **1.0.0** is shipped inside Supervisor and copied only when the operator selects an adaptive/gated proposal. Preserve mode does not copy or activate it. It contains portable workflow methodology, not a copy of the current machine's installed skills or project-specific hosts, scripts, branches and business rules. Normal source, wheel and installer distributions carry the same baseline. `workflow-observer` is a small original task-observation skill, not the full third-party task-observer distribution and not a dependency on its global logs.
 
 Load a skill only when its trigger applies; onboarding does not inject every skill body into each turn. Project-specific facts and adaptations belong in the assessed rules and `project-validation`. Core baseline files are pinned at initial application. A changed packaged baseline invalidates pending proposals even when the version string was accidentally left unchanged.
 
@@ -106,6 +106,6 @@ After approved application, the full copies live under `generated/skills/NAME/`.
 - **stop-slop:** its prose rules and reference examples remain intact.
 - **ui-ux-pro-max:** the search scripts and all local data remain together. Use the copied skill's absolute script path instead of assuming a global `CLAUDE_PLUGIN_ROOT`. Python 3 is required.
 - **skill-creator:** stage proposed skills inside this project's external workflow bundle. Its YAML validation/generation helpers require PyYAML; dependency installation is a separate action.
-- **task-observer:** the full skill and resources are preserved. Its workspace/log anchor is explicitly this project's `project-learning/` directory. It replaces the lightweight workflow-observer for that project; do not load both. No global or Prospera observation history is copied.
+- **task-observer:** the full skill and resources are preserved. Its workspace/log anchor is explicitly this project's `project-learning/` directory. It replaces the lightweight workflow-observer for that project; do not load both. No global or other project's observation history is copied.
 
 When instruction writing is selected, both appendices point to this guide; otherwise open it directly from the external bundle. Existing user/project instructions still take precedence; helpers remain subject to task scope and side-effect approval. Local skill changes stay local, and repeat apply refuses to overwrite them. Imports are not a claim that every helper has been executed or that optional dependencies are installed. For a reproducible shared setup, keep reviewed source exports and their snapshot manifests under your own versioning rather than automatically synchronizing installed skills.

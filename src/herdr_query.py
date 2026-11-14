@@ -24,6 +24,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+import herdr_pairs as hp
+
 # Read-only helpers only. Never import Supervisor, routing, gates, inbox, or recovery entry points.
 from herdr_supervisor import (
     HerdrCli,
@@ -344,7 +346,11 @@ class QueryWorker:
         (provider, agent, report) where report carries each provider's reason and the failover reason."""
         state = self._supervisor_state()
         registry = self.registry()
-        workflow_sessions = self.workflow_sessions()
+        try:
+            workflow_sessions = self.workflow_sessions()
+        except SupervisorError:
+            # Unknown workflow ownership (e.g. an unreadable pair registry): no query session may be judged safe, so nothing is sent.
+            return None, None, {"reasons": {p: {"reason": "workflow_ownership_unknown"} for p in ("codex", "claude")}, "error": "workflow session ownership is unknown; no query was sent"}
         try:
             live = self.herdr.list_agents()
         except HerdrError as error:
@@ -368,7 +374,10 @@ class QueryWorker:
         """Stable read-only doctor/status view for every supported query provider."""
         state = self._supervisor_state()
         registry = self.registry()
-        workflow_sessions = self.workflow_sessions()
+        try:
+            workflow_sessions = self.workflow_sessions()
+        except SupervisorError:
+            return {provider: {"status": "workflow_ownership_unknown", "reason": "workflow session ownership is unknown"} for provider in ("codex", "claude")}
         try:
             live = self.herdr.list_agents()
         except HerdrError as error:
@@ -388,6 +397,12 @@ class QueryWorker:
         return report
 
     def _workflow_session_for(self, provider: str) -> str | None:
+        with contextlib.suppress(SupervisorError, OSError, KeyError, TypeError):
+            if self.paths.state_file.exists():  # a running named-pair task's workflow session is its frozen pair member, not the global owner
+                run = load_json(self.paths.state_file, label="supervisor task state")
+                binding = run.get("session_pair") if isinstance(run, dict) and run.get("supervisor_state") not in ("DONE", "CANCELLED") else None
+                if isinstance(binding, dict) and isinstance(binding["identities"][provider]["session_id"], str):
+                    return binding["identities"][provider]["session_id"]
         if self.paths.owners_file.exists():
             owners = load_json(self.paths.owners_file, label="owners")
             entry = owners.get(provider) if isinstance(owners, dict) else None
@@ -401,7 +416,7 @@ class QueryWorker:
             owners = load_json(self.paths.owners_file, label="owners")
             if isinstance(owners, dict):
                 sessions = {str(v.get("session_id")) for v in owners.values() if isinstance(v, dict)}
-        return sessions
+        return sessions | hp.known_sessions(self.paths)  # a saved named pair's sessions are workflow sessions too
 
     def session_available(self) -> tuple[dict[str, Any] | None, str]:
         """Legacy single-provider view kept for compatibility: the selected provider's agent or a reason."""

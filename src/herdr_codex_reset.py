@@ -228,7 +228,7 @@ class AppServerClient:
             raise ResetError("Codex app-server request timed out")
 
         try:
-            send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "herdr-supervisor", "version": "0.3"}, "capabilities": {}}})
+            send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "herdr-supervisor", "version": "0.4"}, "capabilities": {}}})
             receive(1)
             send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
             send({"jsonrpc": "2.0", "id": 2, "method": method, "params": params or {}})

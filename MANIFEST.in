@@ -4,6 +4,8 @@ include VERSION MANIFEST.txt MANIFEST.in herdr-plugin.toml install.sh uninstall.
 recursive-include bin *
 recursive-include config *.json
 recursive-include docs *.md *.png
+recursive-include agents *.md *.toml
+recursive-include scripts *.sh
 recursive-include systemd *
 recursive-include tests *.py
 recursive-include tests/fixtures *.txt *.json *.jsonl *.md

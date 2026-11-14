@@ -10,8 +10,10 @@ Before any commit or publication:
 3. Inspect all Git objects and full history after commits exist; a clean working tree scan is not a history scan.
 4. Run the complete test suite and Python compilation from source, or let CI (`.github/workflows/ci.yml`) run the full gate: Python 3.11 and 3.13 tests with branch coverage ≥ 80%, Ruff, mypy, packaging, entry points, installer dry run, fixture privacy, version consistency, and secret markers.
    Build the sdist and wheel in an isolated environment (`python -m build`), confirm the sdist lists exactly the repository inventory (`MANIFEST.in` is the allowlist), install the wheel into a throwaway prefix, and run every console entry point with `--help`.
-5. Run an isolated temporary-HOME install, missing-token doctor, unit validation, source/install hash reconciliation, and default-preserving uninstall.
-6. Record every live test and every intentionally deferred action.
-7. Obtain separate human authorization for commit, tag, remote creation, push, GitHub publication, or plugin publication.
+5. Run an isolated temporary-HOME `herdr-setup` minimal and full preview/apply, update, legacy-adoption refusal and rollback (fake adapters; `tests/test_setup_*.py`), a real `systemd-analyze --user verify` of the shipped units in an isolated environment (mocks alone cannot prove valid units), a missing-token doctor, source/install hash reconciliation (`GENERATION.json` and the receipt), and the default-preserving uninstall.
+6. Record every live test and every intentionally deferred action. Real minimal/full setup, update, restart/readiness and rollback need a disposable supported Linux user-systemd environment (a separate user, not a deployment in use) and are a separate runtime decision; missing environment or integration evidence is a stated blocker, never a synthetic pass.
+7. Confirm `config/quota-dependency.json` still names an exact revision of the owned fork of the quota plugin (`herdr-agent-usage`), that its recovery-artifact hashes match the files being distributed, and that no documentation links an address that no longer resolves. Run `herdr-quota-dependency bootstrap --dry-run` from a fresh isolated `HOME` against the recovery archive before publishing. A release never moves the pin implicitly.
+8. Reconcile the release notes (`docs/RELEASE_NOTES.md`) with the final commit: every statement describes shipped source, and every validation not actually run stays listed as pending.
+9. Obtain separate human authorization for commit, tag, remote creation, push, GitHub publication, or plugin publication.
 
 No repository remote is configured or contacted by the installer. Example configuration contains placeholders only.

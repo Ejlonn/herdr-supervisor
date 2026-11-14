@@ -168,6 +168,11 @@ def render_status(status: dict[str, Any], tz: str) -> Rendered:
         lines.append(f"Stage: {esc(status.get('phase') or 'starting', limit=40)} · Active agent: {esc((status.get('active_agent') or '-').title(), limit=20)}")
         selection=status.get("session_selection") or {}
         lines.append(f"Sessions: {esc(selection.get('policy') or 'preserve')} · models {esc(selection.get('profiles') or {})}")
+        pair=status.get("session_pair")
+        if isinstance(pair,dict) and isinstance(pair.get("identities"),dict):  # a named pair run: label, both identities and context are frozen for this run
+            ids=pair["identities"]
+            lines.append(f"Pair: {esc(pair.get('name'), limit=64)} · claude {code(abbrev((ids.get('claude') or {}).get('session_id')))} · codex {code(abbrev((ids.get('codex') or {}).get('session_id')))}")
+            lines.append(f"Context: {esc((pair.get('context') or {}).get('repository'), limit=120)}")
     else:
         lines.append("Send /task or upload a .md/.txt task file to start.")
     preparation=status.get("session_preparation")
@@ -258,7 +263,7 @@ def render_sessions(catalog: dict[str, Any]) -> Rendered:
 
 def render_status_raw(status: dict[str, Any]) -> Rendered:
     """Sanitized, bounded technical view (never secrets)."""
-    keys = ("supervisor_state", "task_id", "phase", "active_agent", "workflow_policy", "session_selection", "session_preparation", "delivery", "pending_gate", "candidate_sha", "runtime_evidence", "push_approval", "codex_reset", "last_event", "event_sequence", "quota_wait", "deferred_anomaly", "native_sessions_abbrev", "errors")
+    keys = ("supervisor_state", "task_id", "phase", "active_agent", "workflow_policy", "session_selection", "session_pair", "session_preparation", "delivery", "pending_gate", "candidate_sha", "runtime_evidence", "push_approval", "codex_reset", "last_event", "event_sequence", "quota_wait", "deferred_anomaly", "native_sessions_abbrev", "errors")
     view = {k: status.get(k) for k in keys if status.get(k) is not None}
     text = redact(json.dumps(view, indent=1, sort_keys=True, default=str), limit=3500)
     return Rendered(f"{title_line('Raw status (sanitized)')}\n<pre>{html.escape(text, quote=False)}</pre>")

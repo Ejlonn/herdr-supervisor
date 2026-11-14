@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import herdr_helper_context as hctx
+import herdr_pairs as hp
 import herdr_startup as hst
 from herdr_cli import help_has_lexeme, match_exact_session, session_identity
 from herdr_core import (
@@ -39,6 +40,7 @@ from herdr_core import (
     startup_wait_settings,
     valid_pane_id,
 )
+from herdr_workflow import pair_switch_problem
 
 SESSION_POLICIES = ("preserve", "fresh-codex", "fresh-claude", "fresh-all")
 PANE_ID_MAX = 128
@@ -145,7 +147,10 @@ def validate_selection(config: dict[str, Any], selection: Any) -> dict[str, Any]
             raise SupervisorError(f"unknown {provider} model profile: {profile}")
         if provider not in fresh and profile != "default":
             raise SupervisorError(f"a model profile cannot be selected for preserved {provider}")
-    return {"policy": policy, "profiles": normalized, "fresh_providers": list(fresh)}
+    result: dict[str, Any] = {"policy": policy, "profiles": normalized, "fresh_providers": list(fresh)}
+    if "pair" in selection:  # additive: a legacy selection never carries the key, so its normalised form is unchanged
+        result["pair"] = hp.validate_pair_selection(selection["pair"], policy)
+    return result
 
 
 def cli_request_envelope(
@@ -436,6 +441,11 @@ def validate_preparation_record(config: dict[str, Any], record: Any, preparation
             raise SupervisorError("session preparation request does not match its binding")
     elif request_envelope is not None:
         raise SupervisorError("supervisor session preparation has a CLI request envelope")
+    destination=record.get("destination")
+    creation=_creation(selection)
+    if (destination is None) != (creation is None) or (destination is not None and (not isinstance(destination,dict) or set(destination)!={"kind","name","binding"} or destination.get("kind")!="named"
+                                                                                  or creation is None or destination.get("name")!=creation["name"] or destination.get("binding")!=hp.selection_digest(selection))):
+        raise SupervisorError("session preparation destination does not match its pair selection")
     owners_before=record.get("owners_before")
     if not isinstance(owners_before,dict) or set(owners_before)!=set(PROVIDERS) or not all(_valid_owner(owners_before[p]) for p in PROVIDERS):
         raise SupervisorError("session preparation owner snapshot is invalid")
@@ -1203,6 +1213,27 @@ def _apply_label(supervisor: Any, provider: str, item: dict[str, Any], record: d
     atomic_write_json(path, record)
 
 
+def _global_owners(supervisor: Any) -> dict[str, dict[str, str]]:
+    """The installation-wide `owners.json` (a named pair never changes it). Fakes without a named-pair seam have only `owners()`."""
+    reader = getattr(supervisor, "global_owners", None)
+    return reader() if callable(reader) else supervisor.owners()
+
+
+def _creation(selected: dict[str, Any]) -> dict[str, Any] | None:
+    pair = selected.get("pair")
+    return pair if isinstance(pair, dict) and pair.get("mode") == "create" else None
+
+
+def _named_binding_performed(supervisor: Any, raw: dict[str, Any]) -> bool:
+    """A named creation's ownership 'write' is the registry publication, never owners.json."""
+    return hp.entry_for_preparation(supervisor.paths, str(raw.get("preparation_id"))) is not None
+
+
+def _release_name(supervisor: Any, preparation_id: str) -> None:
+    with contextlib.suppress(SupervisorError, OSError):
+        hp.release_reservation(supervisor.paths, supervisor.clock, preparation_id)
+
+
 def _verify_owner_set(live: list[dict[str, Any]], owners: dict[str, dict[str, str]], *, label: str) -> None:
     for provider in PROVIDERS:
         expected=owners[provider]
@@ -1360,7 +1391,10 @@ def _make_preparation_inert(supervisor: Any, preparation_id: str, reason: str) -
         # BINDING is an INTENT: inert only while owners.json still equals the pre-operation owners (the mutation was never performed). If the owners were already written, history
         # completed and is reconciled by the next retry (never rewound, never replayed).
         try:
-            if supervisor.owners() != raw.get("owners_before"):
+            if isinstance(raw.get("destination"), dict):
+                if _named_binding_performed(supervisor, raw):
+                    return False
+            elif supervisor.owners() != raw.get("owners_before"):
                 return False
         except SupervisorError:
             return False
@@ -1368,6 +1402,8 @@ def _make_preparation_inert(supervisor: Any, preparation_id: str, reason: str) -
         return False
     raw.update({"status": "ABANDONED", "abandoned_at": iso_utc(supervisor.clock()), "resolved_by": reason})
     atomic_write_json(path, raw)
+    if isinstance(raw.get("destination"), dict):
+        _release_name(supervisor, preparation_id)
     return True
 
 
@@ -1394,7 +1430,7 @@ def sweep_startup_waits(supervisor: Any) -> list[str]:
             hst.close_wait(wait, "RESOLVED", now, "preparation bound")
         elif status == "ABANDONED" or prep is None:
             hst.close_wait(wait, "CANCELLED", now, "preparation abandoned")
-        elif status == "BINDING" and hst.expired(wait, now) and supervisor.owners() != prep.get("owners_before"):
+        elif status == "BINDING" and hst.expired(wait, now) and (_named_binding_performed(supervisor, prep) if isinstance(prep.get("destination"), dict) else supervisor.owners() != prep.get("owners_before")):
             continue  # the owners were already written before the crash: completed history, reconciled by the next retry, not expired or rewound
         elif hst.expired(wait, now):  # WAITING or CONTINUING: the original deadline holds across a worker restart and a crash after the durable marker
             _expire_wait(supervisor, wait, now)
@@ -1657,6 +1693,12 @@ def prepare_sessions(
         raise SupervisorError("invalid starting provider for session preparation")
     selected = validate_selection(supervisor.config, selection)
     fresh = tuple(selected["fresh_providers"])
+    if selected.get("pair") is not None:
+        if origin != "supervisor":
+            raise SupervisorError("named session pairs are started from the supervisor task flow only")
+        if not hp.pairs_enabled(supervisor.config):
+            raise SupervisorError("named session pairs are not enabled: configure session_pairs.enabled and at least one administrator-allowed root")
+    creation = _creation(selected)
     valid_binding = isinstance(request_binding,str) and len(request_binding)==64 and all(c in "0123456789abcdef" for c in request_binding)
     valid_envelope = False
     if origin == "cli" and isinstance(request_envelope, dict):
@@ -1755,11 +1797,19 @@ def prepare_sessions(
         if record.get("selection") != selected or record.get("origin") != origin or record.get("request_binding") != request_binding or record.get("request_envelope") != request_envelope:
             raise SupervisorError("session preparation binding changed")
     else:
+        if creation is not None:
+            # The complete old-run / old-pair boundary is proved BEFORE the name is reserved or any pane exists; a refusal here has no effect to undo.
+            boundary = pair_switch_problem(supervisor.paths, state, supervisor.herdr.list_agents(), own_preparation_id=preparation_id)
+            if boundary is not None:
+                raise SupervisorError(f"cannot create a named pair: {boundary}. Nothing was reserved, created, sent or interrupted.")
+            hp.check_context(supervisor.config, creation["context"])
+            hp.reserve_name(supervisor.paths, supervisor.clock, name=creation["name"], preparation_id=preparation_id, binding=hp.selection_digest(selected))
         record = {
             "schema_version": 2, "preparation_id": preparation_id, "status": "SESSION_SELECTION_AUTHORIZED",
             "selection": selected, "created_at": iso_utc(supervisor.clock()), "origin": origin,
             "request_binding": request_binding, "request_envelope": request_envelope,
             "owners_before": {p:dict(owners[p]) for p in PROVIDERS},
+            **({"destination": {"kind": "named", "name": creation["name"], "binding": hp.selection_digest(selected)}} if creation is not None else {}),
             "providers": {p: {"status": "AUTHORIZED", "old_pane_id": owners[p]["pane_id"], "old_session_id": owners[p]["session_id"], "profile": selected["profiles"][p], "preparation_id": preparation_id,
                               **({"launch_method": method, "input_policy": policy} if p in THREAD_PROVIDERS and method == EXPLICIT_LAUNCH else {}),
                               **(_direct_authorization(supervisor, p, selected["profiles"][p]) if p in THREAD_PROVIDERS else {}),
@@ -1772,7 +1822,11 @@ def prepare_sessions(
         assert_recorded_approval_modes(supervisor.config, record, fresh)
     if record.get("status") in ("OWNERSHIP_BOUND","TASK_STARTED"):
         bound = record.get("bound_owners")
-        if bound != supervisor.owners():
+        if creation is not None:
+            entry = hp.entry_for_preparation(supervisor.paths, preparation_id)
+            if entry is None or entry["identities"] != bound or _global_owners(supervisor) != owners_before:
+                raise SupervisorError("named session preparation was bound but its pair or the global owners changed")
+        elif bound != supervisor.owners():
             raise SupervisorError("session preparation was bound but owners.json changed")
         return record
     if record.get("status") == "ABANDONED":
@@ -1790,7 +1844,14 @@ def prepare_sessions(
             raise SupervisorError("fresh session identity is not distinct from the preserved owner set")
         _verify_owner_set(live,old_owners,label="preparation")
         _verify_owner_set(live,new_owners,label="prepared")
-        if owners==old_owners:
+        if creation is not None:
+            if owners!=old_owners:
+                raise SupervisorError("named session creation found changed global owners; nothing was published")
+            if hp.entry_for_preparation(supervisor.paths, preparation_id) is None:
+                for provider in fresh:  # the registry publication is the ownership effect of a named creation and obeys the original bound
+                    _deadline_guard(supervisor, preparation_id, provider, "binding ownership")
+            hp.publish_created(supervisor.paths, supervisor.config, supervisor.clock, preparation_id=preparation_id, name=creation["name"], context=creation["context"], identities=new_owners)
+        elif owners==old_owners:
             for provider in fresh:  # a persisted BINDING marker is INTENT: the previously unperformed owners write is a new effect and obeys the original bound
                 _deadline_guard(supervisor, preparation_id, provider, "binding ownership")
             atomic_write_json(supervisor.paths.owners_file,new_owners,mode=0o600)
@@ -1897,7 +1958,7 @@ def prepare_sessions(
         new_owners[provider] = {"pane_id": item["pane_id"], "session_id": item["session_id"]}
     # Re-read live state and validate the complete pair before the single ownership mutation.
     live = supervisor.herdr.list_agents()
-    if owners != owners_before or supervisor.owners() != owners_before:
+    if owners != owners_before or _global_owners(supervisor) != owners_before:
         raise SupervisorError("session ownership changed after preparation authorization")
     if any(new_owners[p]["session_id"] in {owners_before[q]["session_id"] for q in PROVIDERS} for p in fresh):
         raise SupervisorError("fresh session identity is not distinct from the preserved owner set")
@@ -1909,7 +1970,10 @@ def prepare_sessions(
     atomic_write_json(path, record)
     for provider in fresh:  # re-read after the intent write, immediately before the owners write: with owners still unchanged the BINDING intent is made inert, never replayed
         _deadline_guard(supervisor, preparation_id, provider, "binding ownership")
-    atomic_write_json(supervisor.paths.owners_file, new_owners, mode=0o600)
+    if creation is not None:  # publish the pair only now that both fresh native identities verified; owners.json is never written for a named pair
+        hp.publish_created(supervisor.paths, supervisor.config, supervisor.clock, preparation_id=preparation_id, name=creation["name"], context=creation["context"], identities={p: new_owners[p] for p in PROVIDERS})
+    else:
+        atomic_write_json(supervisor.paths.owners_file, new_owners, mode=0o600)
     record.update({"status": "OWNERSHIP_BOUND", "bound_at": iso_utc(supervisor.clock()), "bound_owners": new_owners})
     atomic_write_json(path, record)
     supervisor._live_names.clear()

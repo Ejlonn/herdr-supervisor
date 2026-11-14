@@ -13,7 +13,7 @@ import herdr_core  # noqa: E402
 from v2_fixtures import hs  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIPPED_MODULES = ["herdr_supervisor", "herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_startup", "herdr_workflow", "herdr_sessions", "herdr_session_catalog", "herdr_helpers", "herdr_native_identity", "herdr_native_results", "herdr_role_readiness", "herdr_runtime", "herdr_command", "herdr_onboarding", "herdr_skill_baseline", "herdr_support_skills", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "herdr_helper_context", "telegram_api"]
+SHIPPED_MODULES = ["herdr_supervisor", "herdr_core", "herdr_cli", "herdr_quota", "herdr_protocol", "herdr_redaction", "herdr_validation", "herdr_startup", "herdr_workflow", "herdr_sessions", "herdr_pairs", "herdr_session_catalog", "herdr_helpers", "herdr_native_identity", "herdr_native_results", "herdr_codex_children", "herdr_role_readiness", "herdr_runtime", "herdr_command", "herdr_onboarding", "herdr_skill_baseline", "herdr_support_skills", "herdr_telegram", "herdr_query", "herdr_backup", "herdr_artifacts", "herdr_present", "herdr_codex_reset", "herdr_helper_context", "herdr_quota_dependency", "herdr_installation", "herdr_update", "herdr_setup", "telegram_api"]
 SECRET_SHAPES = [
     re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b"),  # Telegram bot token
     re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
@@ -33,7 +33,7 @@ class VersionConsistencyTests(unittest.TestCase):
     def test_single_version_source(self) -> None:
         version = herdr_core.SUPERVISOR_VERSION
         self.assertEqual((ROOT / "VERSION").read_text().strip(), version)
-        self.assertEqual(hs.normalize_version(version), "0.3.0b1")
+        self.assertEqual(hs.normalize_version(version), "0.4.0b1")
         pyproject = (ROOT / "pyproject.toml").read_text()
         self.assertIn(f'version = "{hs.normalize_version(version)}"', pyproject)
         self.assertIn(f"**{version}**", (ROOT / "README.md").read_text())

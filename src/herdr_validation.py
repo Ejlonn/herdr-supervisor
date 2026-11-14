@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal, overload
 
+import herdr_pairs as hp
 from herdr_cli import HerdrCli, session_identity
 from herdr_core import (
     _STAGE_RE,
@@ -254,6 +255,13 @@ def validate_state_v2(state: dict[str, Any]) -> None:
     preparation=state.get("session_preparation")
     if preparation is not None and (not isinstance(preparation,dict) or preparation.get("status") not in ("OWNERSHIP_BOUND","TASK_STARTED")):
         raise SupervisorError("state session_preparation is invalid")
+    if state.get("session_pair") is not None:  # additive: legacy runs never carry it and keep resolving the global owners
+        hp.validate_binding(state["session_pair"])
+        chosen = state["session_selection"].get("pair")
+        binding = state["session_pair"]
+        if not isinstance(chosen, dict) or (chosen.get("mode") == "saved" and (chosen.get("pair_id"), chosen.get("fingerprint")) != (binding["pair_id"], binding["fingerprint"])) \
+                or (chosen.get("mode") in ("save_existing", "create") and hp.name_key(chosen.get("name", "")) != hp.name_key(binding["name"])):
+            raise SupervisorError("state session_pair does not match the pair selection")
     policy = state.get("workflow_policy")
     if policy not in WORKFLOW_POLICIES:
         raise SupervisorError(f"state has an invalid workflow_policy: {policy!r}")
@@ -1253,16 +1261,15 @@ def register_query_provider(
     identity = session_identity(live)
     if not identity:
         raise SupervisorError("query agent has no stable native session identity")
+    # Saved pairs are workflow sessions whether or not a legacy owners.json exists; an unreadable pair registry raises (unknown ownership refuses).
+    workflow_sessions = set(hp.known_sessions(paths))
     if paths.owners_file.exists():
         owners = load_json(paths.owners_file, label="native session owners")
         if not isinstance(owners, dict):
             raise SupervisorError("native session owners file is invalid")
-        workflow_sessions = {
-            entry.get("session_id") for entry in owners.values()
-            if isinstance(entry, dict)
-        }
-        if identity in workflow_sessions:
-            raise SupervisorError("query agent reuses a workflow native session")
+        workflow_sessions |= {entry["session_id"] for entry in owners.values() if isinstance(entry, dict) and isinstance(entry.get("session_id"), str)}
+    if identity in workflow_sessions:
+        raise SupervisorError("query agent reuses a workflow native session")
     registry = load_query_registry(paths)
     registry[provider] = {"agent_name": agent_name, "pane_id": live.get("pane_id"), "session_id": identity}
     paths.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)

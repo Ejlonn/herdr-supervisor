@@ -35,6 +35,7 @@ import os
 import re
 import stat
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,166 @@ MAX_LINE_BYTES = 1024 * 1024
 MAX_DIR_ENTRIES = 4000
 MAX_ELAPSED_SECONDS = 3.0
 SUPPORTED_PROVIDERS = ("claude", "codex")
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeJobs:
+    kind: str  # clear | pending | awaiting_final | retry | unknown
+    detail: str
+    tasks: tuple[str, ...] = ()
+
+
+def claude_background_status(session_id: str, run_id: str, turn_id: str, *, root: Path, cursor: dict[str, Any],
+                             clock: Callable[[], float] = time.monotonic) -> ClaudeJobs:
+    """Observe native jobs for ONE accepted primary delivery; never read job-output paths.
+
+    A system-origin completion notification is evidence of job termination, not a
+    workflow result. A later primary final still has to pass normal routing.
+    Ordinary user text, child messages and quoted XML cannot settle a job.
+    """
+    budget = _Budget(clock)
+    try:
+        if not all(_valid_session(v) for v in (session_id, run_id, turn_id)):
+            return ClaudeJobs("unknown", "invalid session/run/turn binding")
+        path, problem = locate_session_file("claude", session_id, root, budget)
+        if path is None:
+            return ClaudeJobs("unknown", str(problem))
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            lines, meta, problem = _read_window(fd, cursor, "claude", budget)
+            if problem or not meta.get("cursor_used"):
+                return ClaudeJobs("unknown", problem or "complete accepted-turn cursor span does not fit or no longer matches")
+            result = _claude_jobs_from_lines(lines, session_id, run_id, turn_id, budget)
+            changed = _extent_problem(fd, path, meta)
+            if changed:
+                now = os.fstat(fd)
+                linked = os.lstat(path)
+                if stat.S_ISREG(linked.st_mode) and (linked.st_dev, linked.st_ino) == (meta.get("dev"), meta.get("ino")) and (now.st_dev, now.st_ino) == (meta.get("dev"), meta.get("ino")) and now.st_size > meta.get("size", now.st_size):
+                    return ClaudeJobs("retry", "primary transcript is growing; wait for the next bounded snapshot")
+                return ClaudeJobs("unknown", changed)
+            if meta.get("partial_tail_bytes"):
+                return ClaudeJobs("unknown", "primary transcript has an incomplete trailing record")
+            return result
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, _Exhausted, ET.ParseError) as error:
+        return ClaudeJobs("unknown", f"native background lifecycle is unreadable ({type(error).__name__}: {error})")
+
+
+def _claude_jobs_from_lines(lines: list[tuple[int, bytes]], session_id: str, run_id: str, turn_id: str, budget: Any) -> ClaudeJobs:
+    calls: dict[str, str] = {}  # tool-use id -> primary assistant UUID
+    jobs: dict[str, str] = {}  # task id -> tool-use id
+    terminal: set[str] = set()
+    prompt = False
+    last_terminal = last_final = -1
+    seen_requested: set[str] = set()
+    for ordinal, (_offset, raw) in enumerate(lines):
+        budget.check()
+        if ordinal >= MAX_RECORDS or len(raw) > MAX_LINE_BYTES:
+            return ClaudeJobs("unknown", "native background scan exhausted its record/line budget")
+        row = json.loads(raw)
+        if not isinstance(row, dict):
+            return ClaudeJobs("unknown", "non-object native record")
+        eligible = _claude_record(row, session_id, turn_id)
+        if isinstance(eligible, str):
+            return ClaudeJobs("unknown", eligible)
+        if "isCompactSummary" in row:
+            if type(row["isCompactSummary"]) is not bool:
+                return ClaudeJobs("unknown", "native compact-summary flag is not boolean")
+            if row["isCompactSummary"]:
+                message = row.get("message", {})
+                if (row.get("type") != "user" or row.get("isVisibleInTranscriptOnly") is not True
+                        or not isinstance(message, dict) or message.get("role") != "user"
+                        or not isinstance(message.get("content"), (str, list))):
+                    return ClaudeJobs("unknown", "unsupported native compact-summary metadata")
+                content = message["content"]
+                if isinstance(content, list) and any(not isinstance(b, dict) or b.get("type") != "text" or not isinstance(b.get("text"), str) for b in content):
+                    return ClaudeJobs("unknown", "unsupported native compact-summary content")
+                continue  # transcript-only summary is data, never another delivered prompt or a task notification
+        if eligible and eligible[0] == "prompt":
+            text = _text_of(row["message"].get("content"), ("text",))
+            if run_id in text:
+                if prompt:
+                    return ClaudeJobs("unknown", "accepted prompt is ambiguous")
+                prompt = True
+        if not prompt or row.get("type") not in ("user", "assistant") or row.get("isSidechain") is not False:
+            continue
+        message = row["message"]
+        if message.get("role") != row["type"]:
+            return ClaudeJobs("unknown", "native background record role is inconsistent")
+        content = message.get("content")
+        if eligible and eligible[0] == "final":
+            last_final = ordinal
+        if row["type"] == "assistant" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Bash":
+                    ident, args = block.get("id"), block.get("input")
+                    if not isinstance(ident, str) or not ident or ident in calls or not isinstance(args, dict):
+                        return ClaudeJobs("unknown", "malformed or duplicate primary Bash invocation")
+                    bg = args.get("run_in_background", False)
+                    if type(bg) is not bool:
+                        return ClaudeJobs("unknown", "Bash background flag is not boolean")
+                    source = row.get("uuid")
+                    if not isinstance(source, str) or not source:
+                        return ClaudeJobs("unknown", "primary Bash invocation has no native UUID")
+                    calls[ident] = source
+                    if bg:
+                        seen_requested.add(ident)
+        if row["type"] == "user" and isinstance(content, list):
+            tool_results = [v for v in content if isinstance(v, dict) and v.get("type") == "tool_result"]
+            info = row.get("toolUseResult")
+            if isinstance(info, dict) and info.get("backgroundTaskId") is not None:
+                task = info["backgroundTaskId"]
+                if len(tool_results) != 1 or not isinstance(task, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task) is None:
+                    return ClaudeJobs("unknown", "malformed native background task result")
+                ident = tool_results[0].get("tool_use_id")
+                if not isinstance(ident, str):
+                    return ClaudeJobs("unknown", "background tool-use identity is not a string")
+                if ident not in calls or row.get("sourceToolAssistantUUID") != calls[ident] or task in jobs or ident in jobs.values():
+                    return ClaudeJobs("unknown", "background result has no unique primary Bash binding")
+                jobs[task] = ident
+                seen_requested.discard(ident)
+            for block in tool_results:
+                ident = block.get("tool_use_id")
+                if not isinstance(ident, str):
+                    return ClaudeJobs("unknown", "tool result identity is not a string")
+                if ident in seen_requested and block.get("is_error") is True:
+                    seen_requested.discard(ident)  # request was refused, not a running job
+        origin = row.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+            if (row["type"] != "user" or row.get("promptSource") != "system" or row.get("turnOrigin") != "task_notification"
+                    or origin.get("producer") != "session-task" or not isinstance(origin.get("runId"), str) or not origin["runId"]):
+                return ClaudeJobs("unknown", "unsupported native task notification provenance")
+            if isinstance(content, list) and any(not isinstance(v, dict) or v.get("type") != "text" for v in content):
+                return ClaudeJobs("unknown", "mixed native task notification content")
+            notification = _strict_text(content, ("text",))
+            if notification is None or "<!" in notification:
+                return ClaudeJobs("unknown", "unsupported native task notification XML")
+            doc = ET.fromstring(notification)
+            if doc.tag != "task-notification":
+                return ClaudeJobs("unknown", "unexpected native task notification root")
+            values = {}
+            for key in ("task-id", "tool-use-id", "status"):
+                items = doc.findall(key)
+                if len(items) != 1 or not isinstance(items[0].text, str):
+                    return ClaudeJobs("unknown", "ambiguous native task notification")
+                values[key] = items[0].text
+            task, ident = values["task-id"], values["tool-use-id"]
+            if task not in jobs and ident not in calls:
+                continue  # unrelated older task, never adopted for this delivery
+            if task not in jobs or jobs[task] != ident or values["status"] != "completed":
+                return ClaudeJobs("unknown", "native completion does not match the requested job or supported terminal status")
+            if task not in terminal:
+                terminal.add(task)
+                last_terminal = ordinal
+    if not prompt:
+        return ClaudeJobs("unknown", "accepted primary prompt is absent from this cursor span")
+    pending = tuple(sorted(set(jobs) - terminal)) + tuple(sorted(seen_requested))
+    if pending:
+        return ClaudeJobs("pending", "accepted Claude delivery has pending native background work", pending)
+    if terminal and last_final <= last_terminal:
+        return ClaudeJobs("awaiting_final", "background work ended; waiting for its primary continuation")
+    return ClaudeJobs("clear", "no unresolved native background work for this accepted delivery")
 
 FOUND, NONE, CONFLICT, UNSUPPORTED, UNAVAILABLE, UNCERTAIN, IDENTITY = "found", "none", "conflict", "unsupported", "unavailable", "uncertain", "identity"
 

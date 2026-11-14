@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import herdr_pairs as hpair
 import herdr_present as hp
 import herdr_redaction as hr
 from herdr_supervisor import Paths, SupervisorError, atomic_write_json, iso_utc, load_json, sha256_bytes
@@ -69,6 +70,11 @@ def allowed_roots(paths: Paths, config: dict[str, Any]) -> list[Path]:
     roots = [Path(config["review_root"]), generated_dir(paths)]
     extra = (config.get("telegram") or {}).get("artifact_roots") or config.get("artifact_roots") or []
     roots += [Path(str(r)) for r in extra if isinstance(r, str) and r.startswith("/")]
+    if hpair.pairs_enabled(config):  # a saved pair's review base (validated inside the administrator roots when it was saved) holds its runs' plans and reports
+        try:
+            roots += [Path(entry["context"]["review_base"]) for entry in hpair.list_entries(paths)]
+        except SupervisorError:
+            pass  # an unreadable registry adds no root
     return roots
 
 

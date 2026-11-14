@@ -14,9 +14,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+import herdr_codex_children as cc
 import herdr_codex_reset as hcr
 import herdr_helper_context as hctx
 import herdr_native_results as nr
+import herdr_pairs as hp
 import herdr_role_readiness as rr
 import herdr_startup as hst
 from herdr_cli import MIN_HERDR_VERSION_TEXT, match_exact_session, session_identity
@@ -75,7 +77,7 @@ from herdr_sessions import (
     validate_selection,
 )
 from herdr_validation import StateStore, git_head, load_query_registry, new_v2_fields, query_owner_summary, resolve_workflow_contract, safe_gate_view
-from herdr_workflow import SupervisorV2Mixin, _carrier_panes
+from herdr_workflow import SupervisorV2Mixin, _carrier_panes, pair_switch_problem
 
 
 def telegram_doctor_summary() -> dict[str, Any]:
@@ -96,6 +98,10 @@ CLAUDE_QUIET_WINDOW_SECONDS = 8.0
 CLAUDE_SAMPLE_SLEEP_SECONDS = 2.5
 CLAUDE_MAX_SAMPLE_GAP_SECONDS = 4.0
 BACKGROUND_INDICATOR_RULE_IDS = frozenset({"background_agents_working", "background_mcp_task_working"})
+# Codex child-settlement guard (transcript-based; fences supervisor delivery/routing AFTER recorded native actions, never native spawn admission).
+CODEX_CHILD_SAMPLE_SECONDS = 2.5
+CODEX_CHILD_HOLD_PATIENCE_SECONDS = 120.0       # a pending child that never settles becomes a stable operator wait; nothing is retried or closed
+_CODEX_GUARD_KINDS = {cc.TRANSPARENT: "clear", cc.COMPLETE: "clear", cc.HOLD: "hold", cc.UNKNOWN: "unknown", cc.VIOLATION: "violation", cc.IDENTITY: "identity"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,7 +185,12 @@ class Supervisor(SupervisorV2Mixin):
         self._monotonic = monotonic
         self.store = StateStore(paths, clock)
         self._live_names: dict[str, str] = {}
+        self._pair_scope: dict[str, Any] | None = None  # the pair binding of a start in progress (never persisted here)
+        self._pair_cache: tuple[Any, dict[str, Any] | None] | None = None
         self.native_roots: dict[str, Path] | None = None  # tests inject; None = configured/default provider roots
+        self.codex_child_guard_enabled = True  # TEST-ONLY seam on the instance (like launch_executable_check): never a config key, request value or state field
+        self._route_nested: Any = None  # the block of the route() invocation that is ACTIVE right now (set only around its own nested route_v2 call, cleared on every exit)
+        self._codex_hold: dict[tuple[str, str, str], float] = {}  # in-memory only (no state schema): when a pending-child hold began, per run/turn/purpose
         self.provider_version_reader: Callable[[str], str | None] = self._read_provider_version  # tests inject; read-only `--version`, never a session
         self.head_resolver: Callable[[Path], str] = git_head  # tests inject a fake
         self.reset_gateway = reset_gateway or hcr.JournalGateway(
@@ -414,6 +425,8 @@ class Supervisor(SupervisorV2Mixin):
                     record=load_json(path,label="session preparation")
                     if isinstance(record,dict) and record.get("status") not in ("TASK_STARTED","ABANDONED"):
                         record.update({"status":"ABANDONED","resolved_by":"explicit_rebind","abandoned_at":iso_utc(self.clock())})
+                        if isinstance(record.get("destination"), dict):
+                            hp.release_reservation(self.paths, self.clock, str(record.get("preparation_id")))
                         atomic_write_json(path,record)
         return {"applied": apply, "providers": view}
 
@@ -431,6 +444,8 @@ class Supervisor(SupervisorV2Mixin):
             raise SupervisorError("this preparation cannot be abandoned; inspect ownership and use explicit rebind if needed")
         record.update({"status":"ABANDONED","abandoned_at":iso_utc(self.clock())})
         atomic_write_json(path,record)
+        if isinstance(record.get("destination"), dict):
+            hp.release_reservation(self.paths, self.clock, preparation_id)  # the name returns to the pool; a published pair is never touched
         for wait in hst.list_waits(self.paths, preparation_id=preparation_id, statuses=hst.OPEN_STATUSES):
             hst.close_wait(wait, "CANCELLED", self.clock(), "preparation abandoned")
             hst.write_wait(self.paths, wait)
@@ -622,6 +637,44 @@ class Supervisor(SupervisorV2Mixin):
                       reason="Claude statusLine has no windows before the first response; quota remains unknown")
         return blocking_windows(snapshot, self.clock())
 
+    def _working_blocking_windows(self, state: dict[str, Any], provider: str, delivery: dict[str, Any]) -> tuple[QuotaWindow, ...]:
+        """UNKNOWN may accompany the already accepted Claude startup turn, never authorize a new one or quota recovery."""
+        watch = delivery.get("claude_startup_unknown")
+        if watch is not None:
+            if (not isinstance(watch, dict) or set(watch) != {"session_id", "turn_id", "usable_seen"}
+                    or type(watch.get("usable_seen")) is not bool or provider != "claude"
+                    or delivery.get("agent") != provider or not nr._valid_session(watch.get("turn_id"))
+                    or not (delivery.get("status") == "accepted" or isinstance(delivery.get("accepted_at"), str))
+                    or watch.get("session_id") != self.owners()[provider]["session_id"] or watch.get("turn_id") != delivery.get("turn_id")):
+                raise QuotaError("startup telemetry allowance has an invalid delivery/session binding")
+        try:
+            snapshot = self.quota(provider)
+        except QuotaError:
+            if (watch is None or watch["usable_seen"] or state.get("quota_wait") or state.get("interrupted_delivery")
+                    or state.get("deferred_anomaly") or str(delivery.get("kind", "")).startswith("continuation:reconcile")):
+                raise
+            snapshot = self.quota(provider, allow_empty=True)
+            if not snapshot.windows:
+                if (snapshot.fetched_at is None or snapshot.fetched_at > self.clock() + 60 or snapshot.window_source == "windows"):
+                    raise QuotaError("startup telemetry is no longer a valid scoped UNKNOWN snapshot")
+                return ()  # no positive quota claim, no input and no cleared refusal
+        if watch is not None and snapshot.windows and not watch["usable_seen"]:
+            watch["usable_seen"] = True
+            self.store.write_state(state)
+        return blocking_windows(snapshot, self.clock())
+
+    def _claude_pending_work(self, state: dict[str, Any], provider: str, delivery: dict[str, Any]) -> Any:
+        """Turn-bound native lifecycle supplement only where a supported cursor was captured."""
+        if (provider != "claude" or state.get("workflow_policy") not in V2_WORKFLOW_POLICIES
+                or delivery.get("agent") != provider or not isinstance(delivery.get("native_cursor"), dict)
+                or not (delivery.get("status") == "accepted" or isinstance(delivery.get("accepted_at"), str))):
+            return nr.ClaudeJobs("clear", "no supported accepted Claude cursor; existing lifecycle/result checks remain authoritative")
+        root = self._native_roots().get(provider)
+        if root is None:
+            return nr.ClaudeJobs("unknown", "Claude native root is unavailable")
+        return nr.claude_background_status(self.owners()[provider]["session_id"], state["run_id"], delivery["turn_id"],
+                                           root=root, cursor=delivery["native_cursor"])
+
     def quota_refresh_command(self, provider: str) -> list[str] | None:
         ref = (self.config.get("quota_refresh_commands") or {}).get(provider)
         if ref is None:
@@ -691,7 +744,45 @@ class Supervisor(SupervisorV2Mixin):
 
     # ----- native session ownership
 
+    def session_pair_binding(self) -> dict[str, Any] | None:
+        """The named pair every owner resolution must use now, or None for the legacy global owners.
+
+        Order: a start in progress (`pair_scope`), else the immutable binding persisted in the CURRENT NON-TERMINAL run. A terminal run
+        releases its binding (its snapshot stays in the state/history), so legacy flows resolve the global owners again. Nothing here reads
+        the mutable registry, configuration or aliases: a run's targets cannot be retargeted after it started."""
+        if self._pair_scope is not None:
+            return self._pair_scope
+        try:
+            stat = self.paths.state_file.stat()
+        except OSError:
+            return None
+        key = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        if self._pair_cache is None or self._pair_cache[0] != key:
+            state = self.store.read_state(required=False)
+            binding = state.get("session_pair") if isinstance(state, dict) and state.get("supervisor_state") not in TERMINAL_STATES else None
+            self._pair_cache = (key, hp.validate_binding(binding) if binding is not None else None)
+        return self._pair_cache[1]
+
+    @contextlib.contextmanager
+    def pair_scope(self, binding: dict[str, Any] | None) -> Any:
+        """Resolve every owner lookup through `binding` for the duration of one start (the run is not persisted yet)."""
+        previous = self._pair_scope
+        self._pair_scope = None if binding is None else hp.validate_binding(binding)
+        self._live_names.clear()
+        try:
+            yield
+        finally:
+            self._pair_scope = previous
+            self._live_names.clear()
+
     def owners(self) -> dict[str, dict[str, str]]:
+        binding = self.session_pair_binding()
+        if binding is not None:
+            return {provider: dict(binding["identities"][provider]) for provider in PROVIDERS}
+        return self.global_owners()
+
+    def global_owners(self) -> dict[str, dict[str, str]]:
+        """The installation-wide legacy `owners.json`, regardless of any named pair (also the split source when creating a new pair)."""
         value = load_json(self.paths.owners_file, label="native session ownership (owners.json)")
         if not isinstance(value, dict):
             raise SupervisorError("owners.json must be an object")
@@ -710,7 +801,8 @@ class Supervisor(SupervisorV2Mixin):
         if not required_providers or any(p not in PROVIDERS for p in required_providers):
             raise SupervisorError("invalid required startup providers")
         live_agents = self.herdr.list_agents()
-        existing = self.owners() if self.paths.owners_file.exists() else None
+        named = self.session_pair_binding() is not None  # a named pair is verified, never seeded: nothing here writes owners.json for it
+        existing = self.owners() if (named or self.paths.owners_file.exists()) else None
         resolved: dict[str, dict[str, str]] = {}
         for provider in PROVIDERS:
             if existing is not None and provider not in required_providers:
@@ -735,7 +827,7 @@ class Supervisor(SupervisorV2Mixin):
                         raise SupervisorError(
                             f"{name} is still working in its recorded pane and Herdr temporarily omitted its native identity; retry Start Task after that turn settles"
                         )
-                    aliases = [item for item in live_agents if item.get("name") == name]
+                    aliases = [] if named else [item for item in live_agents if item.get("name") == name]  # a saved pair is never matched by a configured alias
                     if len(aliases) == 1:
                         alias_identity = session_identity(aliases[0])
                         if alias_identity and alias_identity != expected:
@@ -813,7 +905,7 @@ class Supervisor(SupervisorV2Mixin):
                                       provider=provider, classification="duplicate", session_id=expected, recorded_pane=recorded_pane, live_panes=carriers)
         if identity.provider_conflicts:
             raise SupervisorError(f"the live record for native session {expected[:8]} is not a {provider} agent; refusing")
-        by_alias = [agent for agent in agents if agent.get("name") == alias]
+        by_alias = [] if self.session_pair_binding() is not None else [agent for agent in agents if agent.get("name") == alias]  # aliases belong to the legacy pair
         if identity.record is None:
             if len(by_alias) == 1 and session_identity(by_alias[0]) not in (None, expected):
                 raise SupervisorError(f"{alias} native session {session_identity(by_alias[0])} differs from recorded {expected}; refusing to silently adopt a different conversation")
@@ -887,24 +979,44 @@ class Supervisor(SupervisorV2Mixin):
         except (SupervisorError, KeyError, OSError):
             return None
 
+    @staticmethod
+    def _stalled_delivery(delivery: Any) -> bool:
+        """A registered ambiguous submission, never a known rejection or arbitrary policy failure."""
+        return (isinstance(delivery, dict) and not isinstance(delivery.get("accepted_at"), str) and delivery.get("error_code") in ("timeout", "agent_prompt_stalled")
+                and (delivery.get("status") == "uncertain" or
+                     (delivery.get("status") == "completed" and delivery.get("outcome") == "rejected_by_policy" and not delivery.get("accepted_at"))))
+
     def collect_routing_result(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], *, purpose: str) -> tuple[ProtocolBlock | None, str, Any]:
         """Terminal first (the supported path, unchanged). Only when it holds no valid current frame for an accepted V2 turn is the exact
         primary session's native transcript consulted, read-only and bounded. Returns (block-from-terminal, terminal output, NativeResult|None).
         Raw quota screens and follow-up answers never come through here."""
         output = self.read_output(provider, settled=True)
-        block = parse_protocol(output, state["run_id"], delivery["turn_id"])
-        if block is not None:
+        pane_frame_allowed = True
+        snapshot_native = None
+        use_snapshot = provider == "codex" and self.codex_child_guard_enabled
+        if use_snapshot:
+            # ONE decision: verification, the spawn policy AND the native frame extraction share one evidence snapshot and one allowance (no second lookup budget)
+            checked, verdict = self._codex_child_check(provider, route=(state["run_id"], delivery["turn_id"]), native_always=True)
+            if checked.kind != "clear":
+                raise SupervisorError(f"{self.agent_name(provider)} child-settlement guard did not clear ({checked.kind}: {checked.detail}); nothing was routed or resent")
+            pane_frame_allowed = not (verdict is not None and verdict.spawned)      # after a spawn only the verified primary native frame can route
+            snapshot_native = verdict.native if verdict is not None else None
+        block = parse_protocol(output, state["run_id"], delivery["turn_id"]) if pane_frame_allowed else None
+        if block is not None and purpose != "retry_stalled":
             return block, output, None
         # Accepted = the prompt was confirmed delivered at some point (`accepted_at` survives the later `completed/rejected_by_policy` marking
-        # of a missing-result wait, which is exactly when the explicit retry runs). An uncertain delivery that was never confirmed stays closed.
+        # of a missing-result wait, which is exactly when the explicit retry runs). An ambiguous timeout/stall may be reconciled only by its exact primary native final after fresh settlement checks.
         accepted = delivery.get("status") == "accepted" or isinstance(delivery.get("accepted_at"), str)
-        if state.get("workflow_policy") not in V2_WORKFLOW_POLICIES or not accepted or delivery.get("agent") != provider:
+        if state.get("workflow_policy") not in V2_WORKFLOW_POLICIES or not (accepted or self._stalled_delivery(delivery)) or delivery.get("agent") != provider:
             return None, output, None
         try:
             session_id = self.owners()[provider]["session_id"]
         except (SupervisorError, KeyError):
             return None, output, None
-        native = nr.resolve(provider, session_id, state["run_id"], delivery["turn_id"], roots=self._native_roots(), cursor=delivery.get("native_cursor"))
+        if use_snapshot:
+            native = snapshot_native or nr.NativeResult(nr.UNCERTAIN, "the verified decision snapshot carries no native result")
+        else:
+            native = nr.resolve(provider, session_id, state["run_id"], delivery["turn_id"], roots=self._native_roots(), cursor=delivery.get("native_cursor"))
         self._log(state, "native_result_lookup", agent=provider, turn_id=delivery["turn_id"], purpose=purpose, status=native.status, reason=native.reason[:200],
                   records=native.provenance.get("records"), scanned_bytes=native.provenance.get("scanned_bytes"), cursor_used=native.provenance.get("cursor_used"))
         return None, output, native
@@ -993,6 +1105,8 @@ class Supervisor(SupervisorV2Mixin):
             return SettleResult("hold", "lifecycle working")
         if status not in READY_STATES:
             return SettleResult("unknown", f"lifecycle {status!r}")
+        if provider == "codex":
+            return self._codex_child_check(provider)[0]      # idle/done is supplementary: a fresh child decision immediately before routing
         return SettleResult("clear", "lifecycle settled")
 
     def _accept_native_block(self, state: dict[str, Any], provider: str, delivery: dict[str, Any], native: Any, *, purpose: str) -> ProtocolBlock | None:
@@ -1003,6 +1117,17 @@ class Supervisor(SupervisorV2Mixin):
                 if earlier.get("frame_sha256") != native.provenance.get("frame_sha256"):
                     raise SupervisorError("a different native routing frame was already recovered for this turn; refusing to route a second one")
                 return None  # already recovered and routed once: duplicate callback/restart creates nothing
+        if self._stalled_delivery(delivery):
+            if not native.recoverable or native.block is None or native.block.run_id != state["run_id"] or native.block.turn_id != delivery["turn_id"]:
+                raise SupervisorError("stalled delivery requires an exact primary native final before acceptance")
+            # The provider's own exact prompt->primary-final attribution, plus the caller's fresh settlement
+            # recheck, reconciles the ambiguous acknowledgement. A missing/partial/conflicting result never does.
+            delivery["accepted_at"] = iso_utc(self.clock())
+            delivery["accepted_via"] = "native_primary_final"
+            if "outcome" in delivery:
+                delivery["previous_outcome"] = delivery.pop("outcome")
+            delivery["status"] = "accepted"
+            self._log(state, "prompt_accepted_by_native_final", agent=provider, turn_id=delivery["turn_id"])
         recoveries.append({"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"], "agent": provider, "purpose": purpose,
                            "at": iso_utc(self.clock()), **{k: v for k, v in native.provenance.items() if k in ("provider", "dev", "ino", "offset_start", "offset_end", "record_offset", "record_id", "message_sha256", "frame_sha256", "cursor_used", "eligible_finals")}})
         del recoveries[:-20]
@@ -1018,6 +1143,71 @@ class Supervisor(SupervisorV2Mixin):
     @staticmethod
     def settle_applies(provider: str) -> bool:
         return provider == "claude"
+
+    # ----- Codex child-settlement guard (one common predicate for every delivery, result-read, key and route consumer)
+
+    def _codex_child_check(self, provider: str, *, route: tuple[str, str] | None = None, native_always: bool = False) -> tuple[SettleResult, "cc.Verdict | None"]:
+        """ONE fresh decision for the exact owned Codex parent (never cached: every consumer re-reads, so an earlier clear carries no authority).
+        Read-only; sends nothing, closes nothing, interrupts nothing. The same predicate backs `codex_child_status` (diagnostics)."""
+        if not self.codex_child_guard_enabled:
+            return SettleResult("clear", "codex child guard disabled by the test-only seam"), None
+        try:
+            self._guard_agent(provider)
+            session = self.owners()[provider]["session_id"]
+        except (SupervisorError, HerdrError, KeyError) as error:
+            return SettleResult("identity", str(error), error), None
+        for attempt in range(3):
+            verdict = cc.verify(session, self._native_roots().get("codex"), clock=self.clock, route=route, native_always=native_always)
+            transient = verdict.kind == cc.UNKNOWN and verdict.detail.startswith((
+                "the bounded native work exceeded ", "the native transcript grew from ",
+                "an evidence file changed after it was read (extent drift)",
+                "the rollout namespace changed while the decision was made (relationship-set drift)"))
+            if not transient or attempt == 2:
+                break
+            self.sleeper(1.0)
+            try:
+                _target, current = self._guard_agent(provider)
+            except (SupervisorError, HerdrError) as error:
+                return SettleResult("identity", str(error), error), None
+            if current.get("agent_status") not in READY_STATES:
+                return SettleResult("hold", "lifecycle changed during bounded native consistency retry"), None
+
+        return SettleResult(_CODEX_GUARD_KINDS[verdict.kind], f"codex child guard {verdict.kind}: {verdict.detail}"[:400]), verdict
+
+    def _codex_settle(self, state: dict[str, Any], provider: str, purpose: str, *, wait: bool, patience: float | None, control: bool) -> SettleResult:
+        """The Codex branch of `settle_guard`: clear (transparent or verified), hold (pending child; bounded), or a stop kind. Never reads/routes/sends."""
+        started = self.clock()
+        key = (str(state.get("run_id")), str((state.get("delivery") or {}).get("turn_id")), purpose)
+        while True:
+            if control and not self.check_control(state):
+                return SettleResult("stop", "control request")
+            result, verdict = self._codex_child_check(provider)
+            now = self.clock()
+            if result.kind == "clear":
+                self._codex_hold.pop(key, None)
+                if verdict is not None and verdict.kind == cc.COMPLETE:
+                    self._log(state, "codex_child_guard_cleared", purpose=purpose, child=str(verdict.evidence.get("child"))[:36])
+                return result
+            if result.kind != "hold":
+                self._codex_hold.pop(key, None)
+                self._log(state, "codex_child_guard_stopped", purpose=purpose, kind=result.kind, detail=result.detail[:200])
+                return result
+            since = self._codex_hold.setdefault(key, now)
+            if now - since >= CODEX_CHILD_HOLD_PATIENCE_SECONDS:
+                self._codex_hold.pop(key, None)
+                self._log(state, "codex_child_guard_patience", purpose=purpose, detail=result.detail[:200])
+                return SettleResult("patience", f"a child has stayed pending for {CODEX_CHILD_HOLD_PATIENCE_SECONDS:.0f}s ({result.detail})")
+            if not wait:
+                self.sleeper(CODEX_CHILD_SAMPLE_SECONDS)
+                return result
+            if patience is not None and now - started >= patience:
+                return SettleResult("patience", f"the child guard did not clear after {patience:.0f}s ({result.detail})")
+            self.sleeper(CODEX_CHILD_SAMPLE_SECONDS)
+
+    def codex_child_status(self) -> dict[str, Any]:
+        """Diagnostics: the SAME predicate the guard uses (one fresh decision), reduced to metadata."""
+        result, verdict = self._codex_child_check("codex")
+        return {"guard": result.kind, "detail": result.detail, "verdict": getattr(verdict, "kind", None), "evidence": dict(getattr(verdict, "evidence", {}) or {})}
 
     @staticmethod
     def _guard_requires_action(state: dict[str, Any]) -> bool:
@@ -1062,6 +1252,8 @@ class Supervisor(SupervisorV2Mixin):
         """Sampled quiet window (CLAUDE_QUIET_WINDOW_SECONDS, samples never more than CLAUDE_MAX_SAMPLE_GAP_SECONDS apart) in a settled
         idle/done lifecycle with no working evidence. wait=False returns "hold" after one paced sample so the caller's deterministic loop
         decides; wait=True keeps sampling (optionally up to `patience` seconds). Never reads, routes or sends anything itself."""
+        if provider == "codex":
+            return self._codex_settle(state, provider, purpose, wait=wait, patience=patience, control=control)
         if not self.settle_applies(provider):
             return SettleResult("clear", "guard applies to Claude pane runs only")
         started = self.clock()
@@ -1101,6 +1293,8 @@ class Supervisor(SupervisorV2Mixin):
     def _background_indicator_check(self, provider: str) -> SettleResult:
         """Immediate recheck before a key is sent to a blocked Claude pane: exact identity plus no matched background-child indicator rule.
         (A blocked screen is not a quiet idle screen, so the quiet window does not apply to keys.)"""
+        if provider == "codex":
+            return self._codex_child_check(provider)[0]      # a key is input: it needs a fresh clear child decision too
         if not self.settle_applies(provider):
             return SettleResult("clear", "guard applies to Claude pane runs only")
         try:
@@ -1131,6 +1325,15 @@ class Supervisor(SupervisorV2Mixin):
             return self._identity_stop(state, guard.error or SupervisorError(guard.detail), f"cannot safely inspect {name}: {guard.detail}")
         if guard.kind == "blocked":
             return self.handle_blocked(state, provider, sent=sent)
+        if provider == "codex":
+            return self.set_wait_user(
+                state,
+                f"{name} child-settlement guard did not clear, so the supervisor did not {action} ({guard.kind}: {guard.detail}); nothing was read, routed, sent, interrupted or closed. "
+                f"Run {state.get('run_id')}; pair {(state.get('session_pair') or {}).get('name', 'unpaired')}; owned Codex session {(state.get('native_sessions') or {}).get('codex', 'unknown')}. "
+                "Inspect the parent's native transcript; `herdr-supervisor resume` re-reads it (the same stop repeats while the cause remains), or revise/cancel the run. "
+                "A history-size stop needs a separately reviewed capacity change; clearing a pane or retrying alone does not shrink native history.",
+                requires_action=guard.kind == "violation",
+            )
         return self.set_wait_user(
             state,
             f"{name} did not reach a quiet settled state, so the supervisor did not {action} ({guard.kind}: {guard.detail}); "
@@ -1251,6 +1454,14 @@ class Supervisor(SupervisorV2Mixin):
             "prepared_at": iso_utc(self.clock()),
             "native_cursor": self._native_cursor(state["active_agent"]),
         }
+        if state["active_agent"] == "claude":
+            snapshot = self.quota("claude", allow_empty=True)
+            if not snapshot.windows:
+                if state.get("deferred_anomaly") or kind.startswith("continuation:reconcile"):
+                    raise QuotaError("unknown startup telemetry cannot authorize reconciliation")
+                self.startup_blocking_windows(state, "claude")  # existing strict scoped-empty admission rule
+                state["delivery"]["claude_startup_unknown"] = {"session_id": self.owners()["claude"]["session_id"],
+                                                               "turn_id": turn_id, "usable_seen": False}
         # Exactly-once accounting: it lives in the same durable write as the delivery record, so a
         # restart that reuses this record never counts the prompt again.
         metrics = state.setdefault("prompt_metrics", new_v2_fields("v1")["prompt_metrics"])
@@ -1266,6 +1477,11 @@ class Supervisor(SupervisorV2Mixin):
     def submit(self, state: dict[str, Any], kind: str) -> str:
         provider = state["active_agent"]
         name = self.agent_name(provider)
+        if kind == "initial" and isinstance(state.get("session_pair"), dict):
+            # First delivery to a named pair: the frozen pair must still be exactly present and BOTH members settled (no substitution, nothing sent otherwise).
+            problems = hp.live_problems(self.herdr.list_agents(), state["session_pair"]["identities"], settled=True)
+            if problems:
+                return self.set_wait_user(state, f"named pair {state['session_pair']['name']!r} is not exactly present and settled before the first delivery: " + "; ".join(problems) + ". Nothing was sent; restore the original sessions, then /resume")
         guard = self.settle_guard(state, provider, "deliver_prompt", wait=True, patience=120.0)
         if guard.kind != "clear":
             return self._guard_stop(state, provider, guard, sent=False, action="deliver the prompt")
@@ -1332,7 +1548,49 @@ class Supervisor(SupervisorV2Mixin):
 
     # ----- routing
 
+    def _codex_route_fence(self, state: dict[str, Any], block: ProtocolBlock) -> str | None:
+        """The ONE fence for every final routing entry (`route`, and `route_v2` called directly). None = the transition may proceed. A fresh decision (exact ownership,
+        stable evidence) must clear; after a verified spawn the supplied block must ALSO be exactly the owned primary's eligible native final for its run/turn,
+        extracted from the same evidence snapshot: a pane, child or caller-supplied frame (or a previously valid but changed one) never authorizes a transition."""
+        if state.get("active_agent") != "codex" or not self.codex_child_guard_enabled:
+            return None
+        if self._route_nested is block:      # the nested route() -> route_v2 hop of ONE active invocation: route() cleared exactly this block moments ago
+            return None
+        delivery = state.get("delivery")
+        authoritative = (state.get("run_id"), delivery.get("turn_id")) if isinstance(delivery, dict) else (state.get("run_id"), None)
+        # the native lookup is bound to the AUTHORITATIVE current run/delivery, never to whatever run/turn the supplied block claims (a missing delivery has no
+        # authoritative turn: the decision still runs, and after a verified spawn the binding check below refuses)
+        auth_run, auth_turn = authoritative
+        lookup = (auth_run, auth_turn) if isinstance(auth_run, str) and auth_run and isinstance(auth_turn, str) and auth_turn else (block.run_id, block.turn_id)
+        fence, verdict = self._codex_child_check("codex", route=lookup)
+        if fence.kind != "clear":
+            return self._guard_stop(state, "codex", fence, sent=True, action="route the result")
+        if verdict is not None and verdict.spawned:
+            accepted = isinstance(delivery, dict) and delivery.get("agent") == "codex" and (delivery.get("status") == "accepted" or isinstance(delivery.get("accepted_at"), str))
+            if not accepted or (block.run_id, block.turn_id) != authoritative:
+                return self._guard_stop(state, "codex", SettleResult("unknown", "codex child guard: the frame to route is not bound to the current run and accepted Codex delivery "
+                                                                    f"(frame {str(block.run_id)[:8]}/{str(block.turn_id)[:8]}, delivery {str(authoritative[0])[:8]}/{str(authoritative[1])[:8]})"),
+                                        sent=True, action="route the result")
+            native = verdict.native
+            same = native is not None and native.recoverable and all(getattr(native.block, field) == getattr(block, field) for field in
+                                                                    ("version", "stage", "next_agent", "handoff", "gate", "payload", "run_id", "turn_id"))
+            if not same:
+                why = "no eligible native final" if native is None or not native.recoverable else "it differs from the native final"
+                return self._guard_stop(state, "codex", SettleResult("unknown", f"codex child guard: the frame to route is not the owned primary's eligible native final ({why})"),
+                                        sent=True, action="route the result")
+        return None
+
     def route(self, state: dict[str, Any], block: ProtocolBlock) -> str:
+        stop = self._codex_route_fence(state, block)
+        if stop is not None:
+            return stop
+        self._route_nested = block      # valid ONLY while this invocation runs; every exit, including an exception, clears it
+        try:
+            return self._route_fenced(state, block)
+        finally:
+            self._route_nested = None
+
+    def _route_fenced(self, state: dict[str, Any], block: ProtocolBlock) -> str:
         anomaly = state.get("deferred_anomaly")
         if isinstance(anomaly, dict) and anomaly.get("continuation") == "submitted":
             anomaly["continuation"] = "resolved"
@@ -1393,7 +1651,7 @@ class Supervisor(SupervisorV2Mixin):
                 # LLM is awakened. The quota snapshot (a local file) is the only thing checked; only a
                 # blocking snapshot counts as a transition worth reading the visible screen for.
                 try:
-                    blocking = blocking_windows(self.quota(provider), self.clock())
+                    blocking = self._working_blocking_windows(state, provider, delivery)
                 except QuotaError as error:
                     return self.set_wait_user(state, f"quota evidence for {provider} is unsafe: {error}")
                 if blocking:
@@ -1451,6 +1709,18 @@ class Supervisor(SupervisorV2Mixin):
                     return self.set_wait_user(state, f"the native routing result for turn {delivery['turn_id']} was already recovered once; nothing was routed twice", requires_action=True)
             if block is not None:
                 return self.route(state, block)
+            jobs = self._claude_pending_work(state, provider, delivery)
+            if jobs.kind in ("pending", "awaiting_final", "retry"):
+                self._log(state, "claude_background_wait", turn_id=delivery["turn_id"], kind=jobs.kind, tasks=list(jobs.tasks), detail=jobs.detail[:200])
+                self.sleeper(CLAUDE_SAMPLE_SLEEP_SECONDS)
+                continue  # controller wait only: no prompt, frame, quota inference or model wake-up
+            if jobs.kind != "clear":
+                state["missing_result"] = {"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"],
+                                           "agent": provider, "attempts": 0, "created_at_unix": self.clock(),
+                                           "background_lifecycle": {"kind": jobs.kind, "detail": jobs.detail[:300]}}
+                if native is not None:
+                    state["missing_result"]["native"] = {"status": native.status, "reason": native.reason[:300]}
+                return self.set_wait_user(state, f"{name} native background lifecycle is unverified: {jobs.detail}; nothing was resent." + self._native_note(native), requires_action=True)
             # Settled without a matching block (Herdr `done` is never semantic success). A reconciliation
             # turn that fails again is a hard stop: no automatic retry.
             if str(delivery.get("kind", "")).startswith("continuation:reconcile"):
@@ -1468,10 +1738,22 @@ class Supervisor(SupervisorV2Mixin):
                 delivery.get("status") == "uncertain" and isinstance(delivery.get("accepted_at"), str)
             )
             if strict and not accepted:
+                if self._stalled_delivery(delivery):
+                    since = delivery.get("settlement_pending_since")
+                    if not isinstance(since, (int, float)):
+                        since = self.clock()
+                        delivery["settlement_pending_since"] = since
+                        self._log(state, "stalled_delivery_settlement_wait", agent=provider, turn_id=delivery["turn_id"])
+                        self.store.write_state(state)
+                    if self.clock() - since < 60.0:
+                        self.sleeper(min(2.5, 60.0 - (self.clock() - since)))
+                        continue  # one bounded observation episode; never resubmit or infer quota from an unaccepted delivery
+                    state["missing_result"] = {"schema_version": 1, "run_id": state["run_id"], "turn_id": delivery["turn_id"],
+                                               "agent": provider, "attempts": 0, "created_at_unix": self.clock()}
                 return self.set_wait_user(
                     state,
                     f"{name} settled ({status}) without a protocol block, but delivery was never confirmed accepted; "
-                    "quota cannot explain uncertain delivery and nothing was resent.",
+                    "quota cannot explain uncertain delivery and nothing was resent. Use the bound routing-result retry after the turn settles.",
                     requires_action=True,
                 )
             self.refresh_quota(state, provider)
@@ -1745,8 +2027,17 @@ class Supervisor(SupervisorV2Mixin):
                 if guard.kind != "clear":
                     return self._guard_stop(state, provider, guard, sent=True, action="read the result after the quota wait")
                 try:
-                    output = self.read_output(provider, settled=True)
-                    block = parse_protocol(output, state["run_id"], delivery["turn_id"])
+                    if provider == "codex":
+                        # guard-aware choke point: after a spawn only the verified primary native frame can route (never the pane-first parse)
+                        block, output, native = self.collect_routing_result(state, provider, delivery, purpose="post_quota")
+                        if block is None and native is not None and native.recoverable:
+                            checked = self._settlement_recheck(state, provider)
+                            if checked.kind != "clear":
+                                return self._guard_stop(state, provider, checked, sent=True, action="route the recovered native result after the quota wait")
+                            block = self._accept_native_block(state, provider, delivery, native, purpose="post_quota")
+                    else:
+                        output = self.read_output(provider, settled=True)
+                        block = parse_protocol(output, state["run_id"], delivery["turn_id"])
                 except HerdrError as error:
                     return self.set_wait_user(state, f"cannot read {name} after the quota wait: {error}")
                 except SupervisorError as error:
@@ -1791,7 +2082,7 @@ class Supervisor(SupervisorV2Mixin):
             if budget>0 and (not isinstance(fingerprint,str) or not re.fullmatch(r"[0-9a-f]{64}",fingerprint)):
                 raise SupervisorError("positive Codex reset budget requires a verified account identity")
 
-    def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None) -> dict[str, Any]:
+    def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None, session_pair: dict[str, Any] | None = None) -> dict[str, Any]:
         self._validate_new_run_request(task,start,workflow_policy,char_limit,codex_reset_authorization)
         existing = self.store.read_state(required=False)
         if existing and existing.get("supervisor_state") not in TERMINAL_STATES:
@@ -1799,7 +2090,27 @@ class Supervisor(SupervisorV2Mixin):
                 f"task {existing.get('task_id')} is still {existing.get('supervisor_state')}; "
                 "use `resume` to continue it or `cancel` before starting another task"
             )
-        owners = self.verify_or_seed_owners((start,))
+        if session_pair is None and validate_selection(self.config, session_selection).get("pair") is not None:
+            raise SupervisorError("a pair selection starts only through the supervisor task flow, which binds the pair before the run exists")
+        if session_pair is not None:
+            # The binding is the run's immutable pair; the pending boundary and exact live identities are re-proved here under the caller's locks.
+            session_pair = hp.validate_binding(session_pair)
+            selected = validate_selection(self.config, session_selection)
+            if (selected.get("pair") or {}).get("mode") is None:
+                raise SupervisorError("a named pair run requires a pair selection")
+            live = self.herdr.list_agents()
+            problem = pair_switch_problem(self.paths, existing, live, own_preparation_id=run_id)
+            if problem is not None:
+                raise SupervisorError(f"cannot start on a named pair: {problem}")
+            hp.check_context(self.config, session_pair["context"])  # a NEW run needs the context to be administrator-authorized and canonical now
+            problems = hp.live_problems(live, session_pair["identities"], settled=True)
+            if problems:
+                raise SupervisorError("cannot start on the named pair " + repr(session_pair["name"]) + ": " + "; ".join(problems) + ". Nothing was sent, launched, renamed or rebound.")
+        if session_pair is not None:
+            with self.pair_scope(session_pair):
+                owners = self.verify_or_seed_owners((start,))
+        else:
+            owners = self.verify_or_seed_owners((start,))
         if run_id is not None and (not isinstance(run_id, str) or not _UUID_RE.fullmatch(run_id)):
             raise SupervisorError("preallocated run id is invalid")
         run_id = run_id or str(uuid.uuid4())
@@ -1827,6 +2138,10 @@ class Supervisor(SupervisorV2Mixin):
         }
         state["session_selection"] = validate_selection(self.config, session_selection)
         state["session_preparation"] = preparation_view(session_preparation)
+        if session_pair is not None:
+            state["session_pair"] = session_pair
+        if isinstance(existing, dict) and (session_pair is not None or existing.get("session_pair") is not None):
+            hp.preserve_terminal_snapshot(self.paths, existing)  # the single current state is about to be replaced: keep the finished named run by its id
         if codex_reset_authorization is not None:
             budget = codex_reset_authorization.get("budget")
             available = codex_reset_authorization.get("available_count")
@@ -2315,6 +2630,11 @@ class Supervisor(SupervisorV2Mixin):
             if state_for_runtime and (state_for_runtime.get("runtime_policy") or {}).get("runtime_validation_required"):
                 report["warnings"].append(f"product repository HEAD is unavailable at {repo}; exact-SHA runtime evidence cannot be recorded until it is")
         report["subagent_roles"] = self.role_readiness_report(live_agents, owners)
+        if isinstance(owners, dict) and "codex" in owners:      # diagnostics use the SAME predicate as the guard (read-only; metadata only)
+            try:
+                report["codex_child_guard"] = self.codex_child_status()
+            except Exception as error:  # noqa: BLE001 - a diagnostic must never fail the doctor
+                report["codex_child_guard"] = {"guard": "unavailable", "detail": type(error).__name__}
         claude_roles = report["subagent_roles"]["claude"]
         if claude_roles["definitions"]["status"] == "installed" and claude_roles["selectability"]["status"] == "UNKNOWN":
             report["warnings"].append("claude role definitions are installed but their selectability in the running parent session is UNKNOWN (files and menus do not prove it)")
@@ -2395,8 +2715,21 @@ class Supervisor(SupervisorV2Mixin):
         """Per provider: definitions installed, the parent's exact session and version, operator observations (bound, never authority) and
         selectability (UNKNOWN unless a current operator observation exists). Read-only: no agent is invoked and no ownership changes."""
         observations = rr.load_observations(self.paths.state_dir / "role_observations.json")
-        report: dict[str, Any] = {"codex": {"status": "not_applicable", "detail": "Codex subagents remain disabled by policy; nothing is reported as available",
-                                           "limitations": list(rr.LIMITATIONS)}}
+        codex_parent = None
+        codex_note = None
+        try:
+            _target, codex_agent = self._guard_agent("codex", live_agents=live_agents)
+            codex_parent = session_identity(codex_agent)
+        except (SupervisorError, HerdrError) as error:
+            codex_note = str(error)[:240]
+        report: dict[str, Any] = {"codex": {
+            "status": "guarded_opt_in",
+            "detail": "Only repository_explorer (Luna/max) or repository_reviewer (Sol/high) is eligible after exact-parent callable pickup and explicit session authorization; definition presence is not activation.",
+            "definitions": rr.installed_definitions(Path.home() / ".codex" / "agents", pattern="*.toml"),
+            "parent": {"session_id": codex_parent, "identity_note": codex_note},
+            "selectability": {"status": "UNKNOWN", "basis": "this report does not inspect the current parent's callable schema"},
+            "limitations": ["supervisor routing/delivery fence only; cannot prevent native spawn or spend", "one helper total per native parent lifetime; complete-history bounds apply"],
+        }}
         # The parent is "verified" only by the control path's own predicate (exact owned session, recorded pane, no duplicate carrier, no moved/changed
         # identity); anything else is unverified and never restarts, rebinds or repairs anything.
         verified: str | None = None
@@ -2418,7 +2751,7 @@ class Supervisor(SupervisorV2Mixin):
     def record_role_observation(self, provider: str, kind: str, roles: Any, actor: str) -> dict[str, Any]:
         """Operator evidence, bound to the exact live owned session and the provider version read now. Never an invocation and never authority."""
         if provider != "claude":
-            raise SupervisorError("role observations are only recorded for claude (Codex subagents are disabled)")
+            raise SupervisorError("operator role observations are only recorded for claude; Codex requires native callable and transcript evidence")
         _target, agent = self._guard_agent(provider)  # exact identity, never restored
         session = session_identity(agent)
         if session is None:
@@ -2491,6 +2824,7 @@ class Supervisor(SupervisorV2Mixin):
             "event_sequence": state.get("event_sequence") if state else None,
             "native_sessions_abbrev": {k: str(v)[:8] for k, v in (state.get("native_sessions") or {}).items()} if state else None,
             "session_selection": state.get("session_selection") if state else None,
+            "session_pair": state.get("session_pair") if state else None,
             "session_preparation": state.get("session_preparation") if state else None,
             "startup_waits": [],
             "agents": {},

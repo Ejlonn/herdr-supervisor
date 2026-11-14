@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+import herdr_pairs as hp
 import herdr_startup as hst
 from herdr_cli import match_exact_session, session_identity
 from herdr_core import (
@@ -75,6 +76,89 @@ from herdr_validation import (
 )
 
 
+def pair_switch_problem(paths: Any, state: dict[str, Any] | None, live_agents: list[dict[str, Any]], *, own_preparation_id: str | None = None) -> str | None:
+    """The ONE old-run / old-pair boundary proof for selecting a named pair (read-only; used by the Telegram card, the supervisor start, a fresh creation
+    before anything is reserved or created, and `initialize`).
+
+    Refuses unless: there is no current run, or it is DONE/CANCELLED with its worker released and nothing unresolved (delivery, recovery, follow-up,
+    reset, open startup wait, another unresolved session preparation); AND every native session the previous run used that is still live is positively
+    settled (idle/done, one carrier). Cancellation alone is not enough while a native turn still works, and nothing here interrupts an old session: the
+    message says how the boundary becomes settled."""
+    problem = hp.terminal_boundary_problem(state)
+    if problem is not None:
+        return problem + "; finish or cancel it and let its worker exit, then select the pair again"
+    if state is not None and isinstance(state.get("run_id"), str):
+        if hst.list_waits(paths, run_id=state["run_id"], statuses=hst.OPEN_STATUSES):
+            return "the previous task still has an open startup wait; continue or cancel it first"
+    if paths.session_preparations_dir.exists():
+        for other in sorted(paths.session_preparations_dir.glob("*.json")):
+            if other.stem == own_preparation_id:
+                continue
+            prior = load_json(other, label="session preparation")
+            if not isinstance(prior, dict) or prior.get("status") not in ("TASK_STARTED", "ABANDONED"):
+                return f"session preparation {other.stem[:8]} is unresolved; resolve or abandon it (`herdr-supervisor abandon-session-start --preparation-id {other.stem}`) first"
+    recorded = _previous_panes(paths, state)
+    for provider, session in sorted(((state or {}).get("native_sessions") or {}).items()):
+        if provider not in PROVIDERS or not isinstance(session, str):
+            continue
+        match = match_exact_session(live_agents, provider, session)
+        if match.ambiguous or match.provider_conflicts:
+            return f"the previous task's {provider} session {session[:8]} is not uniquely identifiable; restore it before switching"
+        if match.record is not None and match.record.get("agent_status") not in READY_STATES:
+            return (f"the previous task's {provider} session {session[:8]} is still {match.record.get('agent_status')!r}; "
+                    "wait for its turn to finish (nothing is interrupted for you), then select the pair again")
+        if match.record is None:
+            # Exact identity is ABSENT in the live list. That proves absence only if nothing in the pane the previous run recorded could still BE that session:
+            # a carrier there with an omitted identity (Herdr drops the field while a turn works), or a different identity that is not settled, is uncertainty
+            # about an old native turn, never a settled or closed session. Nothing is adopted, relabelled or interrupted to clear this.
+            pane = recorded.get(provider)
+            if pane is None:
+                # No trustworthy locator for the old session (a legacy run's owners.json is unreadable, no longer names this native session, or has no entry): the
+                # old pane is unknown, so absence can be established only if NO live agent of that kind lacks an identity — any of them could be the old session.
+                # The mutable global owner file is never adopted as the old run's record.
+                for carrier in live_agents:
+                    if carrier.get("agent") == provider and session_identity(carrier) is None:
+                        return (f"the previous task's {provider} session {session[:8]} has no live record and its recorded pane cannot be established, while a {provider} agent in pane "
+                                f"{carrier.get('pane_id')} ({carrier.get('agent_status')!r}) reports no native identity, so that session cannot be shown to be settled or closed; "
+                                "let that agent settle or close it, restore its identity, then select the pair again (nothing is adopted or interrupted for you)")
+            for carrier in (live_agents if pane else []):
+                if carrier.get("pane_id") != pane:
+                    continue
+                identity = session_identity(carrier)
+                status = carrier.get("agent_status")
+                if identity is None:
+                    return (f"pane {pane}, where the previous task's {provider} session {session[:8]} lived, reports an agent ({status!r}) with no native identity, so that session "
+                            "cannot be shown to be settled or closed; let it settle or close it, restore its identity, then select the pair again (nothing is adopted or interrupted for you)")
+                if identity != session and status not in READY_STATES:
+                    return (f"pane {pane}, where the previous task's {provider} session {session[:8]} lived, now carries session {identity[:8]} that is {status!r}; "
+                            "wait for it to settle, then select the pair again")
+    return None
+
+
+def _previous_panes(paths: Any, state: dict[str, Any] | None) -> dict[str, str]:
+    """The TRUSTWORTHY pane locators of the previous run's native sessions: its frozen pair when it was a named run, else the owners.json entry that still names the
+    same native session (read-only). A missing/unreadable file or a record that no longer matches records nothing — and `pair_switch_problem` then treats that
+    as an unknown locator (fail closed on any identity-less agent of that kind), never as proof that the old session settled or closed."""
+    result: dict[str, str] = {}
+    if not isinstance(state, dict):
+        return result
+    pair = state.get("session_pair")
+    if isinstance(pair, dict) and isinstance(pair.get("identities"), dict):
+        for provider, record in pair["identities"].items():
+            if provider in PROVIDERS and isinstance(record, dict) and valid_pane_id(record.get("pane_id")):
+                result[provider] = record["pane_id"]
+        return result
+    try:
+        owners = load_json(paths.owners_file, label="native session ownership") if paths.owners_file.exists() else {}
+    except SupervisorError:
+        return result
+    for provider, session in ((state.get("native_sessions") or {}).items()):
+        record = owners.get(provider) if isinstance(owners, dict) else None
+        if provider in PROVIDERS and isinstance(record, dict) and record.get("session_id") == session and valid_pane_id(record.get("pane_id")):
+            result[provider] = record["pane_id"]
+    return result
+
+
 def _carrier_panes(live: list[dict[str, Any]], session_id: str) -> list[str]:
     """Canonical pane ids of every live record carrying `session_id`; a record without a canonical pane is
     dropped from the locator list (never stringified into one)."""
@@ -102,6 +186,14 @@ class SupervisorV2Mixin:
         def set_wait_user(self, state: dict[str, Any], reason: str, *, requires_action: bool = False) -> str: ...
 
         def owners(self) -> dict[str, dict[str, str]]: ...
+
+        def global_owners(self) -> dict[str, dict[str, str]]: ...
+
+        def session_pair_binding(self) -> dict[str, Any] | None: ...
+
+        def _claude_pending_work(self, state: dict[str, Any], provider: str, delivery: dict[str, Any]) -> Any: ...
+
+        def pair_scope(self, binding: dict[str, Any] | None) -> Any: ...
 
         def agent_name(self, provider: str) -> str: ...
 
@@ -133,7 +225,7 @@ class SupervisorV2Mixin:
 
         def codex_reset_inventory(self, request_id: str) -> Any: ...
 
-        def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None) -> dict[str, Any]: ...
+        def initialize(self, task: str, start: str, *, task_reference: str | None = None, workflow_policy: str = "v1", char_limit: int | None = None, codex_reset_authorization: dict[str, Any] | None = None, run_id: str | None = None, session_selection: dict[str, Any] | None = None, session_preparation: dict[str, Any] | None = None, session_pair: dict[str, Any] | None = None) -> dict[str, Any]: ...
         def prepare_task_sessions(self, selection: Any, *, preparation_id: str, journal_path: Path | None = None,
                                   origin: str = "supervisor", request_binding: str | None = None,
                                   request_envelope: dict[str, Any] | None = None, start_provider: str = "codex") -> dict[str, Any]: ...
@@ -146,6 +238,8 @@ class SupervisorV2Mixin:
         def session_preparation_view(self, record: dict[str, Any] | None) -> dict[str, Any] | None: ...
 
         def route(self, state: dict[str, Any], block: ProtocolBlock) -> str: ...
+
+        def _codex_route_fence(self, state: dict[str, Any], block: ProtocolBlock) -> str | None: ...
 
         def run_loop(self, state: dict[str, Any], *, recovering: bool = False) -> int: ...
 
@@ -162,6 +256,18 @@ class SupervisorV2Mixin:
         def check_control(self, state: dict[str, Any]) -> bool: ...
 
     # ----- events / outbox
+
+    def context_config(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The configuration every repository/review-context-sensitive check uses for THIS run.
+
+        A named-pair run carries its repository, review base and instruction root in its frozen `session_pair` snapshot; they replace `product_repo` / `review_root` / `project_root` for that run only.
+        With a state in hand its own snapshot decides (so a finished run still answers with the context it ran under); without one, the active run's binding does.
+        Legacy runs and installations without named pairs get `self.config` itself, unchanged."""
+        pair = state.get("session_pair") if isinstance(state, dict) else (self.session_pair_binding() if state is None else None)
+        if not isinstance(pair, dict):
+            return self.config
+        context = hp.validate_binding(pair)["context"]
+        return {**self.config, "product_repo": context["repository"], "review_root": context["review_base"], "project_root": context["instruction_root"]}
 
     def emit_event(self, state: dict[str, Any], event_type: str, data: dict[str, Any], *, identity: str | None = None) -> str:
         """`identity` (optional) replaces the run id in the DERIVED event id only: an event that belongs to a durable sub-record (a startup wait) names that record, so its id can never equal
@@ -251,14 +357,25 @@ class SupervisorV2Mixin:
             "HERDR_STAGE=<completed stage, e.g. plan, brief, implement, review, fix>\n"
             "HERDR_NEXT=<codex|claude|done|human>\n"
             "HERDR_GATE=<none|plan_approval|generic_question|runtime_validation|push_approval>\n"
-            f"HERDR_PAYLOAD=<gate payload JSON path below {self.config['review_root']}, or - when HERDR_GATE=none>\n"
+            f"HERDR_PAYLOAD=<gate payload JSON path below {self.context_config(state)['review_root']}, or - when HERDR_GATE=none>\n"
             "HERDR_HANDOFF=<one line under 300 characters, words_joined_with_underscores, no spaces or angle brackets>\n"
             "Rules: human needs a typed gate and payload; codex/claude/done need HERDR_GATE=none and HERDR_PAYLOAD=-; "
             f"{rule}never reuse an earlier block."
         )
 
+    def pair_context_text(self, state: dict[str, Any]) -> str:
+        """The named run's selected context, stated explicitly in every workflow prompt (empty for a legacy run). The session's own working directory is
+        NOT changed by selecting a pair, so the paths are given in words, from the run's frozen snapshot (never from current configuration)."""
+        pair = state.get("session_pair")
+        if not isinstance(pair, dict):
+            return ""
+        context = hp.validate_binding(pair)["context"]
+        return (f"Selected pair context for this run (fixed; named {pair['name']!r}): repository {context['repository']}; review base {context['review_base']}; "
+                f"instruction root {context['instruction_root']}. Work only in this repository and keep review artifacts under this review base; this session's own "
+                "working directory may differ, so use these paths explicitly and do not work in another repository.\n\n")
+
     def build_prompt_v2(self, state: dict[str, Any], turn_id: str, kind: str) -> str:
-        protocol = self.protocol_instructions(state, turn_id)
+        protocol = self.pair_context_text(state) + self.protocol_instructions(state, turn_id)
         run = state["run_id"]
         if kind.startswith("continuation:"):
             cont = state.get("continuation") or (state.get("delivery") or {}).get("continuation") or {}
@@ -301,7 +418,7 @@ class SupervisorV2Mixin:
                     "continue that stage from where it stopped without redoing completed work.\n\n" + protocol)
         label = "gated workflow" if (state.get("workflow_contract") or {}).get("plan_approval_required_for_handoff") else "supervised workflow"
         preamble = (f"You are the active agent for supervised run {run} ({label}). Follow CLAUDE.md / AGENTS.md and their context under "
-                    f"{self.config['project_root']}; the supervisor only routes turns and enforces human gates. Do only the workflow stage that is correct now.")
+                    f"{self.context_config(state)['project_root']}; the supervisor only routes turns and enforces human gates. Do only the workflow stage that is correct now.")
         handoff = state.get("last_successful_handoff")
         handoff_text = ""
         if isinstance(handoff, dict):
@@ -317,6 +434,9 @@ class SupervisorV2Mixin:
     # ----- V2 routing and gate creation
 
     def route_v2(self, state: dict[str, Any], block: ProtocolBlock) -> str:
+        stop = self._codex_route_fence(state, block)      # a direct route_v2 entry takes the same provenance fence as route()
+        if stop is not None:
+            return stop
         source = state["active_agent"]
         policy = state.get("workflow_policy")
         if policy in V2_WORKFLOW_POLICIES and block.version != 2:
@@ -524,7 +644,7 @@ class SupervisorV2Mixin:
         if isinstance(manifest, dict):
             approved_root = (state.get("runtime_policy") or {}).get("runtime_manifest_root")
             try:
-                verify_runtime_manifest(manifest, approved_root=approved_root, config=self.config)
+                verify_runtime_manifest(manifest, approved_root=approved_root, config=self.context_config(state))
             except (SupervisorError, OSError) as error:
                 return {"predicate": "runtime_manifest", "message": str(error), "expected": approved_root, "observed": manifest.get("repository"),
                         "path": manifest.get("candidate_manifest"), "invalidate": str(error)}
@@ -532,7 +652,7 @@ class SupervisorV2Mixin:
         candidate = state.get("candidate_sha")
         if not candidate:
             return None
-        repo = str(self.config["product_repo"])
+        repo = str(self.context_config(state)["product_repo"])
         try:
             head = self.head_resolver(Path(repo))
         except SupervisorError as error:
@@ -589,12 +709,12 @@ class SupervisorV2Mixin:
     def binding_view(self, state: dict[str, Any]) -> dict[str, Any]:
         """The decision inputs both control paths resolve identically: configuration source, configured repository and review root, and the
         approved/candidate identities. Read-only, no secrets."""
-        view: dict[str, Any] = {"config_file": str(self.paths.config_file), "product_repo": str(self.config.get("product_repo")),
-                                "review_root": str(self.config.get("review_root")), "candidate_sha": state.get("candidate_sha"),
+        view: dict[str, Any] = {"config_file": str(self.paths.config_file), "product_repo": str(self.context_config(state).get("product_repo")),
+                                "review_root": str(self.context_config(state).get("review_root")), "candidate_sha": state.get("candidate_sha"),
                                 "approved_plan_sha256": (state.get("approved_plan") or {}).get("plan_sha256"),
                                 "runtime_manifest_root": (state.get("runtime_policy") or {}).get("runtime_manifest_root")}
         try:
-            view["repository_head"] = self.head_resolver(Path(str(self.config["product_repo"])))
+            view["repository_head"] = self.head_resolver(Path(str(self.context_config(state)["product_repo"])))
         except SupervisorError as error:
             view["repository_head"] = None
             view["repository_head_error"] = str(error)[:200]
@@ -734,6 +854,9 @@ class SupervisorV2Mixin:
             raise SupervisorError("retry must be bound to the current run")
         if self.followup_unresolved(state) is not None:
             raise SupervisorError("a follow-up question is unresolved; return to the decision before retrying the routing result")
+        stalled = isinstance(delivery, dict) and getattr(self, "_stalled_delivery", lambda value: False)(delivery)
+        if stalled and isinstance(delivery, dict) and not isinstance(missing, dict):
+            missing = {"schema_version": 1, "run_id": state["run_id"], "agent": delivery.get("agent"), "turn_id": delivery.get("turn_id"), "attempts": 0, "created_at_unix": self.clock()}
         if state.get("supervisor_state") != "WAIT_USER" or not state.get("wait_user_requires_action") or not isinstance(missing, dict):
             raise SupervisorError("no unread routing result is pending for this run")
         if not isinstance(turn_id, str) or turn_id != missing.get("turn_id") or not isinstance(delivery, dict) or delivery.get("turn_id") != turn_id:
@@ -756,7 +879,7 @@ class SupervisorV2Mixin:
         if guard.kind != "clear":
             raise SupervisorError(f"{name} may still have background children or its idle state cannot be confirmed ({guard.kind}: {guard.detail}); nothing was read, routed or resent. Try again once the pane is quiet.")
         try:
-            block, _output, native = self.collect_routing_result(state, provider, delivery, purpose="retry")
+            block, _output, native = self.collect_routing_result(state, provider, delivery, purpose="retry_stalled" if stalled else "retry")
         except HerdrError as error:
             raise SupervisorError(f"cannot read {name} output: {error}") from error
         source = "terminal"
@@ -768,6 +891,11 @@ class SupervisorV2Mixin:
             source = "native transcript"
             if block is None:
                 raise SupervisorError("the native routing result for this turn was already recovered once; nothing was routed twice")
+        if block is None:
+            jobs = self._claude_pending_work(state, provider, delivery)
+            if jobs.kind in ("pending", "awaiting_final", "retry"):
+                raise SupervisorError(f"the accepted turn still has unresolved native work ({jobs.kind}: {jobs.detail}); the one-time result retry was not consumed and nothing was resent")
+        state["missing_result"] = missing
         missing["attempts"] = int(missing["attempts"]) + 1
         missing["last_attempt_unix"] = self.clock()
         if native is not None:
@@ -1029,10 +1157,10 @@ class SupervisorV2Mixin:
     def create_gate(self, state: dict[str, Any], block: ProtocolBlock) -> dict[str, Any]:
         gate_type = block.gate
         try:
-            review_root = Path(self.config["review_root"])
+            review_root = Path(self.context_config(state)["review_root"])
             payload_path = check_safe_file(block.payload, root=review_root, max_bytes=int(self.config["max_payload_bytes"]), label="gate payload")
             raw_payload = load_json(payload_path, label="gate payload")
-            payload = validate_gate_payload(raw_payload, gate_type, config=self.config)
+            payload = validate_gate_payload(raw_payload, gate_type, config=self.context_config(state))
             if payload_path.resolve().parent != Path(payload["review_directory"]).resolve() and Path(payload["review_directory"]).resolve() not in payload_path.resolve().parents:
                 raise SupervisorError("gate payload must live inside its review_directory")
             payload_sha = sha256_bytes(canonical_json(payload))
@@ -1070,7 +1198,7 @@ class SupervisorV2Mixin:
             if payload.get("candidate_kind") == "manifest":
                 if approved_policy.get("push_approval_required"):
                     raise SupervisorError("manifest runtime cannot satisfy a Git push policy")
-                verify_runtime_manifest(payload, approved_root=approved_policy.get("runtime_manifest_root"), config=self.config)
+                verify_runtime_manifest(payload, approved_root=approved_policy.get("runtime_manifest_root"), config=self.context_config(state))
                 previous_manifest = state.get("runtime_candidate")
                 if previous_manifest != payload:
                     state["runtime_evidence"] = None
@@ -1092,7 +1220,7 @@ class SupervisorV2Mixin:
             candidate = payload["candidate_sha"]
             if not approved_policy.get("runtime_validation_required"):
                 # F2: no runtime gate seeds the candidate; bind it to the repository's current exact HEAD.
-                head = self.head_resolver(Path(self.config["product_repo"]))
+                head = self.head_resolver(Path(self.context_config(state)["product_repo"]))
                 if head != candidate:
                     raise SupervisorError(f"push approval candidate {candidate[:12]} does not equal repository HEAD {head[:12]}")
                 if state.get("candidate_sha") not in (None, candidate):
@@ -1432,7 +1560,7 @@ class SupervisorV2Mixin:
         if manifest:
             if candidate_sha != gate.get("candidate_digest") or state.get("runtime_candidate") != gate["payload"]:
                 raise SupervisorError("manifest candidate does not match pending runtime gate")
-            verify_runtime_manifest(gate["payload"], approved_root=state["runtime_policy"].get("runtime_manifest_root"), config=self.config)
+            verify_runtime_manifest(gate["payload"], approved_root=state["runtime_policy"].get("runtime_manifest_root"), config=self.context_config(state))
         elif not SHA_RE.match(candidate_sha or ""):
             raise SupervisorError("candidate SHA must be a full 40-hex commit SHA")
         if not manifest and (candidate_sha != gate.get("candidate_sha") or candidate_sha != state.get("candidate_sha")):
@@ -1440,7 +1568,7 @@ class SupervisorV2Mixin:
         if environment not in self.config["runtime_environments"]:
             raise SupervisorError(f"unknown runtime environment {environment!r}")
         if not manifest:
-            head = (head_resolver or self.head_resolver)(Path(self.config["product_repo"]))
+            head = (head_resolver or self.head_resolver)(Path(self.context_config(state)["product_repo"]))
             if head != candidate_sha:
                 raise SupervisorError(f"repository HEAD {head[:12]} no longer equals the candidate SHA")
         review_dir = Path(gate["payload"]["review_directory"])
@@ -1608,9 +1736,9 @@ class SupervisorV2Mixin:
         approved = state.get("approved_plan")
         if isinstance(approved, dict) and isinstance(approved.get("plan_path"), str):
             return Path(approved["plan_path"]).parent
-        return Path(self.config["review_root"]) / f"run-{str(state['run_id'])[:8]}"
+        return Path(self.context_config(state)["review_root"]) / f"run-{str(state['run_id'])[:8]}"
 
-    def _followup_destination_problem(self, path_text: Any, *, require_absent: bool = False) -> str | None:
+    def _followup_destination_problem(self, path_text: Any, *, require_absent: bool = False, state: dict[str, Any] | None = None) -> str | None:
         """Why a (persisted or freshly computed) response destination must not be handed to an agent: it must be
         an absolute `.md` path whose parent is a real directory strictly below the configured review root with
         no symlink anywhere between them, and the file itself, if present, must not be a symlink. Data only:
@@ -1618,7 +1746,7 @@ class SupervisorV2Mixin:
         if not isinstance(path_text, str) or not path_text.startswith("/") or "\x00" in path_text or not path_text.endswith(".md"):
             return "response destination must be an absolute .md path"
         path = Path(path_text)
-        review_root = Path(self.config["review_root"])
+        review_root = Path(self.context_config(state)["review_root"])
         try:
             resolved_root = review_root.resolve(strict=True)
         except OSError:
@@ -1645,10 +1773,10 @@ class SupervisorV2Mixin:
             return "response destination already exists"
         return None
 
-    def _prepare_followup_destination(self, directory: Path) -> None:
+    def _prepare_followup_destination(self, directory: Path, state: dict[str, Any] | None = None) -> None:
         """Create the deterministic response directory (0700) only after proving that every existing
         ancestor between it and the review root is a real directory below that root; never follow symlinks."""
-        review_root = Path(self.config["review_root"])
+        review_root = Path(self.context_config(state)["review_root"])
         try:
             resolved_root = review_root.resolve(strict=True)
         except OSError as error:
@@ -1724,9 +1852,9 @@ class SupervisorV2Mixin:
             raise SupervisorError(f"ask-agent refused: the recorded {provider} native session no longer matches this run; not contacting a different conversation")
         turn_id = str(uuid.uuid4())
         directory = self.followup_review_directory(state)
-        self._prepare_followup_destination(directory)  # before PREPARED is persisted: a failure leaves the decision untouched
+        self._prepare_followup_destination(directory, state)  # before PREPARED is persisted: a failure leaves the decision untouched
         response_path = str(directory / f"AGENT_FOLLOWUP_{turn_id[:8]}.md")
-        destination_problem = self._followup_destination_problem(response_path, require_absent=True)
+        destination_problem = self._followup_destination_problem(response_path, require_absent=True, state=state)
         if destination_problem:
             raise SupervisorError(f"ask-agent refused: {destination_problem}")
         state["agent_followup"] = {
@@ -1841,7 +1969,8 @@ class SupervisorV2Mixin:
         decision = followup["decision"]
         label = self.followup_decision_label(decision)
         return (
-            f"Supervised run {state['run_id']}: FOLLOW-UP QUESTION from the operator (read-only). The workflow is paused at the {label} "
+            self.pair_context_text(state)
+            + f"Supervised run {state['run_id']}: FOLLOW-UP QUESTION from the operator (read-only). The workflow is paused at the {label} "
             f"({decision['decision_id']}), which stays exactly as it is and returns to the operator unchanged after your answer. "
             "Do not change code, workflow artifacts, gates, approvals, or state, and do not implement anything: a fix you recommend "
             "starts only if the operator explicitly requests a revision or a new task.\n\n"
@@ -1873,7 +2002,7 @@ class SupervisorV2Mixin:
         provider = followup["provider"]
         if (state.get("native_sessions") or {}).get(provider) != followup["session_id"]:
             return self._followup_failed(state, f"the {provider} native session recorded for this run changed; refusing to contact another conversation", delivery_uncertain=False)
-        destination_problem = self._followup_destination_problem(followup.get("response_path"))
+        destination_problem = self._followup_destination_problem(followup.get("response_path"), state=state)
         if destination_problem:
             # The persisted destination is data. If it no longer proves to be below the review root it must never
             # become a write instruction for an agent: fail closed before any contact, whatever the delivery state.
@@ -1910,7 +2039,7 @@ class SupervisorV2Mixin:
         provider = followup["provider"]
         name = self.agent_name(provider)
         turn_id = followup["followup_turn_id"]
-        destination_problem = self._followup_destination_problem(followup.get("response_path"), require_absent=True)
+        destination_problem = self._followup_destination_problem(followup.get("response_path"), require_absent=True, state=state)
         if destination_problem:
             return self._followup_failed(
                 state,
@@ -2043,10 +2172,10 @@ class SupervisorV2Mixin:
             raise SupervisorError("the follow-up frame names a different decision than the suspended one")
         if frame.response_path != followup["response_path"]:
             raise SupervisorError("the follow-up frame names a different response file than the one requested")
-        destination_problem = self._followup_destination_problem(frame.response_path)
+        destination_problem = self._followup_destination_problem(frame.response_path, state=state)
         if destination_problem:
             raise SupervisorError(destination_problem)
-        path = check_safe_file(frame.response_path, root=Path(self.config["review_root"]), max_bytes=int(self.config["max_artifact_bytes"]), label="follow-up response")
+        path = check_safe_file(frame.response_path, root=Path(self.context_config(state)["review_root"]), max_bytes=int(self.config["max_artifact_bytes"]), label="follow-up response")
         content = path.read_bytes()
         if sha256_bytes(content) != frame.response_sha256:
             raise SupervisorError("follow-up response file does not match the hash in the frame")
@@ -2272,6 +2401,65 @@ class SupervisorV2Mixin:
         atomic_write_json(path, record)
         return path
 
+    def _start_pair_binding(self, selection: Any, run_id: str) -> dict[str, Any] | None:
+        """Resolve the named pair a task start uses, under the caller's transaction lock, before anything is registered or launched.
+
+        `saved`: the registry entry must still equal the fingerprint the card showed. `save_existing`: the two explicitly chosen sessions must be exactly
+        live, settled and unowned by anything else, and are registered idempotently (the pair id is derived from the run id, so a replayed start registers
+        the same entry). `create` and legacy selections return None (creation binds after its journal publishes). Every refusal sends, launches, renames and
+        rebinds nothing."""
+        selected = self.validate_session_selection(selection)
+        pair = selected.get("pair")
+        if pair is None:
+            return None
+        if not hp.pairs_enabled(self.config):
+            raise SupervisorError("named session pairs are not enabled on this installation")
+        live = self.herdr.list_agents()
+        # ONE complete boundary proof BEFORE anything is registered, reserved or created (also for a creation, whose later steps launch panes).
+        problem = pair_switch_problem(self.paths, self.store.read_state(required=False), live, own_preparation_id=run_id)
+        if problem is not None:
+            raise SupervisorError(f"cannot switch pairs: {problem}. Nothing was registered, created, sent or interrupted.")
+        if pair["mode"] == "create":
+            hp.check_context(self.config, pair["context"])  # a creation records the context it will freeze: current authorization first
+            return None
+        if pair["mode"] == "saved":
+            entry = hp.get_entry(self.paths, pair["pair_id"])
+            if entry is None:
+                raise SupervisorError("the saved pair no longer exists; choose a pair again")
+            if hp.entry_fingerprint(entry) != pair["fingerprint"]:
+                raise SupervisorError("the saved pair changed after the Start card was shown; review a new card")
+            hp.check_context(self.config, entry["context"])  # the fingerprint proves stored bytes, not CURRENT administrator permission or filesystem meaning
+        else:
+            entry = None
+        identities = entry["identities"] if entry is not None else pair["identities"]
+        problems = hp.live_problems(live, identities, settled=True)
+        if problems:
+            raise SupervisorError("the pair is not exactly present and settled: " + "; ".join(problems) + ". Restore the original sessions; nothing was sent, launched, renamed or rebound.")
+        if entry is None:
+            context = hp.check_context(self.config, pair["context"])
+            pair_id = str(uuid.uuid5(uuid.UUID(run_id), "named-pair"))
+            committed = hp.get_entry(self.paths, pair_id)
+            if committed is not None:
+                # A replay of THIS request after its registration committed but before its run existed: reconcile the identical registration, never refuse our own entry.
+                if committed["name_key"] != hp.name_key(pair["name"]) or committed["identities"] != identities or committed["context"] != context:
+                    raise SupervisorError("this start's pair registration was already committed with different content")
+                entry = committed
+            else:
+                foreign = hp.foreign_sessions(self.paths)
+                if any(identities[p]["session_id"] in foreign for p in PROVIDERS):
+                    raise SupervisorError("a chosen session is already used by a saved pair, a query session or a helper worker")
+                entry = hp.register_existing(self.paths, self.config, self.clock, name=pair["name"], context=context, identities=identities, pair_id=pair_id)
+        return hp.binding_from_entry(entry, bound_at=iso_utc(self.clock()))
+
+    def _created_pair_binding(self, preparation: Any) -> dict[str, Any] | None:
+        """The binding of a pair a fresh-all creation published (None when the preparation had no named destination)."""
+        if not isinstance(preparation, dict) or not isinstance(preparation.get("destination"), dict):
+            return None
+        entry = hp.entry_for_preparation(self.paths, str(preparation.get("preparation_id")))
+        if entry is None:
+            raise SupervisorError("the named pair was not published; the task was not started")
+        return hp.binding_from_entry(entry, bound_at=iso_utc(self.clock()))
+
     def _session_preparation_failure_message(self, preparation_id: str, error: SupervisorError) -> str:
         try:
             owners = self.owners()
@@ -2303,6 +2491,84 @@ class SupervisorV2Mixin:
             return
         record.update({"status": "started", "run_id": run_id, "started_at": record.get("started_at") or iso_utc(self.clock())})
         atomic_write_json(path, record)
+
+    def settle_cancelled_delivery(self, state: dict[str, Any], *, turn_id: Any, actor: str) -> dict[str, Any]:
+        """Abandon one cancelled run's delivery after identity and child settlement proof.
+
+        Called only by the run-bound durable cancel command with settle_delivery=True.
+        This records cancellation, never completion, a routing result or an approval.
+
+        A terminal run releases its pair binding for later flows, so every owner lookup of this recovery is resolved through the run's OWN
+        frozen `session_pair` snapshot (validated, never the registry, aliases or the global owners); an unnamed run keeps the legacy owners.
+        """
+        pair = state.get("session_pair")
+        if pair is not None and not isinstance(pair, dict):
+            raise SupervisorError("the cancelled run's pair snapshot is not valid; nothing changed")
+        with (self.pair_scope(pair) if pair is not None else contextlib.nullcontext()):
+            return self._settle_cancelled_delivery(state, turn_id=turn_id, actor=actor)
+
+    def _settle_cancelled_delivery(self, state: dict[str, Any], *, turn_id: Any, actor: str) -> dict[str, Any]:
+        if state.get("supervisor_state") != "CANCELLED":
+            raise SupervisorError("delivery settlement requires an already CANCELLED run")
+        delivery = state.get("delivery")
+        if not isinstance(turn_id, str) or not turn_id or not isinstance(delivery, dict) or delivery.get("turn_id") != turn_id:
+            raise SupervisorError("cancelled delivery settlement must match the exact delivery turn")
+        if delivery.get("status") == "cancelled":
+            receipt = delivery.get("cancellation_settlement") or {}
+            if receipt.get("run_id") == state.get("run_id") and receipt.get("turn_id") == turn_id:
+                return {"ok": True, "message": "cancelled delivery was already settled; nothing resent"}
+            raise SupervisorError("cancelled delivery has no matching settlement record")
+        if delivery.get("status") not in ("prepared", "accepted", "uncertain", "interrupted"):
+            raise SupervisorError("the cancelled run has no unsettled delivery")
+        if pid_alive(state.get("worker_pid")):
+            raise SupervisorError("the cancelled run still records a live worker")
+        if (state.get("continuation") is not None or state.get("interrupted_delivery") is not None
+                or state.get("owner_recovery") is not None or self.followup_unresolved(state) is not None
+                or (state.get("codex_reset") or {}).get("current_redemption_state") not in (None, "IDLE", "RESET_VERIFIED")):
+            raise SupervisorError("the cancelled run has another unresolved recovery; delivery settlement cannot discard it")
+        guard = getattr(self, "settle_guard", None)
+        if self.herdr is None or not callable(guard):
+            raise SupervisorError("native settlement verification is unavailable; nothing changed")
+        persisted = state.get("native_sessions")
+        if not isinstance(persisted, dict):
+            raise SupervisorError("cancelled run has no native identity record")
+
+        def check_live() -> dict[str, Any]:
+            owners = getattr(self, "owners")()
+            live = self.herdr.list_agents()
+            checked: dict[str, Any] = {}
+            pair = state.get("session_pair") or {}
+            for provider in PROVIDERS:
+                expected = persisted.get(provider)
+                owner = owners.get(provider) or {}
+                frozen = (pair.get("identities") or {}).get(provider) or owner
+                if (not isinstance(expected, str) or not expected or owner.get("session_id") != expected
+                        or frozen.get("session_id") != expected or not valid_pane_id(frozen.get("pane_id"))
+                        or owner.get("pane_id") != frozen.get("pane_id")):
+                    raise SupervisorError(f"{provider} original ownership cannot be verified")
+                match = match_exact_session(live, provider, expected)
+                if (match.ambiguous or match.provider_conflicts or match.record is None
+                        or match.record.get("pane_id") != frozen["pane_id"] or match.record.get("agent_status") not in READY_STATES):
+                    raise SupervisorError(f"{provider} original session is missing, changed or not settled")
+                checked[provider] = {"session_id": expected, "pane_id": frozen["pane_id"]}
+            return checked
+
+        identities = check_live()
+        for provider in PROVIDERS:
+            verdict = guard(copy.deepcopy(state), provider, "cancelled_delivery_settlement", wait=True, patience=15.0, control=False)
+            if verdict.kind != "clear":
+                raise SupervisorError(f"{provider} child settlement did not clear: {verdict.kind}: {verdict.detail}; nothing changed")
+        if check_live() != identities:
+            raise SupervisorError("original identities changed during settlement")
+        cancelled = copy.deepcopy(delivery)
+        cancelled["cancellation_settlement"] = {"run_id": state["run_id"], "turn_id": turn_id,
+                                               "previous_status": delivery["status"], "actor": actor,
+                                               "at": iso_utc(self.clock()), "identities": identities}
+        cancelled["status"] = "cancelled"
+        state["delivery"] = cancelled
+        self.emit_event(state, "TASK_CANCELLED", {"actor": actor, "mode": "delivery_settled", "turn_id": turn_id})
+        self.store.write_state(state)
+        return {"ok": True, "message": "cancelled delivery settled; no result accepted, native sessions preserved"}
 
     def apply_command(self, state: dict[str, Any] | None, command: dict[str, Any]) -> dict[str, Any]:
         action = command.get("action")
@@ -2390,8 +2656,12 @@ class SupervisorV2Mixin:
                     self._mark_upload_started(command, preallocated)
                 return result
             pending_authorization = self._validate_pending_reset_authorization(command, task_binding)
+            binding: dict[str, Any] | None = None
             try:
-                preparation = self.prepare_task_sessions(selection, preparation_id=str(command.get("preallocated_run_id")), start_provider=requested_start)
+                binding = self._start_pair_binding(selection, str(command.get("preallocated_run_id")))
+                with (self.pair_scope(binding) if binding is not None else contextlib.nullcontext()):
+                    preparation = self.prepare_task_sessions(selection, preparation_id=str(command.get("preallocated_run_id")), start_provider=requested_start)
+                binding = binding or self._created_pair_binding(preparation)
             except SupervisorError as error:
                 # The operator-facing outcome: nothing was delivered, the old sessions are intact, and the
                 # concrete recovery choices (retry adopts a settled result; abandon frees a new sequence).
@@ -2400,7 +2670,7 @@ class SupervisorV2Mixin:
                 raise SupervisorError(self._session_preparation_failure_message(str(command.get("preallocated_run_id")), error)) from error
             new_state = self.initialize(text, requested_start, task_reference=reference, workflow_policy=requested_policy, char_limit=char_limit,
                                         codex_reset_authorization=authorization if isinstance(authorization, dict) else None,
-                                        run_id=command.get("preallocated_run_id"), session_selection=selection, session_preparation=preparation)
+                                        run_id=command.get("preallocated_run_id"), session_selection=selection, session_preparation=preparation, session_pair=binding)
             started_preparation=self._mark_session_preparation_started(new_state["run_id"])
             if started_preparation is not None:
                 new_state["session_preparation"]=self.session_preparation_view(started_preparation)
@@ -2490,6 +2760,8 @@ class SupervisorV2Mixin:
                 raise SupervisorError(f"{action} must be bound to a run id; unbound controls are refused")
             if bound != state.get("run_id"):
                 raise SupervisorError(f"{action} was issued for run {bound[:8]} but the current run is {str(state.get('run_id'))[:8]}; ignored")
+        if action == "cancel" and command.get("settle_delivery") is True:
+            return self.settle_cancelled_delivery(state, turn_id=command.get("turn_id"), actor=actor)
         if action in ("pause", "cancel"):
             desired = "paused" if action == "pause" else "cancelled"
             if state["supervisor_state"] in TERMINAL_STATES:
@@ -2654,6 +2926,10 @@ class SupervisorV2Mixin:
                                       provider=provider, classification="duplicate", session_id=record["session_id"], recorded_pane=record["pane_id"], live_panes=carriers)
         if identity.provider_conflicts:
             raise SupervisorError(f"{provider} native session {record['session_id'][:8]} is carried by a record of another provider; refusing")
+        bound_pair = self.session_pair_binding()
+        if identity.record is None and bound_pair is not None:
+            raise SupervisorError(f"{provider} native session {record['session_id'][:8]} of the named pair {bound_pair['name']!r} is not live; the supervisor never launches, restarts, renames or substitutes a saved pair member. "
+                                  "Restore the original session in its recorded pane, then /resume")
         if identity.record is not None:
             agent = identity.record
             if agent.get("pane_id") != record["pane_id"]:
@@ -3129,7 +3405,14 @@ class SupervisorV2Mixin:
             raise SupervisorError(f"workflow checkpoint drifted ({drift}); repair refused")
         old_pane = owners[provider]["pane_id"]
         owners[provider] = {"pane_id": pane, "session_id": session}  # the session id is copied from state, never derived from live data
-        atomic_write_json(self.paths.owners_file, owners, mode=0o600)
+        if self.session_pair_binding() is not None:
+            # A named run repairs only ITS frozen locator (same native session, new pane); owners.json and the saved pair entry are never rewritten.
+            binding = json.loads(json.dumps(state["session_pair"]))
+            binding["identities"][provider] = {"pane_id": pane, "session_id": session}  # the bound fingerprint stays: it names the entry the run started from
+            state["session_pair"] = hp.validate_binding(binding)
+            self.store.write_state(state)  # the new locator is durable before any consumer resolves it
+        else:
+            atomic_write_json(self.paths.owners_file, owners, mode=0o600)
         self._live_names.clear()
         state["owner_recovery"] = None
         state["wait_user_reason"] = None

@@ -57,7 +57,7 @@ class DistributionTests(unittest.TestCase):
             "systemd/herdr-backup.service", "systemd/herdr-backup.timer", "bin/herdr-backup",
         ):
             self.assertTrue((ROOT / path).is_file(), path)
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "0.3.0-beta.1")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "0.4.0-beta.1")
         self.assertIn("Apache License", (ROOT / "LICENSE").read_text())
         readme = (ROOT / "README.md").read_text()
         metadata = (ROOT / "pyproject.toml").read_text()
@@ -112,8 +112,10 @@ class DistributionTests(unittest.TestCase):
             self.assertIn("No service was loaded", result.stdout)
 
             lib = home / ".local/lib/herdr-supervisor"
+            self.assertTrue((lib / "active").is_symlink(), "the program is one immutable generation behind one atomic pointer")
+            generation = lib / os.readlink(lib / "active")
             for source in (ROOT / "src").glob("*.py"):
-                installed = lib / source.name
+                installed = generation / source.name
                 self.assertTrue(installed.is_file())
                 self.assertEqual(hashlib.sha256(source.read_bytes()).digest(), hashlib.sha256(installed.read_bytes()).digest())
             for launcher in (ROOT / "bin").iterdir():
@@ -153,14 +155,22 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Skipped unit validation", result.stderr)
             self.assertIn("No service was loaded", result.stdout)
-            self.assertTrue((home / ".local/lib/herdr-supervisor/herdr_supervisor.py").is_file())
+            self.assertTrue((home / ".local/lib/herdr-supervisor/active/herdr_supervisor.py").is_file())
 
-            # With a runtime directory the same fake runs, and a failing verification still fails the install.
+            # With a runtime directory the same fake runs, and a failing verification refuses BEFORE any write (the candidate
+            # units are validated from a scratch copy, so a defective unit leaves nothing installed).
+            fresh = root / "home2"
+            fresh.mkdir()
+            self.fake_herdr(fresh)
             analyze.write_text("#!/bin/sh\necho 'unit has a bad unit file setting' >&2; exit 1\n")
-            env["XDG_RUNTIME_DIR"] = str(root / "runtime")
+            (root / "runtime").mkdir()
+            env.update({"XDG_RUNTIME_DIR": str(root / "runtime"), "HOME": str(fresh)})
             result = subprocess.run([str(ROOT / "install.sh")], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60, check=False)
-            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
             self.assertNotIn("No service was loaded", result.stdout)
+            self.assertIn("unit validation failed", result.stdout + result.stderr)
+            self.assertEqual(sorted(p.name for p in fresh.iterdir()), [".local"], "nothing but the pre-existing Herdr stub exists")
+            self.assertFalse((fresh / ".local/lib").exists())
 
     def test_install_preserves_existing_config_and_never_activates(self) -> None:
         script = (ROOT / "install.sh").read_text()
@@ -178,6 +188,32 @@ class DistributionTests(unittest.TestCase):
             result = self.run_script("install.sh", home=home, fake_bin=self.fake_commands(root))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(config.read_text(), '{"human": "keep"}\n')
+
+    def test_install_places_quota_lock_and_launcher_without_touching_the_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            self.fake_herdr(home)
+            fake_bin = self.fake_commands(root)
+            dry = self.run_script("install.sh", "--dry-run", home=home, fake_bin=fake_bin)
+            self.assertIn("Approval hash", dry.stdout)
+            self.assertFalse((home / ".local/lib").exists())
+            result = self.run_script("install.sh", home=home, fake_bin=fake_bin)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("herdr-quota-dependency check", result.stdout)
+            installed_lock = home / ".local/lib/herdr-supervisor/active/quota-dependency.json"
+            self.assertEqual(installed_lock.read_bytes(), (ROOT / "config/quota-dependency.json").read_bytes())
+            self.assertEqual(stat.S_IMODE((home / ".local/bin/herdr-quota-dependency").stat().st_mode), 0o755)
+            env = {"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"}
+            shown = subprocess.run([str(home / ".local/bin/herdr-quota-dependency"), "--json", "show-lock"], env=env, capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertEqual(json.loads(shown.stdout)["lock"], json.loads(installed_lock.read_text()))
+            self.assertFalse((home / ".config/herdr").exists(), "installing the supervisor never creates or edits Herdr plugin configuration")
+            removed = self.run_script("uninstall.sh", home=home, fake_bin=fake_bin)
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertFalse((home / ".local/bin/herdr-quota-dependency").exists())
+            self.assertFalse(installed_lock.exists())
 
     def test_uninstall_dry_run_is_bounded_and_default_preserves_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -277,7 +313,7 @@ class DistributionTests(unittest.TestCase):
         self.assertIn('"--plugin", "herdr-agent-usage"', source)
 
     def test_shell_scripts_parse(self) -> None:
-        for script in ("install.sh", "uninstall.sh", "bin/herdr-supervisor", "bin/herdr-telegram", "bin/herdr-query-worker", "bin/herdr-backup", "bin/herdr-codex-reset-worker"):
+        for script in ("install.sh", "uninstall.sh", "bin/herdr-supervisor", "bin/herdr-telegram", "bin/herdr-query-worker", "bin/herdr-backup", "bin/herdr-codex-reset-worker", "bin/herdr-quota-dependency"):
             result = subprocess.run(["sh", "-n", str(ROOT / script)], capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, f"{script}: {result.stderr}")
 
