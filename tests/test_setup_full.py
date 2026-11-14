@@ -301,6 +301,7 @@ class PathsComponentTests(FullCase):
         self.layout.sup_config.write_text(json.dumps(original))
         review = self.tmp / "reviews"
         review.mkdir()
+        backups_before = set(self.layout.backups.glob("*/manifest.json"))
         code, out, err = self.run_tool("setup", "--profile", "full", "--payload", str(self.payload), "--components", "paths", "--project-root", str(self.project), "--review-root", str(review),
                                        "--apply", "--approve-current", adapters=self.adapters(self.quota))
         self.assertIn(code, (0, hi.EXIT_ACTION), out + err)
@@ -309,7 +310,16 @@ class PathsComponentTests(FullCase):
         self.assertEqual({key for key in edited if edited[key] != original.get(key)}, {"project_root", "review_root"}, "nothing else in the configuration changed")
         self.assertEqual(stat.S_IMODE(self.layout.sup_config.stat().st_mode), 0o600)
         core.load_config(self.layout.sup_config)
-        manifest = json.loads(next(self.layout.backups.glob("*/manifest.json")).read_text())
+        # The initial installation's backup also exists and glob order is unspecified, so the manifest of this paths operation is the one backup created by the apply above,
+        # bound to its own operation: directory name, manifest and journal must agree.
+        created = set(self.layout.backups.glob("*/manifest.json")) - backups_before
+        self.assertEqual(len(created), 1, f"the paths apply must create exactly one backup, got {sorted(str(path) for path in created)}")
+        manifest_path = next(iter(created))
+        manifest = json.loads(manifest_path.read_text())
+        operation = manifest_path.parent.name
+        self.assertEqual(manifest["operation_id"], operation)
+        journal = json.loads((self.layout.ops / f"{operation}.json").read_text())
+        self.assertEqual((journal["operation_id"], journal["kind"]), (operation, "setup"))
         entry = next(item for item in manifest["entries"] if item["role"] == "config")
         self.assertEqual(entry["before"]["sha256"], hi.sha256_bytes(json.dumps(original).encode()), "the protected preimage is recorded")
 
